@@ -702,6 +702,8 @@ dependencies = [
  "clap",
  "rfq-client",
  "rfq-maker",
+ "rfq-rgb",
+ "rfq-types",
  "rfq-wallet",
  "tokio",
 ]

@@ -1,7 +1,10 @@
-use std::{env, time::Duration};
+use std::{env, sync::Arc, time::Duration};
 
 use clap::{Parser, Subcommand};
 use rfq_client::{RfqClient, Url};
+use rfq_maker::MockMaker;
+use rfq_rgb::MockRgbBackend;
+use rfq_types::{Allocation, AssetId, AssetKind, BitcoinNetwork, InventorySnapshot, MakerId};
 use rfq_wallet::{MockWalletBackend, WalletBackend};
 use tokio::time;
 
@@ -59,7 +62,7 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Run => run(config).await,
         Command::Health => health(config),
-        Command::Inventory => inventory(config),
+        Command::Inventory => inventory(config).await,
     }
 }
 
@@ -100,14 +103,44 @@ fn health(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn inventory(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let _client = RfqClient::new(config.api_url()?);
+async fn inventory(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let _api_url = config.api_url()?;
+    let maker = mock_maker(&config);
+    let snapshot = maker.inventory_summary().await;
 
-    println!("maker-node inventory placeholder");
+    println!("maker-node inventory");
     println!("maker_id={}", config.maker_id);
-    println!("allocations=mock-only");
+    print_inventory_snapshot(&snapshot);
 
     Ok(())
+}
+
+fn mock_maker(config: &MakerNodeConfig) -> MockMaker {
+    let maker_id = MakerId(config.maker_id.clone());
+    let asset = AssetId {
+        network: BitcoinNetwork::Regtest,
+        kind: AssetKind::Rgb20,
+        id: "rgb-test-asset".to_owned(),
+    };
+    let allocation = Allocation {
+        maker_id: maker_id.clone(),
+        asset,
+        available_amount: 1_000_000,
+    };
+    let rgb_backend = Arc::new(MockRgbBackend::new(vec![allocation.clone()]));
+
+    MockMaker::new(maker_id, vec![allocation], rgb_backend)
+}
+
+fn print_inventory_snapshot(snapshot: &InventorySnapshot) {
+    println!("total_amount={}", snapshot.total_amount);
+    println!("available_amount={}", snapshot.available_amount);
+    println!("reserved_amount={}", snapshot.reserved_amount);
+    println!("spent_amount={}", snapshot.spent_amount);
+    println!("total_allocations={}", snapshot.total_allocations);
+    println!("available_allocations={}", snapshot.available_allocations);
+    println!("reserved_allocations={}", snapshot.reserved_allocations);
+    println!("spent_allocations={}", snapshot.spent_allocations);
 }
 
 #[cfg(test)]
@@ -151,6 +184,26 @@ mod tests {
         assert_eq!(config.rfq_api_url, "http://127.0.0.1:3000");
         assert_eq!(config.maker_id, "mock-maker-node");
         assert_eq!(config.poll_interval_ms, 1_000);
+    }
+
+    #[tokio::test]
+    async fn mock_inventory_summary_is_available_by_default() {
+        let config = MakerNodeConfig {
+            rfq_api_url: "http://127.0.0.1:3000".to_owned(),
+            maker_id: "test-maker".to_owned(),
+            poll_interval_ms: 1_000,
+        };
+
+        let snapshot = mock_maker(&config).inventory_summary().await;
+
+        assert_eq!(snapshot.total_amount, 1_000_000);
+        assert_eq!(snapshot.available_amount, 1_000_000);
+        assert_eq!(snapshot.reserved_amount, 0);
+        assert_eq!(snapshot.spent_amount, 0);
+        assert_eq!(snapshot.total_allocations, 1);
+        assert_eq!(snapshot.available_allocations, 1);
+        assert_eq!(snapshot.reserved_allocations, 0);
+        assert_eq!(snapshot.spent_allocations, 0);
     }
 
     fn restore_env(key: &str, value: Option<String>) {

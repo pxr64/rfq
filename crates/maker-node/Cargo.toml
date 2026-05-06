@@ -8,5 +8,7 @@ version.workspace = true
 clap.workspace = true
 rfq-client = { path = "../rfq-client" }
 rfq-maker = { path = "../rfq-maker" }
+rfq-rgb = { path = "../rfq-rgb" }
+rfq-types = { path = "../rfq-types" }
 rfq-wallet = { path = "../rfq-wallet" }
 tokio.workspace = true

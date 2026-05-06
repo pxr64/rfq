@@ -113,6 +113,18 @@ pub struct ManagedAllocation {
     pub state: AllocationState,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct InventorySnapshot {
+    pub total_amount: u64,
+    pub available_amount: u64,
+    pub reserved_amount: u64,
+    pub spent_amount: u64,
+    pub total_allocations: u64,
+    pub available_allocations: u64,
+    pub reserved_allocations: u64,
+    pub spent_allocations: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RgbTransfer {
     pub psbt: String,

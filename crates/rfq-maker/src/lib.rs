@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use rfq_rgb::RgbBackend;
 use rfq_router::{MakerConnector, RouterError};
 use rfq_types::{
-    AcceptQuoteRequest, Allocation, AllocationState, MakerId, ManagedAllocation, Quote, QuoteId,
-    QuoteRequest, SettlementIntent, SettlementStatus,
+    AcceptQuoteRequest, Allocation, AllocationState, InventorySnapshot, MakerId, ManagedAllocation,
+    Quote, QuoteId, QuoteRequest, SettlementIntent, SettlementStatus,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -48,6 +48,13 @@ impl MockMaker {
 
     pub async fn inventory_snapshot(&self) -> Vec<ManagedAllocation> {
         self.inventory.read().await.clone()
+    }
+
+    pub async fn inventory_summary(&self) -> InventorySnapshot {
+        let mut inventory = self.inventory.write().await;
+        release_expired_reservations(&mut inventory, now_ms());
+
+        summarize_inventory(&inventory)
     }
 }
 
@@ -167,6 +174,33 @@ fn has_reserved_quote(inventory: &[ManagedAllocation], quote_id: &QuoteId) -> bo
     })
 }
 
+fn summarize_inventory(inventory: &[ManagedAllocation]) -> InventorySnapshot {
+    let mut snapshot = InventorySnapshot::default();
+
+    for allocation in inventory {
+        let amount = allocation.allocation.available_amount;
+        snapshot.total_amount = snapshot.total_amount.saturating_add(amount);
+        snapshot.total_allocations += 1;
+
+        match allocation.state {
+            AllocationState::Available => {
+                snapshot.available_amount = snapshot.available_amount.saturating_add(amount);
+                snapshot.available_allocations += 1;
+            }
+            AllocationState::Reserved { .. } => {
+                snapshot.reserved_amount = snapshot.reserved_amount.saturating_add(amount);
+                snapshot.reserved_allocations += 1;
+            }
+            AllocationState::Spent { .. } => {
+                snapshot.spent_amount = snapshot.spent_amount.saturating_add(amount);
+                snapshot.spent_allocations += 1;
+            }
+        }
+    }
+
+    snapshot
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +232,14 @@ mod tests {
             maker_id: maker_id(),
             asset: asset(),
             available_amount: 100,
+        }
+    }
+
+    fn allocation_with_amount(amount: u64) -> Allocation {
+        Allocation {
+            maker_id: maker_id(),
+            asset: asset(),
+            available_amount: amount,
         }
     }
 
@@ -239,6 +281,72 @@ mod tests {
             AllocationState::Reserved { quote_id, expires_at_ms }
                 if quote_id == &quote.quote_id && *expires_at_ms == quote.expires_at_ms
         ));
+    }
+
+    #[tokio::test]
+    async fn inventory_summary_counts_initial_inventory_as_available() {
+        let maker = maker_with_inventory(vec![
+            ManagedAllocation {
+                allocation: allocation_with_amount(100),
+                state: AllocationState::Available,
+            },
+            ManagedAllocation {
+                allocation: allocation_with_amount(200),
+                state: AllocationState::Available,
+            },
+        ]);
+
+        let snapshot = maker.inventory_summary().await;
+
+        assert_eq!(
+            snapshot,
+            InventorySnapshot {
+                total_amount: 300,
+                available_amount: 300,
+                reserved_amount: 0,
+                spent_amount: 0,
+                total_allocations: 2,
+                available_allocations: 2,
+                reserved_allocations: 0,
+                spent_allocations: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn inventory_summary_counts_reserved_after_quote() {
+        let maker = maker();
+
+        let quote = maker.request_quote(quote_request("rfq-1")).await.unwrap();
+        let snapshot = maker.inventory_summary().await;
+
+        assert!(quote.is_some());
+        assert_eq!(snapshot.available_amount, 0);
+        assert_eq!(snapshot.reserved_amount, 100);
+        assert_eq!(snapshot.spent_amount, 0);
+        assert_eq!(snapshot.available_allocations, 0);
+        assert_eq!(snapshot.reserved_allocations, 1);
+        assert_eq!(snapshot.spent_allocations, 0);
+    }
+
+    #[tokio::test]
+    async fn inventory_summary_releases_expired_reservation() {
+        let maker = maker_with_inventory(vec![ManagedAllocation {
+            allocation: allocation(),
+            state: AllocationState::Reserved {
+                quote_id: QuoteId("expired-quote".to_owned()),
+                expires_at_ms: 0,
+            },
+        }]);
+
+        let snapshot = maker.inventory_summary().await;
+        let inventory = maker.inventory_snapshot().await;
+
+        assert_eq!(snapshot.available_amount, 100);
+        assert_eq!(snapshot.reserved_amount, 0);
+        assert_eq!(snapshot.available_allocations, 1);
+        assert_eq!(snapshot.reserved_allocations, 0);
+        assert!(matches!(inventory[0].state, AllocationState::Available));
     }
 
     #[tokio::test]
@@ -299,6 +407,36 @@ mod tests {
             &inventory[0].state,
             AllocationState::Spent { quote_id } if quote_id == &quote.quote_id
         ));
+    }
+
+    #[tokio::test]
+    async fn inventory_summary_counts_spent_after_accept() {
+        let maker = maker();
+        let quote = maker
+            .request_quote(quote_request("rfq-1"))
+            .await
+            .unwrap()
+            .expect("quote should be returned");
+
+        maker
+            .accept_quote(
+                quote.clone(),
+                AcceptQuoteRequest {
+                    quote_id: quote.quote_id,
+                    rgb_invoice: "rgb:test_invoice".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let snapshot = maker.inventory_summary().await;
+
+        assert_eq!(snapshot.available_amount, 0);
+        assert_eq!(snapshot.reserved_amount, 0);
+        assert_eq!(snapshot.spent_amount, 100);
+        assert_eq!(snapshot.available_allocations, 0);
+        assert_eq!(snapshot.reserved_allocations, 0);
+        assert_eq!(snapshot.spent_allocations, 1);
     }
 
     #[tokio::test]
