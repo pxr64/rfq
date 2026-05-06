@@ -6,7 +6,7 @@ use rfq_maker::MockMaker;
 use rfq_rgb::MockRgbBackend;
 use rfq_types::{Allocation, AssetId, AssetKind, BitcoinNetwork, InventorySnapshot, MakerId};
 use rfq_wallet::{MockWalletBackend, WalletBackend};
-use tokio::time;
+use tokio::{task::JoinHandle, time};
 
 #[derive(Debug, Parser)]
 #[command(name = "maker-node", about = "Mock RGB RFQ maker daemon")]
@@ -27,6 +27,7 @@ struct MakerNodeConfig {
     rfq_api_url: String,
     maker_id: String,
     poll_interval_ms: u64,
+    cleanup_interval_ms: u64,
 }
 
 impl MakerNodeConfig {
@@ -36,6 +37,10 @@ impl MakerNodeConfig {
                 .unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned()),
             maker_id: env::var("MAKER_ID").unwrap_or_else(|_| "mock-maker-node".to_owned()),
             poll_interval_ms: env::var("POLL_INTERVAL_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1_000),
+            cleanup_interval_ms: env::var("CLEANUP_INTERVAL_MS")
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1_000),
@@ -69,21 +74,30 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
 async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let _client = RfqClient::new(config.api_url()?);
     let wallet = MockWalletBackend::default();
-    let maker_type = std::any::type_name::<rfq_maker::MockMaker>();
+    let maker = mock_maker(&config);
+    let maker_type = std::any::type_name::<MockMaker>();
     let sample_invoice = wallet.create_rgb_invoice("mock-contract", 1)?;
 
     println!("maker-node starting");
     println!("maker_id={}", config.maker_id);
     println!("rfq_api_url={}", config.rfq_api_url);
     println!("poll_interval_ms={}", config.poll_interval_ms);
+    println!("cleanup_interval_ms={}", config.cleanup_interval_ms);
     println!("wallet_sample_invoice={sample_invoice}");
     println!("maker_runtime={maker_type}");
 
-    let mut interval = time::interval(Duration::from_millis(config.poll_interval_ms));
-    loop {
-        interval.tick().await;
-        println!("maker-node placeholder tick");
-    }
+    let cleanup_task = spawn_cleanup_loop(maker.clone(), config.cleanup_interval_ms);
+    let placeholder_task = spawn_placeholder_loop(config.poll_interval_ms);
+
+    tokio::signal::ctrl_c().await?;
+    println!("maker-node shutting down");
+
+    cleanup_task.abort();
+    placeholder_task.abort();
+    let _ = cleanup_task.await;
+    let _ = placeholder_task.await;
+
+    Ok(())
 }
 
 fn health(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -143,10 +157,38 @@ fn print_inventory_snapshot(snapshot: &InventorySnapshot) {
     println!("spent_allocations={}", snapshot.spent_allocations);
 }
 
+fn spawn_cleanup_loop(maker: MockMaker, cleanup_interval_ms: u64) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_millis(cleanup_interval_ms));
+
+        loop {
+            interval.tick().await;
+            let released = maker.release_expired_reservations().await;
+            if released > 0 {
+                println!("released_expired_reservations={released}");
+            }
+        }
+    })
+}
+
+fn spawn_placeholder_loop(poll_interval_ms: u64) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_millis(poll_interval_ms));
+
+        loop {
+            interval.tick().await;
+            println!("maker-node placeholder tick");
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn cli_parses_commands() {
@@ -168,22 +210,40 @@ mod tests {
 
     #[test]
     fn config_uses_defaults_when_env_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let old_api_url = env::var("RFQ_API_URL").ok();
         let old_maker_id = env::var("MAKER_ID").ok();
         let old_poll_interval = env::var("POLL_INTERVAL_MS").ok();
+        let old_cleanup_interval = env::var("CLEANUP_INTERVAL_MS").ok();
         env::remove_var("RFQ_API_URL");
         env::remove_var("MAKER_ID");
         env::remove_var("POLL_INTERVAL_MS");
+        env::remove_var("CLEANUP_INTERVAL_MS");
 
         let config = MakerNodeConfig::from_env();
 
         restore_env("RFQ_API_URL", old_api_url);
         restore_env("MAKER_ID", old_maker_id);
         restore_env("POLL_INTERVAL_MS", old_poll_interval);
+        restore_env("CLEANUP_INTERVAL_MS", old_cleanup_interval);
 
         assert_eq!(config.rfq_api_url, "http://127.0.0.1:3000");
         assert_eq!(config.maker_id, "mock-maker-node");
         assert_eq!(config.poll_interval_ms, 1_000);
+        assert_eq!(config.cleanup_interval_ms, 1_000);
+    }
+
+    #[test]
+    fn config_reads_custom_cleanup_interval() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_cleanup_interval = env::var("CLEANUP_INTERVAL_MS").ok();
+        env::set_var("CLEANUP_INTERVAL_MS", "2500");
+
+        let config = MakerNodeConfig::from_env();
+
+        restore_env("CLEANUP_INTERVAL_MS", old_cleanup_interval);
+
+        assert_eq!(config.cleanup_interval_ms, 2_500);
     }
 
     #[tokio::test]
@@ -192,6 +252,7 @@ mod tests {
             rfq_api_url: "http://127.0.0.1:3000".to_owned(),
             maker_id: "test-maker".to_owned(),
             poll_interval_ms: 1_000,
+            cleanup_interval_ms: 1_000,
         };
 
         let snapshot = mock_maker(&config).inventory_summary().await;

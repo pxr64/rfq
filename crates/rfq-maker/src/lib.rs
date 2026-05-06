@@ -52,9 +52,15 @@ impl MockMaker {
 
     pub async fn inventory_summary(&self) -> InventorySnapshot {
         let mut inventory = self.inventory.write().await;
-        release_expired_reservations(&mut inventory, now_ms());
+        release_expired_reservations_in_inventory(&mut inventory, now_ms());
 
         summarize_inventory(&inventory)
+    }
+
+    pub async fn release_expired_reservations(&self) -> usize {
+        let mut inventory = self.inventory.write().await;
+
+        release_expired_reservations_in_inventory(&mut inventory, now_ms())
     }
 }
 
@@ -67,7 +73,7 @@ impl MakerConnector for MockMaker {
     async fn request_quote(&self, request: QuoteRequest) -> Result<Option<Quote>, RouterError> {
         let mut inventory = self.inventory.write().await;
         let now_ms = now_ms();
-        release_expired_reservations(&mut inventory, now_ms);
+        release_expired_reservations_in_inventory(&mut inventory, now_ms);
 
         let Some(allocation) = inventory.iter_mut().find(|managed| {
             matches!(&managed.state, AllocationState::Available)
@@ -104,7 +110,7 @@ impl MakerConnector for MockMaker {
     ) -> Result<SettlementIntent, RouterError> {
         {
             let mut inventory = self.inventory.write().await;
-            release_expired_reservations(&mut inventory, now_ms());
+            release_expired_reservations_in_inventory(&mut inventory, now_ms());
 
             if !has_reserved_quote(&inventory, &quote.quote_id) {
                 return Err(RouterError::Maker(
@@ -153,15 +159,23 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn release_expired_reservations(inventory: &mut [ManagedAllocation], now_ms: u64) {
+fn release_expired_reservations_in_inventory(
+    inventory: &mut [ManagedAllocation],
+    now_ms: u64,
+) -> usize {
+    let mut released = 0;
+
     for allocation in inventory {
         if matches!(
             &allocation.state,
             AllocationState::Reserved { expires_at_ms, .. } if *expires_at_ms <= now_ms
         ) {
             allocation.state = AllocationState::Available;
+            released += 1;
         }
     }
+
+    released
 }
 
 fn has_reserved_quote(inventory: &[ManagedAllocation], quote_id: &QuoteId) -> bool {
@@ -347,6 +361,52 @@ mod tests {
         assert_eq!(snapshot.available_allocations, 1);
         assert_eq!(snapshot.reserved_allocations, 0);
         assert!(matches!(inventory[0].state, AllocationState::Available));
+    }
+
+    #[tokio::test]
+    async fn release_expired_reservations_returns_count_and_releases() {
+        let maker = maker_with_inventory(vec![ManagedAllocation {
+            allocation: allocation(),
+            state: AllocationState::Reserved {
+                quote_id: QuoteId("expired-quote".to_owned()),
+                expires_at_ms: 0,
+            },
+        }]);
+
+        let released = maker.release_expired_reservations().await;
+        let inventory = maker.inventory_snapshot().await;
+
+        assert_eq!(released, 1);
+        assert!(matches!(inventory[0].state, AllocationState::Available));
+    }
+
+    #[tokio::test]
+    async fn release_expired_reservations_ignores_active_and_spent() {
+        let maker = maker_with_inventory(vec![
+            ManagedAllocation {
+                allocation: allocation(),
+                state: AllocationState::Reserved {
+                    quote_id: QuoteId("active-quote".to_owned()),
+                    expires_at_ms: now_ms() + 30_000,
+                },
+            },
+            ManagedAllocation {
+                allocation: allocation(),
+                state: AllocationState::Spent {
+                    quote_id: QuoteId("spent-quote".to_owned()),
+                },
+            },
+        ]);
+
+        let released = maker.release_expired_reservations().await;
+        let inventory = maker.inventory_snapshot().await;
+
+        assert_eq!(released, 0);
+        assert!(matches!(
+            inventory[0].state,
+            AllocationState::Reserved { .. }
+        ));
+        assert!(matches!(inventory[1].state, AllocationState::Spent { .. }));
     }
 
     #[tokio::test]
