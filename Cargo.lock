@@ -984,6 +984,7 @@ dependencies = [
  "rfq-rgb",
  "rfq-router",
  "rfq-types",
+ "tokio",
  "uuid",
 ]
 

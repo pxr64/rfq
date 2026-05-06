@@ -9,4 +9,5 @@ async-trait.workspace = true
 rfq-rgb = { path = "../rfq-rgb" }
 rfq-router = { path = "../rfq-router" }
 rfq-types = { path = "../rfq-types" }
+tokio.workspace = true
 uuid.workspace = true

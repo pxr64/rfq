@@ -88,11 +88,29 @@ pub enum SettlementStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Allocation {
     pub maker_id: MakerId,
     pub asset: AssetId,
     pub available_amount: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AllocationState {
+    Available,
+    Reserved {
+        quote_id: QuoteId,
+        expires_at_ms: u64,
+    },
+    Spent {
+        quote_id: QuoteId,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedAllocation {
+    pub allocation: Allocation,
+    pub state: AllocationState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
