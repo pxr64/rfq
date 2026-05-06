@@ -7,7 +7,9 @@ version.workspace = true
 [dependencies]
 async-trait.workspace = true
 futures.workspace = true
+reqwest.workspace = true
 rfq-core = { path = "../rfq-core" }
 rfq-types = { path = "../rfq-types" }
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -12,7 +12,7 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [x] Issue #2: Add maker inventory snapshot endpoint/helper
 - [x] Issue #3: Add quote expiry cleanup loop in maker-node
 - [x] Issue #4: Wire maker-node runtime to broker/client surfaces
-- [ ] Define broker-to-maker node protocol
+- [x] Define broker-to-maker node protocol
 - [ ] Define regtest RGB20 integration plan
 - [ ] Issue #9: Add RFQ settlement state machine
 - [ ] Issue #6: Add OpenAPI spec for public RFQ API

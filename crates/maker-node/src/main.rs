@@ -1,12 +1,24 @@
 use std::{env, sync::Arc, time::Duration};
 
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
 use clap::{Parser, Subcommand};
 use rfq_client::{RfqClient, Url};
 use rfq_maker::MockMaker;
 use rfq_rgb::MockRgbBackend;
-use rfq_types::{Allocation, AssetId, AssetKind, BitcoinNetwork, InventorySnapshot, MakerId};
+use rfq_router::MakerConnector;
+use rfq_store::{InMemoryQuoteStore, QuoteStore};
+use rfq_types::{
+    AcceptQuoteRequest, Allocation, AssetId, AssetKind, BitcoinNetwork, HealthResponse,
+    InventorySnapshot, MakerId, Quote, QuoteId, QuoteRequest, SettlementIntent,
+};
 use rfq_wallet::{MockWalletBackend, WalletBackend};
-use tokio::{task::JoinHandle, time};
+use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time};
 
 #[derive(Debug, Parser)]
 #[command(name = "maker-node", about = "Mock RGB RFQ maker daemon")]
@@ -25,6 +37,7 @@ enum Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MakerNodeConfig {
     rfq_api_url: String,
+    maker_listen_addr: String,
     maker_id: String,
     poll_interval_ms: u64,
     cleanup_interval_ms: u64,
@@ -35,6 +48,8 @@ impl MakerNodeConfig {
         Self {
             rfq_api_url: env::var("RFQ_API_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned()),
+            maker_listen_addr: env::var("MAKER_LISTEN_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1:4000".to_owned()),
             maker_id: env::var("MAKER_ID").unwrap_or_else(|_| "mock-maker-node".to_owned()),
             poll_interval_ms: env::var("POLL_INTERVAL_MS")
                 .ok()
@@ -75,12 +90,16 @@ async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> 
     let _client = RfqClient::new(config.api_url()?);
     let wallet = MockWalletBackend::default();
     let maker = mock_maker(&config);
+    let app = maker_app(maker.clone());
+    let listener = TcpListener::bind(&config.maker_listen_addr).await?;
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let maker_type = std::any::type_name::<MockMaker>();
     let sample_invoice = wallet.create_rgb_invoice("mock-contract", 1)?;
 
     println!("maker-node starting");
     println!("maker_id={}", config.maker_id);
     println!("rfq_api_url={}", config.rfq_api_url);
+    println!("maker_listen_addr={}", config.maker_listen_addr);
     println!("poll_interval_ms={}", config.poll_interval_ms);
     println!("cleanup_interval_ms={}", config.cleanup_interval_ms);
     println!("wallet_sample_invoice={sample_invoice}");
@@ -88,12 +107,24 @@ async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> 
 
     let cleanup_task = spawn_cleanup_loop(maker.clone(), config.cleanup_interval_ms);
     let placeholder_task = spawn_placeholder_loop(config.poll_interval_ms);
+    let server_task = tokio::spawn(async move {
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        if let Err(error) = result {
+            eprintln!("maker-node HTTP server error: {error}");
+        }
+    });
 
     tokio::signal::ctrl_c().await?;
     println!("maker-node shutting down");
 
+    let _ = shutdown_tx.send(());
     cleanup_task.abort();
     placeholder_task.abort();
+    let _ = server_task.await;
     let _ = cleanup_task.await;
     let _ = placeholder_task.await;
 
@@ -156,6 +187,85 @@ fn mock_maker(config: &MakerNodeConfig) -> MockMaker {
     MockMaker::new(maker_id, vec![allocation], rgb_backend)
 }
 
+#[derive(Clone)]
+struct MakerNodeState {
+    maker: MockMaker,
+    store: InMemoryQuoteStore,
+}
+
+fn maker_app(maker: MockMaker) -> Router {
+    Router::new()
+        .route("/health", get(maker_health))
+        .route("/inventory", get(maker_inventory))
+        .route("/quotes", post(maker_quote))
+        .route("/quotes/:quote_id/accept", post(maker_accept_quote))
+        .with_state(MakerNodeState {
+            maker,
+            store: InMemoryQuoteStore::new(),
+        })
+}
+
+async fn maker_health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_owned(),
+    })
+}
+
+async fn maker_inventory(State(state): State<MakerNodeState>) -> Json<InventorySnapshot> {
+    Json(state.maker.inventory_summary().await)
+}
+
+async fn maker_quote(
+    State(state): State<MakerNodeState>,
+    Json(request): Json<QuoteRequest>,
+) -> Result<Json<Option<Quote>>, MakerNodeHttpError> {
+    let quote = state.maker.request_quote(request).await?;
+    if let Some(quote) = &quote {
+        state.store.save_quote(quote.clone()).await;
+    }
+
+    Ok(Json(quote))
+}
+
+async fn maker_accept_quote(
+    State(state): State<MakerNodeState>,
+    Path(quote_id): Path<String>,
+    Json(mut request): Json<AcceptQuoteRequest>,
+) -> Result<Json<SettlementIntent>, MakerNodeHttpError> {
+    let quote_id = QuoteId(quote_id);
+    let quote = state
+        .store
+        .get_quote(&quote_id)
+        .await
+        .ok_or(MakerNodeHttpError::NotFound)?;
+    request.quote_id = quote_id;
+
+    Ok(Json(state.maker.accept_quote(quote, request).await?))
+}
+
+#[derive(Debug)]
+enum MakerNodeHttpError {
+    NotFound,
+    Maker(String),
+}
+
+impl IntoResponse for MakerNodeHttpError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            MakerNodeHttpError::NotFound => (StatusCode::NOT_FOUND, "quote not found".to_owned()),
+            MakerNodeHttpError::Maker(message) => (StatusCode::BAD_REQUEST, message),
+        };
+
+        (status, message).into_response()
+    }
+}
+
+impl From<rfq_router::RouterError> for MakerNodeHttpError {
+    fn from(error: rfq_router::RouterError) -> Self {
+        MakerNodeHttpError::Maker(error.to_string())
+    }
+}
+
 fn print_inventory_snapshot(snapshot: &InventorySnapshot) {
     println!("total_amount={}", snapshot.total_amount);
     println!("available_amount={}", snapshot.available_amount);
@@ -195,8 +305,14 @@ fn spawn_placeholder_loop(poll_interval_ms: u64) -> JoinHandle<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Method, Request},
+    };
     use clap::CommandFactory;
+    use rfq_types::{RfqId, SettlementStatus, Side};
     use std::sync::Mutex;
+    use tower::ServiceExt;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -222,10 +338,12 @@ mod tests {
     fn config_uses_defaults_when_env_missing() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_api_url = env::var("RFQ_API_URL").ok();
+        let old_maker_listen_addr = env::var("MAKER_LISTEN_ADDR").ok();
         let old_maker_id = env::var("MAKER_ID").ok();
         let old_poll_interval = env::var("POLL_INTERVAL_MS").ok();
         let old_cleanup_interval = env::var("CLEANUP_INTERVAL_MS").ok();
         env::remove_var("RFQ_API_URL");
+        env::remove_var("MAKER_LISTEN_ADDR");
         env::remove_var("MAKER_ID");
         env::remove_var("POLL_INTERVAL_MS");
         env::remove_var("CLEANUP_INTERVAL_MS");
@@ -233,11 +351,13 @@ mod tests {
         let config = MakerNodeConfig::from_env();
 
         restore_env("RFQ_API_URL", old_api_url);
+        restore_env("MAKER_LISTEN_ADDR", old_maker_listen_addr);
         restore_env("MAKER_ID", old_maker_id);
         restore_env("POLL_INTERVAL_MS", old_poll_interval);
         restore_env("CLEANUP_INTERVAL_MS", old_cleanup_interval);
 
         assert_eq!(config.rfq_api_url, "http://127.0.0.1:3000");
+        assert_eq!(config.maker_listen_addr, "127.0.0.1:4000");
         assert_eq!(config.maker_id, "mock-maker-node");
         assert_eq!(config.poll_interval_ms, 1_000);
         assert_eq!(config.cleanup_interval_ms, 1_000);
@@ -258,14 +378,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_inventory_summary_is_available_by_default() {
-        let config = MakerNodeConfig {
-            rfq_api_url: "http://127.0.0.1:3000".to_owned(),
-            maker_id: "test-maker".to_owned(),
-            poll_interval_ms: 1_000,
-            cleanup_interval_ms: 1_000,
-        };
-
-        let snapshot = mock_maker(&config).inventory_summary().await;
+        let snapshot = mock_maker(&test_config()).inventory_summary().await;
 
         assert_eq!(snapshot.total_amount, 1_000_000);
         assert_eq!(snapshot.available_amount, 1_000_000);
@@ -275,6 +388,162 @@ mod tests {
         assert_eq!(snapshot.available_allocations, 1);
         assert_eq!(snapshot.reserved_allocations, 0);
         assert_eq!(snapshot.spent_allocations, 0);
+    }
+
+    #[tokio::test]
+    async fn maker_http_health_returns_ok() {
+        let response = test_app()
+            .oneshot(empty_request(Method::GET, "/health"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let health: HealthResponse = read_json(response).await;
+        assert_eq!(health.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn maker_http_inventory_returns_snapshot() {
+        let response = test_app()
+            .oneshot(empty_request(Method::GET, "/inventory"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot: InventorySnapshot = read_json(response).await;
+        assert_eq!(snapshot.available_amount, 1_000_000);
+        assert_eq!(snapshot.available_allocations, 1);
+    }
+
+    #[tokio::test]
+    async fn maker_http_quote_returns_quote_and_reserves_inventory() {
+        let app = test_app();
+
+        let quote = request_quote(app.clone(), "rfq-1").await;
+        let response = app
+            .oneshot(empty_request(Method::GET, "/inventory"))
+            .await
+            .unwrap();
+        let snapshot: InventorySnapshot = read_json(response).await;
+
+        assert_eq!(quote.amount, 100);
+        assert_eq!(snapshot.available_amount, 0);
+        assert_eq!(snapshot.reserved_amount, 1_000_000);
+        assert_eq!(snapshot.reserved_allocations, 1);
+    }
+
+    #[tokio::test]
+    async fn maker_http_accept_returns_settlement_intent() {
+        let app = test_app();
+        let quote = request_quote(app.clone(), "rfq-accept").await;
+        let request = AcceptQuoteRequest {
+            quote_id: quote.quote_id.clone(),
+            rgb_invoice: "rgb:test_invoice".to_owned(),
+        };
+
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/quotes/{}/accept", quote.quote_id.0),
+                &request,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let settlement: SettlementIntent = read_json(response).await;
+        assert_eq!(settlement.quote_id, quote.quote_id);
+        assert_eq!(settlement.status, SettlementStatus::Ready);
+        assert!(settlement.transfer.is_some());
+    }
+
+    #[tokio::test]
+    async fn maker_http_accept_unknown_quote_returns_not_found() {
+        let request = AcceptQuoteRequest {
+            quote_id: QuoteId("missing".to_owned()),
+            rgb_invoice: "rgb:test_invoice".to_owned(),
+        };
+
+        let response = test_app()
+            .oneshot(json_request(
+                Method::POST,
+                "/quotes/missing/accept",
+                &request,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn test_app() -> Router {
+        maker_app(mock_maker(&test_config()))
+    }
+
+    fn test_config() -> MakerNodeConfig {
+        MakerNodeConfig {
+            rfq_api_url: "http://127.0.0.1:3000".to_owned(),
+            maker_listen_addr: "127.0.0.1:4000".to_owned(),
+            maker_id: "test-maker".to_owned(),
+            poll_interval_ms: 1_000,
+            cleanup_interval_ms: 1_000,
+        }
+    }
+
+    async fn request_quote(app: Router, rfq_id: &str) -> Quote {
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/quotes",
+                &quote_request(rfq_id),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let quote: Option<Quote> = read_json(response).await;
+        quote.unwrap()
+    }
+
+    fn quote_request(rfq_id: &str) -> QuoteRequest {
+        QuoteRequest {
+            rfq_id: RfqId(rfq_id.to_owned()),
+            base_asset: AssetId {
+                network: BitcoinNetwork::Regtest,
+                kind: AssetKind::Rgb20,
+                id: "rgb-test-asset".to_owned(),
+            },
+            quote_asset: AssetId {
+                network: BitcoinNetwork::Regtest,
+                kind: AssetKind::Btc,
+                id: "btc".to_owned(),
+            },
+            side: Side::Buy,
+            amount: 100,
+            created_at_ms: 1,
+        }
+    }
+
+    fn empty_request(method: Method, uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn json_request<T: serde::Serialize>(method: Method, uri: &str, body: &T) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    async fn read_json<T: serde::de::DeserializeOwned>(response: Response) -> T {
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 
     fn restore_env(key: &str, value: Option<String>) {
