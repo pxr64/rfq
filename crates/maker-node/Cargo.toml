@@ -1,0 +1,12 @@
+[package]
+name = "maker-node"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+clap.workspace = true
+rfq-client = { path = "../rfq-client" }
+rfq-maker = { path = "../rfq-maker" }
+rfq-wallet = { path = "../rfq-wallet" }
+tokio.workspace = true

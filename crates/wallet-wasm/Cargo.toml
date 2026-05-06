@@ -1,0 +1,13 @@
+[package]
+name = "wallet-wasm"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rfq-wallet = { path = "../rfq-wallet" }
+wasm-bindgen.workspace = true
+

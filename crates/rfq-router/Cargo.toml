@@ -1,0 +1,13 @@
+[package]
+name = "rfq-router"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+rfq-core = { path = "../rfq-core" }
+rfq-types = { path = "../rfq-types" }
+thiserror.workspace = true
+tokio.workspace = true

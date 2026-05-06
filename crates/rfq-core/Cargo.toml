@@ -1,0 +1,9 @@
+[package]
+name = "rfq-core"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+rfq-types = { path = "../rfq-types" }
+thiserror.workspace = true

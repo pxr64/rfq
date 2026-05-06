@@ -1,0 +1,22 @@
+[package]
+name = "rfq-api"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+axum.workspace = true
+http.workspace = true
+rfq-core = { path = "../rfq-core" }
+rfq-maker = { path = "../rfq-maker" }
+rfq-rgb = { path = "../rfq-rgb" }
+rfq-router = { path = "../rfq-router" }
+rfq-store = { path = "../rfq-store" }
+rfq-types = { path = "../rfq-types" }
+serde.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tower.workspace = true

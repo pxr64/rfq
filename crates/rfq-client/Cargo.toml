@@ -1,0 +1,12 @@
+[package]
+name = "rfq-client"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+reqwest.workspace = true
+rfq-types = { path = "../rfq-types" }
+serde.workspace = true
+thiserror.workspace = true
+

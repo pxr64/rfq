@@ -1,0 +1,10 @@
+[package]
+name = "rfq-rgb"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+rfq-types = { path = "../rfq-types" }
+thiserror.workspace = true
