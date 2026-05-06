@@ -4,7 +4,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use rfq_core::is_quote_expired;
@@ -14,8 +14,8 @@ use rfq_router::{fanout_quote, MakerConnector};
 use rfq_store::{InMemoryQuoteStore, QuoteStore};
 pub use rfq_types::CreateRfqRequest;
 use rfq_types::{
-    AcceptQuoteRequest, Allocation, AssetId, AssetKind, BitcoinNetwork, MakerId, Quote, QuoteId,
-    QuoteRequest, RfqId, SettlementIntent,
+    AcceptQuoteRequest, Allocation, AssetId, AssetKind, BitcoinNetwork, HealthResponse, MakerId,
+    Quote, QuoteId, QuoteRequest, RfqId, SettlementIntent,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -54,9 +54,16 @@ pub fn app() -> Router {
 
 pub fn app_with_state(state: AppState) -> Router {
     Router::new()
+        .route("/health", get(health))
         .route("/rfq", post(create_rfq))
         .route("/quotes/:id/accept", post(accept_quote))
         .with_state(state)
+}
+
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse {
+        status: "ok".to_owned(),
+    })
 }
 
 async fn create_rfq(

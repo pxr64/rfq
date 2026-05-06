@@ -66,7 +66,7 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Command::Run => run(config).await,
-        Command::Health => health(config),
+        Command::Health => health(config).await,
         Command::Inventory => inventory(config).await,
     }
 }
@@ -100,14 +100,15 @@ async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn health(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let _client = RfqClient::new(config.api_url()?);
+async fn health(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let broker_status = broker_health_status(&config).await?;
     let wallet = MockWalletBackend::default();
     let _sample_signed_psbt = wallet.sign_psbt("mock-psbt")?;
 
     println!("maker-node health ok");
     println!("maker_id={}", config.maker_id);
     println!("rfq_api_url={}", config.rfq_api_url);
+    println!("broker_status={broker_status}");
     println!("wallet=mock-ready");
     println!(
         "maker_runtime={}",
@@ -115,6 +116,15 @@ fn health(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+async fn broker_health_status(
+    config: &MakerNodeConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let client = RfqClient::new(config.api_url()?);
+    let response = client.health().await?;
+
+    Ok(response.status)
 }
 
 async fn inventory(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {

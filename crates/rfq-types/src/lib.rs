@@ -54,6 +54,11 @@ pub struct CreateRfqRequest {
     pub amount: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HealthResponse {
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Quote {
     pub quote_id: QuoteId,

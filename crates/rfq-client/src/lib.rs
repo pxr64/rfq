@@ -1,6 +1,6 @@
 use reqwest::StatusCode;
 pub use reqwest::Url;
-use rfq_types::{AcceptQuoteRequest, CreateRfqRequest, Quote, SettlementIntent};
+use rfq_types::{AcceptQuoteRequest, CreateRfqRequest, HealthResponse, Quote, SettlementIntent};
 use thiserror::Error;
 
 pub struct RfqClient {
@@ -22,6 +22,13 @@ impl RfqClient {
     ) -> Result<Vec<Quote>, RfqClientError> {
         let url = self.endpoint("rfq")?;
         let response = self.http.post(url).json(&request).send().await?;
+
+        parse_response(response).await
+    }
+
+    pub async fn health(&self) -> Result<HealthResponse, RfqClientError> {
+        let url = self.endpoint("health")?;
+        let response = self.http.get(url).send().await?;
 
         parse_response(response).await
     }

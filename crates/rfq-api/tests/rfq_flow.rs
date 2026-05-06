@@ -4,9 +4,32 @@ use axum::{
 };
 use rfq_api::{AcceptQuoteBody, CreateRfqRequest};
 use rfq_types::{
-    AssetId, AssetKind, BitcoinNetwork, Quote, SettlementIntent, SettlementStatus, Side,
+    AssetId, AssetKind, BitcoinNetwork, HealthResponse, Quote, SettlementIntent, SettlementStatus,
+    Side,
 };
 use tower::ServiceExt;
+
+#[tokio::test]
+async fn health_returns_ok() {
+    let app = rfq_api::app();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let health: HealthResponse = serde_json::from_slice(&body).unwrap();
+    assert_eq!(health.status, "ok");
+}
 
 #[tokio::test]
 async fn rfq_quote_accept_flow_succeeds() {
