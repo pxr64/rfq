@@ -16,9 +16,9 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [x] Define regtest RGB20 integration plan
 - [x] Validate end-to-end NIA issuance + issuer→maker transfer on regtest
 - [ ] Issue #13: Implement library-backed `rfq-rgb` adapter
+- [ ] Issue #14: RGB maker UTXO inventory management (supersedes #11)
 - [ ] Issue #9: Add RFQ settlement state machine
 - [ ] Issue #6: Add OpenAPI spec for public RFQ API
-- [ ] Issue #11: Explore splitting a maker allocation across multiple accepted buyers
 
 ## Issue #2: Inventory Snapshot
 
@@ -81,6 +81,22 @@ Wrap the proven manual regtest RGB flow behind adapter traits, using `rgb-std` +
 - Keep `rgb-*` / `bp-*` deps strictly inside `crates/rfq-rgb`; downstream callers only import the rfq-rgb trait.
 - Keep normal tests mocked; add `#[ignore]` integration tests under `crates/rfq-rgb/tests/cli.rs` for the Docker regtest stack.
 
+## RGB Maker UTXO Inventory Management (Issue #14)
+
+Track RGB-colored UTXOs as denomination units so the maker can fulfill RFQs safely at scale without UTXO bloat, fragmentation, or fee blow-up. Replaces the current whole-allocation reservation model. Supersedes #11 (allocation splitting becomes a side-effect of per-UTXO tracking).
+
+Per-UTXO data model: `InventoryUtxo { outpoint, asset_id, amount, btc_sats, status, created_at, updated_at, pending_txid }` with an `InventoryStatus` enum covering `Available`, `Reserved { rfq_id, expires_at }`, `PendingBitcoinConfirm`, `PendingRgbAcceptance`, `Spent`, `Invalid`.
+
+- Surface seal/outpoint per allocation in `rfq-rgb` (the data is already there in `LibRgbBackend`; just stop discarding it).
+- Replace `MockMaker`'s whole-allocation reservation with per-UTXO reservation; atomic + concurrency-safe.
+- Denomination-aware coin selection — start greedy-exact-fit (minimize input count, minimize change, prefer exact matches), iterate to fee-aware scoring later.
+- Change management: re-ingest change UTXOs from successful transfers back into inventory; optionally normalize into target denomination buckets.
+- Persistence behind an `rfq-store` adapter trait (SQLite or RocksDB): atomic reservation updates, durable settlement tracking, crash-safe recovery.
+- Periodic rebalancing loop mirroring `spawn_cleanup_loop` in `crates/maker-node/src/main.rs` — trigger on UTXO count / fragmentation score / fee environment; maintain a target distribution policy.
+- Extended inventory metrics: `total_balance`, `available_balance`, `reserved_balance`, `fragmentation_score`, `average_input_count`, `average_change_ratio`, `pending_settlements`.
+- Failure handling: release stale reservations, reconcile chain state under reorgs, mark invalid allocations after failed broadcasts / failed RGB acceptance.
+- Depends on **#13** for real per-UTXO data and the witness-tx round-trip; should land before **#9** (settlement state machine needs to know which UTXOs got reserved/spent).
+
 ## Issue #9: Settlement State Machine
 
 Make quote acceptance and settlement lifecycle explicit before real RGB/Bitcoin execution.
@@ -102,4 +118,4 @@ Document the broker contract once the core broker and maker-node surfaces stabil
 - Maker inventory remains maker-owned; the broker may observe inventory but should not reserve or mutate it directly.
 - The MVP targets Bitcoin regtest with a full RGB node and issued RGB20 assets.
 - Mocks remain the default for unit tests and local fast checks.
-- Whole-allocation reservation stays in place until partial allocation splitting is explored.
+- Whole-allocation reservation is the current MVP behavior; per-UTXO reservation + denomination-aware coin selection arrive under issue #14.
