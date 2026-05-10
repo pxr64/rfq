@@ -193,6 +193,37 @@ Success means:
 - taker sees the received amount in `rgb_taker state "$contract_id"`
 - maker sees the remaining/change amount in `rgb_maker state "$contract_id"`
 
+## Known Constraints & Version Pins
+
+Gotchas baked into the stack today. If you bump any pinned version, re-check this list before declaring the upgrade clean.
+
+### Indexer
+
+- **electrs must be a romanz build, not a blockstream-fork derivative.** `bp-wallet 0.11.1-alpha.2`'s electrum parser is brittle to `blockchain.transaction.get` response-shape differences: against `mempool/electrs` or `getumbrel/electrs` it trips an internal `expect("broken logic")` at `src/indexers/electrum.rs:220` during keychain sync. We work around this by building `romanz/electrs` v0.11.1 from source in [electrs.Dockerfile](../infra/regtest/electrs.Dockerfile).
+- **`-v` flag is rejected by romanz/electrs v0.11.1** even though `--help` advertises it. Use `--log-filters=INFO` instead (already set in `docker-compose.yml`).
+
+### bitcoind auth
+
+- **bitcoind uses cookie auth, not `-rpcuser`/`-rpcpassword`.** romanz/electrs 0.11.1 only supports `--cookie-file=<path>` (no `--cookie=user:pass` flag). If both `-rpcuser` AND `--cookie-file` are set, bitcoind suppresses cookie generation and electrs fails to start.
+- **`bitcoin-cli` running inside the container needs `-datadir=/home/bitcoin/.bitcoin`.** `docker compose exec` runs as root, but bitcoind runs as the `bitcoin` user (uid 101) and writes `.cookie` under `/home/bitcoin/.bitcoin/regtest/`. Without the `-datadir` flag, bitcoin-cli looks at `/root/.bitcoin/regtest/.cookie`, doesn't find it, and bails with "Could not locate RPC credentials." Already applied to the healthcheck and the `bcli` helpers.
+
+### Wallet descriptor
+
+- **Multipath terminal must declare keychain 9 explicitly.** rgb-cmd uses keychain 9 for RGB seal anchors (`rgb address -k 9`). BIP-389 multipath descriptors are strict — `/<0;1>/*` would reject derivation at index 9. The `rgb-wallets-init` script writes `/<0;1;9>/*` so receive (0), change (1), and seal-anchor (9) chains are all valid.
+- **`--electrum=` baked empty into shell aliases stays empty.** Shell `alias` definitions evaluate `$VAR` at definition time. If you paste the alias block while `$ELECTRUM_URL` is unset, the alias captures `--electrum=` with no value; later setting `ELECTRUM_URL=...` doesn't fix it. Stash-only commands (`contracts`, `schemata`, `inspect`) still work; anything that needs the indexer (`address`, `utxos --sync`, `invoice`, `transfer`, `finalize -p`) fails with "invalid socket address." Recovery: `unalias rgb_issuer rgb_maker rgb_taker bcli bp bphot` then re-paste the export block with `ELECTRUM_URL` set first.
+
+### Tooling versions
+
+- **bp-hot 0.11.1-alpha.2 only generates random seeds** — no `--import-mnemonic` flag. `regtest-reset` regenerates fresh seeds, so issuer/maker/taker addresses (and outpoints) change after every reset. Back up `infra/regtest/wallets/*.seed` if you want continuity.
+- **rgb-schemata must be checked out on the `v0.11.1` branch**, not `master`. `master` tracks `v0.11.0-beta.9` schemata, which fail rgb-cmd 0.11.1-rc.6 import with `Error: entity not found`. The `rgb-schemas-fetch` make target pins `v0.11.1`; override via `RGB_SCHEMAS_REF=<ref>` if you need a different version. Note that the v0.11.1 branch uses singular filenames (`NonInflatableAsset.rgb`); master uses plural (`NonInflatableAssets.rgb`).
+- **Stable contract id requires a stable contract YAML AND a stable seal outpoint.** Even if [artifacts/rfq-nia.yaml](../infra/regtest/artifacts/rfq-nia.yaml) is byte-identical, re-issuing produces a different contract id because the genesis hash bakes in a creation timestamp (visible as the date column in `rgb_issuer contracts`). To reuse a contract id across resets you'd need to back up `data/issuer/regtest/*.dat` along with the wallet.
+
+### Operational
+
+- **`make regtest-reset` wipes `wallets/`, `data/`, `artifacts/`, and `contracts/generated/`.** It does not wipe `tools/` (so the cargo-installed binaries survive). Use `regtest-down` if you want to stop services without losing state.
+- **`docker compose down -v` wipes ALL Docker volumes** (bitcoind chain state + electrs index). Prefer `docker compose down` (no `-v`) and selective `docker volume rm regtest_electrs-data` if you only want to reset the index.
+- **`make regtest-up` now does `compose up -d --build`** so Dockerfile edits are picked up automatically. Cached builds skip in seconds; clean rebuilds take ~5-10 min (the cargo + dep compile inside the electrs builder stage).
+
 ## RFQ Integration Notes
 
 The next implementation should add a CLI-backed adapter while preserving crate boundaries:

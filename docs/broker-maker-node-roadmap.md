@@ -14,6 +14,7 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [x] Issue #4: Wire maker-node runtime to broker/client surfaces
 - [x] Define broker-to-maker node protocol
 - [x] Define regtest RGB20 integration plan
+- [x] Validate end-to-end NIA issuance + issuer→maker transfer on regtest
 - [ ] Implement CLI-backed `rfq-rgb` adapter
 - [ ] Issue #9: Add RFQ settlement state machine
 - [ ] Issue #6: Add OpenAPI spec for public RFQ API
