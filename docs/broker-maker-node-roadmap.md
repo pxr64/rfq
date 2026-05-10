@@ -15,7 +15,7 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [x] Define broker-to-maker node protocol
 - [x] Define regtest RGB20 integration plan
 - [x] Validate end-to-end NIA issuance + issuer→maker transfer on regtest
-- [ ] Implement CLI-backed `rfq-rgb` adapter
+- [ ] Issue #13: Implement library-backed `rfq-rgb` adapter
 - [ ] Issue #9: Add RFQ settlement state machine
 - [ ] Issue #6: Add OpenAPI spec for public RFQ API
 - [ ] Issue #11: Explore splitting a maker allocation across multiple accepted buyers
@@ -71,13 +71,15 @@ Define how the mock-only scaffolding becomes a real regtest MVP without leaking 
 - Keep `rfq-api`, `rfq-router`, `rfq-core`, and `rfq-types` free of real RGB implementation dependencies.
 - Keep unit tests mock-based; add optional ignored integration tests for a running regtest Bitcoin/RGB environment later.
 
-## CLI-Backed `rfq-rgb` Adapter
+## Library-Backed `rfq-rgb` Adapter (Issue #13)
 
-Wrap the proven manual regtest RGB flow behind adapter traits.
+Wrap the proven manual regtest RGB flow behind adapter traits, using `rgb-std` + `bp-wallet` crates directly (the same libraries `rgb-cmd` builds on). Subprocess shell-outs were considered and rejected: brittle text parsing, no type safety, no win on isolation since the RGB dep graph still lives inside `rfq-rgb` either way.
 
-- Add a command-backed RGB backend in `rfq-rgb`.
-- Add maker-node config for RGB data dirs, contract id, Electrum URL, and wallet names.
-- Keep normal tests mocked; add ignored integration tests for the Docker regtest stack.
+- Add `LibRgbBackend` in `rfq-rgb` using `Stock`, `RgbWallet`, `RgbInvoice`, `ContractBuilder` directly.
+- Expand the `RgbBackend` trait with `finalize_and_broadcast` so signing stays outside rfq-rgb (lives in rfq-wallet eventually).
+- Add maker-node config for RGB data dir, contract id, Electrum URL, wallet name, network.
+- Keep `rgb-*` / `bp-*` deps strictly inside `crates/rfq-rgb`; downstream callers only import the rfq-rgb trait.
+- Keep normal tests mocked; add `#[ignore]` integration tests under `crates/rfq-rgb/tests/cli.rs` for the Docker regtest stack.
 
 ## Issue #9: Settlement State Machine
 
