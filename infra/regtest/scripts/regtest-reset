@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/common.sh"
+
+require_command docker
+compose down -v
+rm -rf "$ARTIFACTS_DIR" "$DATA_DIR" "$WALLETS_DIR" "$ROOT_DIR/contracts/generated"
+mkdir -p "$ARTIFACTS_DIR" "$DATA_DIR"/{issuer,maker,taker} "$WALLETS_DIR" "$ROOT_DIR/contracts/generated"
+echo "regtest RGB data reset"

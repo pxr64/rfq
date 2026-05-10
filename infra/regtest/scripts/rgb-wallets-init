@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/common.sh"
+
+require_docker_services
+require_rgb_tools
+ensure_dirs
+
+# bp-hot 0.11.1-alpha.2 generates a random seed (no mnemonic-import flag).
+# We persist seed + account + extracted descriptor under $WALLETS_DIR so the
+# rest of the manual checklist (rgb create, address, transfer, ...) stays
+# stable between runs. `make regtest-reset` wipes $WALLETS_DIR, after which
+# fresh seeds get generated on the next invocation.
+export SEED_PASSWORD=""
+
+roles=(issuer maker taker)
+
+for role in "${roles[@]}"; do
+  seed_file="$WALLETS_DIR/$role.seed"
+  account_file="$WALLETS_DIR/$role.account"
+  descriptor_file="$WALLETS_DIR/$role.descriptor"
+
+  if [[ ! -f "$seed_file" ]]; then
+    "$TOOLS_DIR/bp-wallet/bin/bp-hot" seed "$seed_file" >/dev/null
+    echo "created $seed_file"
+  fi
+
+  if [[ ! -f "$descriptor_file" ]]; then
+    derive_output="$(
+      "$TOOLS_DIR/bp-wallet/bin/bp-hot" derive -N \
+        --scheme bip84 --account 0h \
+        "$seed_file" "$account_file"
+    )"
+    descriptor="$(printf '%s\n' "$derive_output" | awk '/^Account:/ { print $2 }')"
+    if [[ -z "$descriptor" ]]; then
+      echo "failed to parse descriptor from bp-hot derive output:" >&2
+      printf '%s\n' "$derive_output" >&2
+      exit 1
+    fi
+    # /<0;1;9>/* terminal declares external (0), change (1), and the
+    # RGB seal-anchor keychain (9). rgb address -k 9 needs keychain 9 in
+    # the descriptor or it can't derive anchor addresses.
+    printf '%s/<0;1;9>/*\n' "$descriptor" > "$descriptor_file"
+    echo "created $descriptor_file"
+  fi
+done
+
+echo
+echo "wallet descriptors ready:"
+for role in "${roles[@]}"; do
+  echo "  $role: $WALLETS_DIR/$role.descriptor"
+done
+echo
+echo "next: see docs/regtest-rgb20-nia-dev-infra.md for the rgb create commands"

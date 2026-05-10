@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/common.sh"
+
+require_docker_services
+require_rgb_tools
+ensure_dirs
+
+manual_step "rgb-issue-asset" \
+  "Import the NonInflatableAsset schema, fund the issuer outpoint, render a contract definition, and run rgb issue. Save the resulting contract_id for RFQ asset config."

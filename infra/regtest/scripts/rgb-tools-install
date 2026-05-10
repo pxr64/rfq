@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/common.sh"
+
+require_command cargo
+ensure_dirs
+
+cargo install bp-wallet \
+  --version "$BP_WALLET_VERSION" \
+  --root "$TOOLS_DIR/bp-wallet" \
+  --features=cli,hot
+
+cargo install rgb-cmd \
+  --version "$RGB_CMD_VERSION" \
+  --root "$TOOLS_DIR/rgb-cmd"
+
+echo "installed bp-wallet $BP_WALLET_VERSION and rgb-cmd $RGB_CMD_VERSION under $TOOLS_DIR"

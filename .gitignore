@@ -3,3 +3,8 @@
 .env.*
 !.env.example
 .DS_Store
+infra/regtest/artifacts/
+infra/regtest/contracts/generated/
+infra/regtest/data/
+infra/regtest/tools/
+infra/regtest/wallets/

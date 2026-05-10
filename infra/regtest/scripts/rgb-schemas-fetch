@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/common.sh"
+
+require_command git
+ensure_dirs
+
+target="$TOOLS_DIR/rgb-schemas"
+# v0.11.1 branch matches rgb-cmd 0.11.1-rc.6; master is on the older 0.11.0
+# beta line and produces "entity not found" errors during import.
+ref="${RGB_SCHEMAS_REF:-v0.11.1}"
+repo="${RGB_SCHEMAS_REPO:-https://github.com/RGB-WG/rgb-schemata.git}"
+
+if [[ ! -d "$target/.git" ]]; then
+  git clone "$repo" "$target"
+fi
+git -C "$target" fetch --quiet origin
+git -C "$target" checkout --quiet "$ref"
+
+schema_file="$target/schemata/NonInflatableAsset.rgb"
+if [[ ! -f "$schema_file" ]]; then
+  echo "expected schema file not found: $schema_file" >&2
+  echo "check $target/schemata/ for the current filename" >&2
+  exit 1
+fi
+
+echo "rgb-schemas ready at: $target"
+echo "schema file:          $schema_file"
+echo "export SCHEMATA_DIR=\"$target/schemata\""

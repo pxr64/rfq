@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/common.sh"
+
+require_docker_services
+
+blocks="${1:-1}"
+
+if ! bcli -rpcwallet="$BITCOIN_WALLET" getwalletinfo >/dev/null 2>&1; then
+  if bcli listwalletdir | grep -q "\"$BITCOIN_WALLET\""; then
+    bcli loadwallet "$BITCOIN_WALLET" >/dev/null
+  else
+    bcli createwallet "$BITCOIN_WALLET" >/dev/null
+  fi
+fi
+
+address="$(bcli -rpcwallet="$BITCOIN_WALLET" getnewaddress "" bech32)"
+bcli -rpcwallet="$BITCOIN_WALLET" generatetoaddress "$blocks" "$address"

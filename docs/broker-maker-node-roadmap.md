@@ -13,7 +13,8 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [x] Issue #3: Add quote expiry cleanup loop in maker-node
 - [x] Issue #4: Wire maker-node runtime to broker/client surfaces
 - [x] Define broker-to-maker node protocol
-- [ ] Define regtest RGB20 integration plan
+- [x] Define regtest RGB20 integration plan
+- [ ] Implement CLI-backed `rfq-rgb` adapter
 - [ ] Issue #9: Add RFQ settlement state machine
 - [ ] Issue #6: Add OpenAPI spec for public RFQ API
 - [ ] Issue #11: Explore splitting a maker allocation across multiple accepted buyers
@@ -60,11 +61,22 @@ Define the network boundary between broker and external maker nodes.
 
 Define how the mock-only scaffolding becomes a real regtest MVP without leaking RGB dependencies into broker/core crates.
 
+- Add Docker-based regtest infrastructure under `infra/regtest`.
+- Use `bitcoind`, `electrs`, and pinned RGB sandbox-compatible CLI tooling.
+- Document the manual NIA issuance and issuer-to-maker-to-taker transfer path.
 - Keep real RGB node/client dependencies isolated in `rfq-rgb`.
 - Keep wallet/key/PSBT/invoice behavior behind `rfq-wallet`.
 - Add maker-node config for Bitcoin regtest, RGB node endpoint, RGB20 contract IDs, inventory, and wallet/key material.
 - Keep `rfq-api`, `rfq-router`, `rfq-core`, and `rfq-types` free of real RGB implementation dependencies.
 - Keep unit tests mock-based; add optional ignored integration tests for a running regtest Bitcoin/RGB environment later.
+
+## CLI-Backed `rfq-rgb` Adapter
+
+Wrap the proven manual regtest RGB flow behind adapter traits.
+
+- Add a command-backed RGB backend in `rfq-rgb`.
+- Add maker-node config for RGB data dirs, contract id, Electrum URL, and wallet names.
+- Keep normal tests mocked; add ignored integration tests for the Docker regtest stack.
 
 ## Issue #9: Settlement State Machine
 

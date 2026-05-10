@@ -31,4 +31,16 @@ cargo test --workspace
 cargo run -p rfq-api
 cargo run -p maker-node -- health
 ```
+
+## Regtest RGB Infra
+
+The first on-chain RGB20/NIA dev stack lives under `infra/regtest`.
+
+```bash
+make -C infra/regtest regtest-up
+make -C infra/regtest regtest-mine BLOCKS=103
+make -C infra/regtest rgb-tools-install
+```
+
+See `docs/regtest-rgb20-nia-dev-infra.md` for the manual issue and transfer checklist.
 # rfq

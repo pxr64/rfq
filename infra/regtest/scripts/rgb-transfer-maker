@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/common.sh"
+
+require_docker_services
+require_rgb_tools
+ensure_dirs
+
+manual_step "rgb-transfer-maker" \
+  "Use the maker RGB invoice as the recipient, create an issuer transfer, copy the consignment to maker state, mine one block, and accept the transfer in the maker stash."

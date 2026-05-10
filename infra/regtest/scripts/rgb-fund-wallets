@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(dirname "$0")/common.sh"
+
+require_docker_services
+require_rgb_tools
+ensure_dirs
+
+amount="${RGB_FUND_AMOUNT:-1}"
+
+# Make sure the miner wallet is available (mirrors regtest-mine).
+if ! bcli -rpcwallet="$BITCOIN_WALLET" getwalletinfo >/dev/null 2>&1; then
+  if bcli listwalletdir | grep -q "\"$BITCOIN_WALLET\""; then
+    bcli loadwallet "$BITCOIN_WALLET" >/dev/null
+  else
+    bcli createwallet "$BITCOIN_WALLET" >/dev/null
+  fi
+fi
+
+extract_last_word() { awk 'NF{a=$NF} END{print a}'; }
+
+echo "deriving keychain-9 addresses..."
+issuer_addr=$(rgb_issuer address -k 9 | extract_last_word)
+maker_addr=$(rgb_maker  address -k 9 | extract_last_word)
+taker_addr=$(rgb_taker  address -k 9 | extract_last_word)
+
+if [[ -z "$issuer_addr" || -z "$maker_addr" || -z "$taker_addr" ]]; then
+  echo "failed to derive a keychain-9 address for at least one role." >&2
+  echo "have you run: make rgb-wallets-init && rgb_* create --wpkh ... ?" >&2
+  exit 1
+fi
+
+echo "  issuer: $issuer_addr"
+echo "  maker : $maker_addr"
+echo "  taker : $taker_addr"
+echo
+
+echo "funding from miner wallet (${amount} BTC each)..."
+bcli -rpcwallet="$BITCOIN_WALLET" sendtoaddress "$issuer_addr" "$amount" >/dev/null
+bcli -rpcwallet="$BITCOIN_WALLET" sendtoaddress "$maker_addr"  "$amount" >/dev/null
+bcli -rpcwallet="$BITCOIN_WALLET" sendtoaddress "$taker_addr"  "$amount" >/dev/null
+
+echo "mining 1 confirmation block..."
+bcli -rpcwallet="$BITCOIN_WALLET" generatetoaddress 1 \
+  "$(bcli -rpcwallet="$BITCOIN_WALLET" getnewaddress "" bech32)" >/dev/null
+
+echo
+echo "syncing rgb wallets..."
+echo "--- issuer ---"
+rgb_issuer utxos --sync
+echo "--- maker ---"
+rgb_maker  utxos --sync
+echo "--- taker ---"
+rgb_taker  utxos --sync
