@@ -1,4 +1,4 @@
-use std::{env, sync::Arc, time::Duration};
+use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Path, State},
@@ -10,7 +10,7 @@ use axum::{
 use clap::{Parser, Subcommand};
 use rfq_client::{RfqClient, Url};
 use rfq_maker::MockMaker;
-use rfq_rgb::MockRgbBackend;
+use rfq_rgb::{LibRgbBackend, MockRgbBackend, RgbBackend};
 use rfq_router::MakerConnector;
 use rfq_store::{InMemoryQuoteStore, QuoteStore};
 use rfq_types::{
@@ -41,6 +41,18 @@ struct MakerNodeConfig {
     maker_id: String,
     poll_interval_ms: u64,
     cleanup_interval_ms: u64,
+    rgb: Option<RgbConfig>,
+}
+
+/// Library-backed RGB adapter config. Populated from env when ALL fields resolve;
+/// missing any → maker-node falls back to `MockRgbBackend`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RgbConfig {
+    data_dir: PathBuf,
+    wallet_name: String,
+    network: String,
+    electrum_url: String,
+    contract_id: String,
 }
 
 impl MakerNodeConfig {
@@ -59,11 +71,30 @@ impl MakerNodeConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1_000),
+            rgb: RgbConfig::from_env(),
         }
     }
 
     fn api_url(&self) -> Result<Url, String> {
         Url::parse(&self.rfq_api_url).map_err(|error| error.to_string())
+    }
+}
+
+impl RgbConfig {
+    fn from_env() -> Option<Self> {
+        let data_dir = env::var("RGB_DATA_DIR").ok()?;
+        let contract_id = env::var("RGB_CONTRACT_ID").ok()?;
+        let electrum_url =
+            env::var("ELECTRUM_URL").unwrap_or_else(|_| "localhost:50001".to_owned());
+        let wallet_name = env::var("RGB_WALLET").unwrap_or_else(|_| "maker".to_owned());
+        let network = env::var("RGB_NETWORK").unwrap_or_else(|_| "regtest".to_owned());
+        Some(Self {
+            data_dir: PathBuf::from(data_dir),
+            wallet_name,
+            network,
+            electrum_url,
+            contract_id,
+        })
     }
 }
 
@@ -89,7 +120,7 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
 async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let _client = RfqClient::new(config.api_url()?);
     let wallet = MockWalletBackend::default();
-    let maker = mock_maker(&config);
+    let maker = build_maker(&config).await?;
     let app = maker_app(maker.clone());
     let listener = TcpListener::bind(&config.maker_listen_addr).await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -160,7 +191,7 @@ async fn broker_health_status(
 
 async fn inventory(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let _api_url = config.api_url()?;
-    let maker = mock_maker(&config);
+    let maker = build_maker(&config).await?;
     let snapshot = maker.inventory_summary().await;
 
     println!("maker-node inventory");
@@ -170,21 +201,42 @@ async fn inventory(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-fn mock_maker(config: &MakerNodeConfig) -> MockMaker {
+async fn build_maker(config: &MakerNodeConfig) -> Result<MockMaker, Box<dyn std::error::Error>> {
     let maker_id = MakerId(config.maker_id.clone());
     let asset = AssetId {
         network: BitcoinNetwork::Regtest,
         kind: AssetKind::Rgb20,
-        id: "rgb-test-asset".to_owned(),
+        id: config
+            .rgb
+            .as_ref()
+            .map(|r| r.contract_id.clone())
+            .unwrap_or_else(|| "rgb-test-asset".to_owned()),
     };
-    let allocation = Allocation {
-        maker_id: maker_id.clone(),
-        asset,
-        available_amount: 1_000_000,
-    };
-    let rgb_backend = Arc::new(MockRgbBackend::new(vec![allocation.clone()]));
 
-    MockMaker::new(maker_id, vec![allocation], rgb_backend)
+    let (allocations, rgb_backend): (Vec<Allocation>, Arc<dyn RgbBackend>) = match &config.rgb {
+        Some(rgb_cfg) => {
+            let backend = LibRgbBackend::new(
+                rgb_cfg.data_dir.clone(),
+                rgb_cfg.wallet_name.clone(),
+                rgb_cfg.network.clone(),
+                rgb_cfg.electrum_url.clone(),
+                maker_id.clone(),
+            );
+            let allocations = backend.list_allocations(&asset).await?;
+            (allocations, Arc::new(backend))
+        }
+        None => {
+            let allocation = Allocation {
+                maker_id: maker_id.clone(),
+                asset,
+                available_amount: 1_000_000,
+            };
+            let backend = MockRgbBackend::new(vec![allocation.clone()]);
+            (vec![allocation], Arc::new(backend))
+        }
+    };
+
+    Ok(MockMaker::new(maker_id, allocations, rgb_backend))
 }
 
 #[derive(Clone)]
@@ -378,7 +430,8 @@ mod tests {
 
     #[tokio::test]
     async fn mock_inventory_summary_is_available_by_default() {
-        let snapshot = mock_maker(&test_config()).inventory_summary().await;
+        let maker = build_maker(&test_config()).await.unwrap();
+        let snapshot = maker.inventory_summary().await;
 
         assert_eq!(snapshot.total_amount, 1_000_000);
         assert_eq!(snapshot.available_amount, 1_000_000);
@@ -393,6 +446,7 @@ mod tests {
     #[tokio::test]
     async fn maker_http_health_returns_ok() {
         let response = test_app()
+            .await
             .oneshot(empty_request(Method::GET, "/health"))
             .await
             .unwrap();
@@ -405,6 +459,7 @@ mod tests {
     #[tokio::test]
     async fn maker_http_inventory_returns_snapshot() {
         let response = test_app()
+            .await
             .oneshot(empty_request(Method::GET, "/inventory"))
             .await
             .unwrap();
@@ -417,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn maker_http_quote_returns_quote_and_reserves_inventory() {
-        let app = test_app();
+        let app = test_app().await;
 
         let quote = request_quote(app.clone(), "rfq-1").await;
         let response = app
@@ -434,7 +489,7 @@ mod tests {
 
     #[tokio::test]
     async fn maker_http_accept_returns_settlement_intent() {
-        let app = test_app();
+        let app = test_app().await;
         let quote = request_quote(app.clone(), "rfq-accept").await;
         let request = AcceptQuoteRequest {
             quote_id: quote.quote_id.clone(),
@@ -465,6 +520,7 @@ mod tests {
         };
 
         let response = test_app()
+            .await
             .oneshot(json_request(
                 Method::POST,
                 "/quotes/missing/accept",
@@ -476,8 +532,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    fn test_app() -> Router {
-        maker_app(mock_maker(&test_config()))
+    async fn test_app() -> Router {
+        maker_app(build_maker(&test_config()).await.unwrap())
     }
 
     fn test_config() -> MakerNodeConfig {
@@ -487,6 +543,7 @@ mod tests {
             maker_id: "test-maker".to_owned(),
             poll_interval_ms: 1_000,
             cleanup_interval_ms: 1_000,
+            rgb: None,
         }
     }
 

@@ -8,3 +8,13 @@ version.workspace = true
 async-trait.workspace = true
 rfq-types = { path = "../rfq-types" }
 thiserror.workspace = true
+
+# Library-backed RGB adapter. Pinned to the same versions rgb-cmd 0.11.1-rc.6 uses;
+# see docs/regtest-rgb20-nia-dev-infra.md "Known Constraints & Version Pins".
+rgb-api = { version = "=0.11.1-rc.6", features = ["electrum_blocking", "fs", "serde"] }
+bp-std = { version = "=0.11.1-alpha.2", features = ["client-side-validation", "serde"] }
+bp-wallet = { version = "=0.11.1-alpha.2", features = ["fs"] }
+amplify = "=4.8.0"
+
+[dev-dependencies]
+tokio = { workspace = true }
