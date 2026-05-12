@@ -103,7 +103,7 @@ Shipped as five sequenced sub-PRs (see `.claude/plans/yes-lets-do-ti-lovely-grov
 
 - [x] **14a** — Surface per-UTXO outpoints in `rfq-rgb`. `Outpoint` + `RgbInventoryUtxo` in `rfq-types`; `RgbBackend::list_inventory_utxos`; `LibRgbBackend` stops discarding `seal.to_outpoint()`. (commit `2643517`)
 - [x] **14b** — `InventoryStore` trait + `InMemoryInventoryStore`; remaining types (`InventoryStatus`, `InventoryUtxo`, `ReservationId`, `ExtendedInventorySnapshot`, `InventoryError`); legacy `InventorySnapshot` retained as `From<&ExtendedInventorySnapshot>` view.
-- [ ] **14c** — Per-UTXO reservation in `MockMaker` behind `InventoryStore`; legacy `InventorySnapshot` kept as derived view.
+- [x] **14c** — Per-UTXO reservation in `MockMaker` behind `InventoryStore`. `CoinSelector` trait + `WholeUtxoSelector` placeholder (14d swaps in `GreedyExactFitSelector`). Atomic reservation under contention verified by 10-task concurrent test. Legacy `inventory_snapshot` / `inventory_summary` preserved as derived views.
 - [ ] **14d** — `GreedyExactFitSelector` (exact-match → bounded subset-sum → smallest-change vs smallest-input-count tie-break).
 - [ ] **14e** — Rebalance loop stub, extended metrics, failure handling, change re-ingestion; `docs/rebalancing-strategy.md`; deletion of legacy `Allocation` / `AllocationState` / `ManagedAllocation`.
 

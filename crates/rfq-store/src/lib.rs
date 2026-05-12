@@ -64,6 +64,10 @@ pub trait InventoryStore: Send + Sync {
 
     async fn list_for_asset(&self, asset: &AssetId) -> Vec<InventoryUtxo>;
 
+    /// All UTXOs across every asset. Used by the maker for global inventory
+    /// summaries that the per-asset surface can't express.
+    async fn list_all(&self) -> Vec<InventoryUtxo>;
+
     /// Subset of `list_for_asset` filtered to `InventoryStatus::Available`.
     /// Input to the coin selector (lands in 14c/14d).
     async fn list_available(&self, asset: &AssetId) -> Vec<InventoryUtxo>;
@@ -71,6 +75,12 @@ pub trait InventoryStore: Send + Sync {
     async fn get(&self, outpoint: &Outpoint) -> Option<InventoryUtxo>;
 
     async fn extended_snapshot(&self, asset: &AssetId) -> ExtendedInventorySnapshot;
+
+    /// Locate the active reservation for `quote_id` if one exists. Returns
+    /// `None` for unknown / released / already-spent quote ids. Used by
+    /// `MockMaker::accept_quote` to bridge the public `Quote` to the internal
+    /// `ReservationId`.
+    async fn find_reservation_for_quote(&self, quote_id: &QuoteId) -> Option<ReservationId>;
 
     /// Atomically reserve every supplied outpoint under a fresh reservation
     /// id. Fails with `UtxoNotAvailable` (and mutates nothing) if any outpoint
@@ -116,6 +126,17 @@ impl InMemoryInventoryStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Synchronous seeding helper. Useful in sync constructors (e.g.
+    /// `MockMaker::new`) where awaiting `replace_for_asset` would force the
+    /// whole constructor to become async.
+    pub fn with_seed(utxos: Vec<InventoryUtxo>) -> Self {
+        let map: HashMap<Outpoint, InventoryUtxo> =
+            utxos.into_iter().map(|u| (u.outpoint.clone(), u)).collect();
+        Self {
+            utxos: Arc::new(RwLock::new(map)),
+        }
+    }
 }
 
 #[async_trait]
@@ -155,6 +176,10 @@ impl InventoryStore for InMemoryInventoryStore {
             .collect()
     }
 
+    async fn list_all(&self) -> Vec<InventoryUtxo> {
+        self.utxos.read().await.values().cloned().collect()
+    }
+
     async fn list_available(&self, asset: &AssetId) -> Vec<InventoryUtxo> {
         self.utxos
             .read()
@@ -171,7 +196,23 @@ impl InventoryStore for InMemoryInventoryStore {
 
     async fn extended_snapshot(&self, asset: &AssetId) -> ExtendedInventorySnapshot {
         let utxos = self.utxos.read().await;
-        summarize(utxos.values().filter(|u| &u.asset_id == asset))
+        ExtendedInventorySnapshot::from_utxos(utxos.values().filter(|u| &u.asset_id == asset))
+    }
+
+    async fn find_reservation_for_quote(&self, quote_id: &QuoteId) -> Option<ReservationId> {
+        self.utxos.read().await.values().find_map(|u| {
+            if let InventoryStatus::Reserved {
+                reservation_id,
+                quote_id: qid,
+                ..
+            } = &u.status
+            {
+                if qid == quote_id {
+                    return Some(reservation_id.clone());
+                }
+            }
+            None
+        })
     }
 
     async fn reserve_utxos(
@@ -304,66 +345,6 @@ impl InventoryStore for InMemoryInventoryStore {
         }
         Ok(updated)
     }
-}
-
-fn summarize<'a>(utxos: impl Iterator<Item = &'a InventoryUtxo>) -> ExtendedInventorySnapshot {
-    let mut snap = ExtendedInventorySnapshot::default();
-    let mut largest_available: u64 = 0;
-    let mut pending_settlement_amount: u64 = 0;
-    let mut pending_settlement_utxos: u64 = 0;
-    let mut pending_settlements: u64 = 0;
-
-    for utxo in utxos {
-        snap.total_amount = snap.total_amount.saturating_add(utxo.amount);
-        snap.total_utxos += 1;
-        match &utxo.status {
-            InventoryStatus::Available => {
-                snap.available_amount = snap.available_amount.saturating_add(utxo.amount);
-                snap.available_utxos += 1;
-                if utxo.amount > largest_available {
-                    largest_available = utxo.amount;
-                }
-            }
-            InventoryStatus::Reserved { .. } => {
-                snap.reserved_amount = snap.reserved_amount.saturating_add(utxo.amount);
-                snap.reserved_utxos += 1;
-                pending_settlements += 1;
-            }
-            InventoryStatus::PendingBitcoinConfirm { .. }
-            | InventoryStatus::PendingRgbAcceptance { .. } => {
-                pending_settlement_amount = pending_settlement_amount.saturating_add(utxo.amount);
-                pending_settlement_utxos += 1;
-                pending_settlements += 1;
-            }
-            InventoryStatus::Spent { .. } => {
-                snap.spent_amount = snap.spent_amount.saturating_add(utxo.amount);
-                snap.spent_utxos += 1;
-            }
-            InventoryStatus::Invalid { .. } => {
-                snap.invalid_utxos += 1;
-            }
-        }
-    }
-
-    snap.pending_settlement_amount = pending_settlement_amount;
-    snap.pending_settlement_utxos = pending_settlement_utxos;
-    snap.pending_settlements = pending_settlements;
-
-    // 0.0 = perfectly consolidated (one UTXO holds everything available)
-    // approaching 1.0 = dust spread across many UTXOs. See
-    // docs/rebalancing-strategy.md (lands in 14e) for the rationale + worked
-    // examples.
-    snap.fragmentation_score = if snap.available_amount > 0 {
-        1.0 - (largest_available as f64 / snap.available_amount as f64)
-    } else {
-        0.0
-    };
-
-    // average_input_count and average_change_ratio are rolling settlement
-    // metrics fed by MockMaker (14c/14e), not derivable from inventory state
-    // alone — leave at default 0.0 here.
-
-    snap
 }
 
 #[cfg(test)]

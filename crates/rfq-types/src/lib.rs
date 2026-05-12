@@ -250,6 +250,65 @@ impl From<&ExtendedInventorySnapshot> for InventorySnapshot {
     }
 }
 
+impl ExtendedInventorySnapshot {
+    /// Compute a fresh snapshot from a UTXO iterator. The aggregation rules are
+    /// the spec for `InventoryStore::extended_snapshot` — backends should
+    /// either delegate to this or match its output exactly.
+    ///
+    /// `fragmentation_score = 1.0 - (largest_available / total_available)`,
+    /// with a 0.0 fallback when no available amount exists. `average_input_count`
+    /// and `average_change_ratio` are rolling settlement metrics fed externally
+    /// (not derivable from inventory state) and stay at 0.0 here.
+    pub fn from_utxos<'a, I>(utxos: I) -> Self
+    where
+        I: IntoIterator<Item = &'a InventoryUtxo>,
+    {
+        let mut snap = ExtendedInventorySnapshot::default();
+        let mut largest_available: u64 = 0;
+
+        for utxo in utxos {
+            snap.total_amount = snap.total_amount.saturating_add(utxo.amount);
+            snap.total_utxos += 1;
+            match &utxo.status {
+                InventoryStatus::Available => {
+                    snap.available_amount = snap.available_amount.saturating_add(utxo.amount);
+                    snap.available_utxos += 1;
+                    if utxo.amount > largest_available {
+                        largest_available = utxo.amount;
+                    }
+                }
+                InventoryStatus::Reserved { .. } => {
+                    snap.reserved_amount = snap.reserved_amount.saturating_add(utxo.amount);
+                    snap.reserved_utxos += 1;
+                    snap.pending_settlements += 1;
+                }
+                InventoryStatus::PendingBitcoinConfirm { .. }
+                | InventoryStatus::PendingRgbAcceptance { .. } => {
+                    snap.pending_settlement_amount =
+                        snap.pending_settlement_amount.saturating_add(utxo.amount);
+                    snap.pending_settlement_utxos += 1;
+                    snap.pending_settlements += 1;
+                }
+                InventoryStatus::Spent { .. } => {
+                    snap.spent_amount = snap.spent_amount.saturating_add(utxo.amount);
+                    snap.spent_utxos += 1;
+                }
+                InventoryStatus::Invalid { .. } => {
+                    snap.invalid_utxos += 1;
+                }
+            }
+        }
+
+        snap.fragmentation_score = if snap.available_amount > 0 {
+            1.0 - (largest_available as f64 / snap.available_amount as f64)
+        } else {
+            0.0
+        };
+
+        snap
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum InventoryError {
     UtxoNotFound(Outpoint),

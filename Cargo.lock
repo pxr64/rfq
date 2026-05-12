@@ -1739,7 +1739,9 @@ dependencies = [
  "async-trait",
  "rfq-rgb",
  "rfq-router",
+ "rfq-store",
  "rfq-types",
+ "thiserror 1.0.69",
  "tokio",
  "uuid",
 ]
