@@ -166,6 +166,122 @@ pub struct RgbInventoryUtxo {
     pub btc_sats: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ReservationId(pub String);
+
+/// Lifecycle state of a single RGB-colored UTXO tracked by the maker's
+/// inventory store. Maps onto the settlement state machine (#9):
+/// `Reserved` → `PendingBitcoinConfirm` (broadcast) → `PendingRgbAcceptance`
+/// (confirmed) → `Spent` (counterparty accepted).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum InventoryStatus {
+    Available,
+    Reserved {
+        reservation_id: ReservationId,
+        rfq_id: RfqId,
+        quote_id: QuoteId,
+        expires_at_ms: u64,
+    },
+    PendingBitcoinConfirm {
+        witness_txid: String,
+    },
+    PendingRgbAcceptance {
+        witness_txid: String,
+    },
+    Spent {
+        witness_txid: String,
+        quote_id: QuoteId,
+    },
+    Invalid {
+        reason: String,
+    },
+}
+
+/// Inventory store row. One per outpoint. Authoritative state for the maker —
+/// `RgbInventoryUtxo` is the read-only chain view; this wraps it with lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InventoryUtxo {
+    pub outpoint: Outpoint,
+    pub asset_id: AssetId,
+    pub amount: u64,
+    pub btc_sats: u64,
+    pub status: InventoryStatus,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    /// Set when this UTXO entered inventory as the change output of a still-
+    /// unconfirmed broadcast tx. Cleared once the tx confirms.
+    pub pending_txid: Option<String>,
+}
+
+/// Snapshot of the maker's inventory health for an asset. Derived from the
+/// store on demand; not stored. `f64` fields prevent an `Eq` derive but
+/// `PartialEq` is enough for assertions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ExtendedInventorySnapshot {
+    pub total_amount: u64,
+    pub available_amount: u64,
+    pub reserved_amount: u64,
+    pub pending_settlement_amount: u64,
+    pub spent_amount: u64,
+    pub total_utxos: u64,
+    pub available_utxos: u64,
+    pub reserved_utxos: u64,
+    pub pending_settlement_utxos: u64,
+    pub spent_utxos: u64,
+    pub invalid_utxos: u64,
+    pub fragmentation_score: f64,
+    pub average_input_count: f64,
+    pub average_change_ratio: f64,
+    pub pending_settlements: u64,
+}
+
+impl From<&ExtendedInventorySnapshot> for InventorySnapshot {
+    fn from(ext: &ExtendedInventorySnapshot) -> Self {
+        Self {
+            total_amount: ext.total_amount,
+            available_amount: ext.available_amount,
+            reserved_amount: ext.reserved_amount,
+            spent_amount: ext.spent_amount,
+            total_allocations: ext.total_utxos,
+            available_allocations: ext.available_utxos,
+            reserved_allocations: ext.reserved_utxos,
+            spent_allocations: ext.spent_utxos,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum InventoryError {
+    UtxoNotFound(Outpoint),
+    UtxoNotAvailable {
+        outpoint: Outpoint,
+        status: InventoryStatus,
+    },
+    ReservationNotFound(ReservationId),
+    InvalidTransition {
+        from: InventoryStatus,
+        to: String,
+    },
+}
+
+impl std::fmt::Display for InventoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UtxoNotFound(op) => write!(f, "utxo not found: {op}"),
+            Self::UtxoNotAvailable { outpoint, status } => write!(
+                f,
+                "utxo {outpoint} is not available (status: {status:?})"
+            ),
+            Self::ReservationNotFound(id) => write!(f, "reservation not found: {}", id.0),
+            Self::InvalidTransition { from, to } => {
+                write!(f, "invalid inventory transition: {from:?} -> {to}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InventoryError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AllocationState {
     Available,

@@ -8,3 +8,4 @@ version.workspace = true
 async-trait.workspace = true
 rfq-types = { path = "../rfq-types" }
 tokio.workspace = true
+uuid.workspace = true

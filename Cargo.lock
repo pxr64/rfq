@@ -1779,6 +1779,7 @@ dependencies = [
  "async-trait",
  "rfq-types",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

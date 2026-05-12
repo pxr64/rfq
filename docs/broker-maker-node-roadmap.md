@@ -97,6 +97,16 @@ Per-UTXO data model: `InventoryUtxo { outpoint, asset_id, amount, btc_sats, stat
 - Failure handling: release stale reservations, reconcile chain state under reorgs, mark invalid allocations after failed broadcasts / failed RGB acceptance.
 - Depends on **#13** for real per-UTXO data and the witness-tx round-trip; should land before **#9** (settlement state machine needs to know which UTXOs got reserved/spent).
 
+### Sub-PR progress
+
+Shipped as five sequenced sub-PRs (see `.claude/plans/yes-lets-do-ti-lovely-grove.md` for the full design).
+
+- [x] **14a** — Surface per-UTXO outpoints in `rfq-rgb`. `Outpoint` + `RgbInventoryUtxo` in `rfq-types`; `RgbBackend::list_inventory_utxos`; `LibRgbBackend` stops discarding `seal.to_outpoint()`. (commit `2643517`)
+- [x] **14b** — `InventoryStore` trait + `InMemoryInventoryStore`; remaining types (`InventoryStatus`, `InventoryUtxo`, `ReservationId`, `ExtendedInventorySnapshot`, `InventoryError`); legacy `InventorySnapshot` retained as `From<&ExtendedInventorySnapshot>` view.
+- [ ] **14c** — Per-UTXO reservation in `MockMaker` behind `InventoryStore`; legacy `InventorySnapshot` kept as derived view.
+- [ ] **14d** — `GreedyExactFitSelector` (exact-match → bounded subset-sum → smallest-change vs smallest-input-count tie-break).
+- [ ] **14e** — Rebalance loop stub, extended metrics, failure handling, change re-ingestion; `docs/rebalancing-strategy.md`; deletion of legacy `Allocation` / `AllocationState` / `ManagedAllocation`.
+
 ## Issue #9: Settlement State Machine
 
 Make quote acceptance and settlement lifecycle explicit before real RGB/Bitcoin execution.
