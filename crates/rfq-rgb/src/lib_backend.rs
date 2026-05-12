@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use rfq_types::{Allocation, AssetId, MakerId, RgbTransfer};
+use rfq_types::{Allocation, AssetId, MakerId, Outpoint, RgbInventoryUtxo, RgbTransfer};
 
 use rgb::contract::FilterIncludeAll;
 use rgb::invoice::RgbInvoice;
@@ -59,6 +59,21 @@ impl LibRgbBackend {
 #[async_trait]
 impl RgbBackend for LibRgbBackend {
     async fn list_allocations(&self, asset: &AssetId) -> Result<Vec<Allocation>, RgbError> {
+        let utxos = self.list_inventory_utxos(asset).await?;
+        Ok(utxos
+            .into_iter()
+            .map(|utxo| Allocation {
+                maker_id: self.maker_id.clone(),
+                asset: utxo.asset_id,
+                available_amount: utxo.amount,
+            })
+            .collect())
+    }
+
+    async fn list_inventory_utxos(
+        &self,
+        asset: &AssetId,
+    ) -> Result<Vec<RgbInventoryUtxo>, RgbError> {
         let stock = self.load_stock()?;
         let contract_id = ContractId::from_str(&asset.id)
             .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
@@ -66,20 +81,25 @@ impl RgbBackend for LibRgbBackend {
             .contract_data(contract_id)
             .map_err(|e| RgbError::ContractNotFound(e.to_string()))?;
 
-        let mut allocations = Vec::new();
+        let mut utxos = Vec::new();
         let filter = FilterIncludeAll;
         for details in contract.schema.owned_types.values() {
             if let Ok(rgb_allocations) = contract.fungible(details.name.clone(), &filter) {
                 for alloc in rgb_allocations {
-                    allocations.push(Allocation {
-                        maker_id: self.maker_id.clone(),
-                        asset: asset.clone(),
-                        available_amount: alloc.state.value(),
+                    let op = alloc.seal.to_outpoint();
+                    utxos.push(RgbInventoryUtxo {
+                        outpoint: Outpoint {
+                            txid: op.txid.to_string(),
+                            vout: op.vout.into_u32(),
+                        },
+                        asset_id: asset.clone(),
+                        amount: alloc.state.value(),
+                        btc_sats: 0,
                     });
                 }
             }
         }
-        Ok(allocations)
+        Ok(utxos)
     }
 
     async fn validate_invoice(&self, invoice: &str) -> Result<(), RgbError> {

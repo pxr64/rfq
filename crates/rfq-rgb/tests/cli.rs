@@ -105,6 +105,46 @@ async fn list_allocations_returns_seeded_balance() {
 }
 
 #[tokio::test]
+#[ignore = "requires the regtest stack with a NIA contract issued; see file header"]
+async fn list_inventory_utxos_returns_per_utxo_outpoints() {
+    let Some((backend, asset)) = lib_backend() else {
+        return;
+    };
+
+    let utxos = backend
+        .list_inventory_utxos(&asset)
+        .await
+        .expect("list_inventory_utxos should succeed against a live stash");
+
+    assert!(
+        !utxos.is_empty(),
+        "expected at least one UTXO; is the contract issued and has the maker received any?"
+    );
+
+    let zero_txid = "0".repeat(64);
+    for utxo in &utxos {
+        assert_eq!(utxo.asset_id, asset);
+        assert_eq!(
+            utxo.outpoint.txid.len(),
+            64,
+            "expected 64-hex-char txid, got {:?}",
+            utxo.outpoint.txid
+        );
+        assert_ne!(
+            utxo.outpoint.txid, zero_txid,
+            "outpoint txid should not be all-zeros; LibRgbBackend should surface real seal data"
+        );
+    }
+
+    // list_inventory_utxos and list_allocations should agree on total amount
+    // — list_allocations is implemented as a sum/aggregation of UTXOs.
+    let allocations = backend.list_allocations(&asset).await.unwrap();
+    let utxo_total: u64 = utxos.iter().map(|u| u.amount).sum();
+    let alloc_total: u64 = allocations.iter().map(|a| a.available_amount).sum();
+    assert_eq!(utxo_total, alloc_total);
+}
+
+#[tokio::test]
 #[ignore = "blocked on LibRgbBackend::create_transfer (issue #13); flip when impl lands"]
 async fn create_transfer_produces_psbt_and_consignment() {
     let Some((backend, _asset)) = lib_backend() else {
