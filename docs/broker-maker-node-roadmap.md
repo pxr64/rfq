@@ -104,7 +104,7 @@ Shipped as five sequenced sub-PRs (see `.claude/plans/yes-lets-do-ti-lovely-grov
 - [x] **14a** — Surface per-UTXO outpoints in `rfq-rgb`. `Outpoint` + `RgbInventoryUtxo` in `rfq-types`; `RgbBackend::list_inventory_utxos`; `LibRgbBackend` stops discarding `seal.to_outpoint()`. (commit `2643517`)
 - [x] **14b** — `InventoryStore` trait + `InMemoryInventoryStore`; remaining types (`InventoryStatus`, `InventoryUtxo`, `ReservationId`, `ExtendedInventorySnapshot`, `InventoryError`); legacy `InventorySnapshot` retained as `From<&ExtendedInventorySnapshot>` view.
 - [x] **14c** — Per-UTXO reservation in `MockMaker` behind `InventoryStore`. `CoinSelector` trait + `WholeUtxoSelector` placeholder (14d swaps in `GreedyExactFitSelector`). Atomic reservation under contention verified by 10-task concurrent test. Legacy `inventory_snapshot` / `inventory_summary` preserved as derived views.
-- [ ] **14d** — `GreedyExactFitSelector` (exact-match → bounded subset-sum → smallest-change vs smallest-input-count tie-break).
+- [x] **14d** — `GreedyExactFitSelector` (exact-single → bounded 2-of-N exact up to N=2000 → bounded 3-of-N exact up to N=16 → smallest-change single → multi-UTXO greedy). Exclusion-based retry in `request_quote` so a fully deterministic selector still gets healthy concurrency. Fragmentation hot path verified: 100 dust UTXOs + 1 fat 10000 UTXO, request 20, picks `{10, 10}` not the fat one.
 - [ ] **14e** — Rebalance loop stub, extended metrics, failure handling, change re-ingestion; `docs/rebalancing-strategy.md`; deletion of legacy `Allocation` / `AllocationState` / `ManagedAllocation`.
 
 ## Issue #9: Settlement State Machine

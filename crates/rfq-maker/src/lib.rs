@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use async_trait::async_trait;
 use rfq_rgb::RgbBackend;
@@ -12,10 +12,14 @@ use rfq_types::{
 use uuid::Uuid;
 
 mod coin_select;
-pub use coin_select::{CoinSelectionError, CoinSelector, Selection, WholeUtxoSelector};
+pub use coin_select::{CoinSelectionError, CoinSelector, GreedyExactFitSelector, Selection};
 
 const QUOTE_TTL_MS: u64 = 30_000;
-const RESERVE_RETRY_ATTEMPTS: u32 = 3;
+/// Upper bound on reservation retries under contention. With outpoint
+/// exclusion on each retry, the effective bound is `min(this, available_utxo_count)`
+/// — the loop exits via the selector's Insufficient branch once exclusions
+/// have whittled the candidate set to empty.
+const RESERVE_RETRY_ATTEMPTS: u32 = 16;
 
 #[derive(Clone)]
 pub struct MockMaker {
@@ -52,7 +56,7 @@ impl MockMaker {
         Self::with_components(
             maker_id,
             Arc::new(InMemoryInventoryStore::with_seed(utxos)),
-            Arc::new(WholeUtxoSelector),
+            Arc::new(GreedyExactFitSelector),
             rgb_backend,
         )
     }
@@ -83,7 +87,7 @@ impl MockMaker {
         Self::with_components(
             maker_id,
             Arc::new(InMemoryInventoryStore::with_seed(utxos)),
-            Arc::new(WholeUtxoSelector),
+            Arc::new(GreedyExactFitSelector),
             rgb_backend,
         )
     }
@@ -158,10 +162,23 @@ impl MakerConnector for MockMaker {
         let quote_id = QuoteId(Uuid::new_v4().to_string());
         let expires_at_ms = now + QUOTE_TTL_MS;
 
+        // Exclusion-based retry: when a reservation fails because another
+        // caller grabbed an outpoint between our list_available read and our
+        // reserve_utxos write, we exclude the contested outpoint and re-select.
+        // This is what gives a deterministic selector (GreedyExactFitSelector)
+        // healthy concurrency — without it, every losing task re-picks the
+        // same UTXO and only one ever makes progress per round.
+        let mut excluded: HashSet<Outpoint> = HashSet::new();
         let mut attempts: u32 = 0;
         let selection = loop {
             attempts += 1;
-            let available = self.store.list_available(&request.base_asset).await;
+            let available: Vec<InventoryUtxo> = self
+                .store
+                .list_available(&request.base_asset)
+                .await
+                .into_iter()
+                .filter(|u| !excluded.contains(&u.outpoint))
+                .collect();
             let selection = match self
                 .selector
                 .select(&request.base_asset, request.amount, &available)
@@ -186,6 +203,7 @@ impl MakerConnector for MockMaker {
                 | Err(InventoryError::UtxoNotFound(_))
                     if attempts < RESERVE_RETRY_ATTEMPTS =>
                 {
+                    excluded.extend(selection.chosen);
                     continue;
                 }
                 Err(InventoryError::UtxoNotAvailable { .. })
