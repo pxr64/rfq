@@ -5,14 +5,71 @@ use rfq_rgb::RgbBackend;
 use rfq_router::{MakerConnector, RouterError};
 use rfq_store::{InMemoryInventoryStore, InventoryStore};
 use rfq_types::{
-    AcceptQuoteRequest, Allocation, AllocationState, ExtendedInventorySnapshot, InventoryError,
-    InventorySnapshot, InventoryStatus, InventoryUtxo, MakerId, ManagedAllocation, Outpoint, Quote,
-    QuoteId, QuoteRequest, ReservationId, RfqId, SettlementIntent, SettlementStatus,
+    AcceptQuoteRequest, Allocation, AllocationState, AssetId, ExtendedInventorySnapshot,
+    InventoryError, InventorySnapshot, InventoryStatus, InventoryUtxo, MakerId, ManagedAllocation,
+    Outpoint, Quote, QuoteId, QuoteRequest, ReservationId, RfqId, SettlementIntent,
+    SettlementStatus,
 };
 use uuid::Uuid;
 
 mod coin_select;
 pub use coin_select::{CoinSelectionError, CoinSelector, GreedyExactFitSelector, Selection};
+
+/// Inputs to the periodic rebalance planner. Defaults are conservative — the
+/// loop should fire rarely under normal operation. See
+/// `docs/rebalancing-strategy.md` for the why behind these thresholds.
+#[derive(Debug, Clone)]
+pub struct RebalancePolicy {
+    pub fragmentation_threshold: f64,
+    pub max_utxo_count: u64,
+    pub min_utxo_count: u64,
+}
+
+impl Default for RebalancePolicy {
+    fn default() -> Self {
+        Self {
+            fragmentation_threshold: 0.7,
+            max_utxo_count: 50,
+            min_utxo_count: 3,
+        }
+    }
+}
+
+/// Proposed rebalance actions plus the trigger reasons that fired. In 14e
+/// `merges` and `splits` are always empty placeholders — execution is deferred
+/// to the follow-up issue. The trigger list is what the loop logs.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RebalancePlan {
+    pub triggers: Vec<RebalanceTrigger>,
+    pub merges: Vec<MergeAction>,
+    pub splits: Vec<SplitAction>,
+}
+
+impl RebalancePlan {
+    pub fn is_empty(&self) -> bool {
+        self.triggers.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RebalanceTrigger {
+    HighFragmentation { score: f64, threshold: f64 },
+    TooManyUtxos { count: u64, max: u64 },
+    TooFewUtxos { count: u64, min: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeAction {
+    pub asset: AssetId,
+    pub inputs: Vec<Outpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitAction {
+    pub asset: AssetId,
+    pub input: Outpoint,
+    pub target_pieces: u32,
+}
 
 const QUOTE_TTL_MS: u64 = 30_000;
 /// Upper bound on reservation retries under contention. With outpoint
@@ -147,6 +204,39 @@ impl MockMaker {
     pub async fn release_expired_reservations(&self) -> usize {
         self.store.release_expired_reservations(now_ms()).await
     }
+
+    /// Periodic rebalance planner. Reads `extended_inventory_summary()` and
+    /// returns a `RebalancePlan` describing trigger reasons plus (in the
+    /// follow-up issue) the merge/split actions to fold into the next
+    /// outgoing settlement tx. In 14e the action lists stay empty — only the
+    /// trigger detection ships. See `docs/rebalancing-strategy.md`.
+    pub async fn rebalance(&self, policy: &RebalancePolicy) -> RebalancePlan {
+        let ext = self.extended_inventory_summary().await;
+        let mut plan = RebalancePlan::default();
+
+        // High fragmentation is only meaningful when there's something to
+        // rebalance — guard against div-by-zero artifacts on empty inventory.
+        if ext.available_amount > 0 && ext.fragmentation_score >= policy.fragmentation_threshold {
+            plan.triggers.push(RebalanceTrigger::HighFragmentation {
+                score: ext.fragmentation_score,
+                threshold: policy.fragmentation_threshold,
+            });
+        }
+        if ext.available_utxos > policy.max_utxo_count {
+            plan.triggers.push(RebalanceTrigger::TooManyUtxos {
+                count: ext.available_utxos,
+                max: policy.max_utxo_count,
+            });
+        }
+        if ext.available_utxos < policy.min_utxo_count && ext.total_amount > 0 {
+            plan.triggers.push(RebalanceTrigger::TooFewUtxos {
+                count: ext.available_utxos,
+                min: policy.min_utxo_count,
+            });
+        }
+
+        plan
+    }
 }
 
 #[async_trait]
@@ -241,6 +331,23 @@ impl MakerConnector for MockMaker {
                 RouterError::Maker("quote reservation not found or expired".to_owned())
             })?;
 
+        // Compute expected change before mark_spent transitions the
+        // reservation. The Reserved variant is the only status that still
+        // carries reservation_id at this point.
+        let reserved_total: u64 = self
+            .store
+            .list_for_asset(&quote.base_asset)
+            .await
+            .into_iter()
+            .filter_map(|u| match &u.status {
+                InventoryStatus::Reserved { reservation_id: rid, .. } if rid == &reservation_id => {
+                    Some(u.amount)
+                }
+                _ => None,
+            })
+            .sum();
+        let expected_change = reserved_total.saturating_sub(quote.amount);
+
         let transfer = match self
             .rgb_backend
             .create_transfer(&request.rgb_invoice, quote.amount)
@@ -248,9 +355,6 @@ impl MakerConnector for MockMaker {
         {
             Ok(t) => t,
             Err(e) => {
-                // Release the reservation on transfer failure. Best-effort: if
-                // the release itself errors, surface the original transfer
-                // error since that's the user-relevant one.
                 let _ = self
                     .store
                     .release_reservation(&reservation_id, now_ms())
@@ -259,12 +363,37 @@ impl MakerConnector for MockMaker {
             }
         };
 
-        // Synthesize a witness txid until 14e wires the real broadcast path.
+        // Synthesize a witness txid until #13 wires the real broadcast path.
         let witness_txid = format!("mock-wt-{}", quote.quote_id.0);
         self.store
-            .mark_spent(&reservation_id, witness_txid, now_ms())
+            .mark_spent(&reservation_id, witness_txid.clone(), now_ms())
             .await
             .map_err(|e| RouterError::Maker(e.to_string()))?;
+
+        // Change re-ingestion: when the selection had to take more than
+        // requested, the broadcast tx would produce a change output back to
+        // the maker. The mock synthesizes the outpoint (vout=1) and registers
+        // it as PendingBitcoinConfirm. Best-effort — ingestion failure
+        // (collision) doesn't block settlement.
+        if expected_change > 0 {
+            let now = now_ms();
+            let change_utxo = InventoryUtxo {
+                outpoint: Outpoint::new(witness_txid.clone(), 1),
+                asset_id: quote.base_asset.clone(),
+                amount: expected_change,
+                btc_sats: 0,
+                status: InventoryStatus::PendingBitcoinConfirm {
+                    reservation_id: reservation_id.clone(),
+                    witness_txid: witness_txid.clone(),
+                },
+                created_at_ms: now,
+                updated_at_ms: now,
+                pending_txid: Some(witness_txid.clone()),
+            };
+            if let Err(e) = self.store.ingest_change_utxo(change_utxo).await {
+                eprintln!("change re-ingestion failed (continuing): {e}");
+            }
+        }
 
         Ok(SettlementIntent {
             quote_id: quote.quote_id,
@@ -725,6 +854,146 @@ mod tests {
         let ext = maker.extended_inventory_summary().await;
         assert_eq!(ext.reserved_utxos, 5);
         assert_eq!(ext.available_utxos, 0);
+    }
+
+    // --- 14e tests ---
+
+    #[tokio::test]
+    async fn rebalance_emits_no_triggers_for_healthy_inventory() {
+        // Single big UTXO → fragmentation 0.0, available_utxos = 1 (between
+        // min and max). All triggers should be silent.
+        let maker = maker_with_allocations(vec![allocation_with_amount(1000)]);
+        let policy = RebalancePolicy {
+            fragmentation_threshold: 0.7,
+            max_utxo_count: 50,
+            min_utxo_count: 1,
+        };
+        let plan = maker.rebalance(&policy).await;
+        assert!(plan.is_empty(), "expected no triggers, got {plan:?}");
+    }
+
+    #[tokio::test]
+    async fn rebalance_fires_high_fragmentation_above_threshold() {
+        // 5 UTXOs of 100 each. Largest 100 / total 500 = 0.2 share →
+        // fragmentation = 0.8, which crosses 0.7.
+        let maker = maker_with_allocations(vec![
+            allocation_with_amount(100),
+            allocation_with_amount(100),
+            allocation_with_amount(100),
+            allocation_with_amount(100),
+            allocation_with_amount(100),
+        ]);
+        let policy = RebalancePolicy {
+            fragmentation_threshold: 0.7,
+            max_utxo_count: 50,
+            min_utxo_count: 1,
+        };
+        let plan = maker.rebalance(&policy).await;
+        assert!(plan
+            .triggers
+            .iter()
+            .any(|t| matches!(t, RebalanceTrigger::HighFragmentation { .. })));
+    }
+
+    #[tokio::test]
+    async fn rebalance_fires_too_many_utxos_above_max() {
+        let allocations: Vec<_> = (0..10).map(|_| allocation_with_amount(10)).collect();
+        let maker = maker_with_allocations(allocations);
+        let policy = RebalancePolicy {
+            fragmentation_threshold: 1.0, // suppress fragmentation trigger
+            max_utxo_count: 5,
+            min_utxo_count: 1,
+        };
+        let plan = maker.rebalance(&policy).await;
+        assert!(plan.triggers.iter().any(|t| matches!(
+            t,
+            RebalanceTrigger::TooManyUtxos { count: 10, max: 5 }
+        )));
+    }
+
+    #[tokio::test]
+    async fn rebalance_fires_too_few_utxos_below_min() {
+        let maker = maker_with_allocations(vec![allocation_with_amount(1000)]);
+        let policy = RebalancePolicy {
+            fragmentation_threshold: 1.0,
+            max_utxo_count: 50,
+            min_utxo_count: 3,
+        };
+        let plan = maker.rebalance(&policy).await;
+        assert!(plan.triggers.iter().any(|t| matches!(
+            t,
+            RebalanceTrigger::TooFewUtxos { count: 1, min: 3 }
+        )));
+    }
+
+    #[tokio::test]
+    async fn accept_with_change_ingests_pending_bitcoin_confirm_utxo() {
+        // Single allocation of 100; request 60. Selection picks the 100 UTXO,
+        // change = 40. After accept_quote, inventory should show the input
+        // UTXO as Spent and a synthetic change UTXO as PendingBitcoinConfirm.
+        let allocation = allocation_with_amount(100);
+        let rgb_backend = Arc::new(MockRgbBackend::new(vec![allocation.clone()]));
+        let maker = MockMaker::new(maker_id(), vec![allocation], rgb_backend);
+
+        let mut request = quote_request("rfq-1");
+        request.amount = 60;
+        let quote = maker
+            .request_quote(request)
+            .await
+            .unwrap()
+            .expect("quote should be issued");
+
+        let intent = maker
+            .accept_quote(
+                quote.clone(),
+                AcceptQuoteRequest {
+                    quote_id: quote.quote_id.clone(),
+                    rgb_invoice: "rgb:test".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(intent.status, SettlementStatus::Ready);
+
+        let utxos = maker.utxo_snapshot().await;
+        let spent_count = utxos
+            .iter()
+            .filter(|u| matches!(u.status, InventoryStatus::Spent { .. }))
+            .count();
+        let pending_change = utxos
+            .iter()
+            .find(|u| matches!(u.status, InventoryStatus::PendingBitcoinConfirm { .. }));
+        assert_eq!(spent_count, 1);
+        let pending_change = pending_change.expect("expected a change UTXO");
+        assert_eq!(pending_change.amount, 40);
+        assert!(pending_change.pending_txid.is_some());
+    }
+
+    #[tokio::test]
+    async fn accept_releases_reservation_on_transfer_failure() {
+        // MockRgbBackend rejects invoices that don't start with "rgb:".
+        let maker = maker();
+        let quote = maker
+            .request_quote(quote_request("rfq-1"))
+            .await
+            .unwrap()
+            .expect("quote should be issued");
+
+        let result = maker
+            .accept_quote(
+                quote.clone(),
+                AcceptQuoteRequest {
+                    quote_id: quote.quote_id,
+                    rgb_invoice: "not-an-invoice".into(),
+                },
+            )
+            .await;
+        assert!(result.is_err());
+
+        let snapshot = maker.inventory_summary().await;
+        assert_eq!(snapshot.available_amount, 100);
+        assert_eq!(snapshot.reserved_amount, 0);
+        assert_eq!(snapshot.spent_amount, 0);
     }
 
     #[tokio::test]

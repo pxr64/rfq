@@ -182,10 +182,16 @@ pub enum InventoryStatus {
         quote_id: QuoteId,
         expires_at_ms: u64,
     },
+    /// Tx is broadcast; awaiting bitcoin confirmation. `reservation_id` is
+    /// retained so the settlement state machine (#9) can drive transitions
+    /// keyed by reservation rather than scanning by witness_txid.
     PendingBitcoinConfirm {
+        reservation_id: ReservationId,
         witness_txid: String,
     },
+    /// Tx is bitcoin-confirmed; awaiting RGB consignment acceptance.
     PendingRgbAcceptance {
+        reservation_id: ReservationId,
         witness_txid: String,
     },
     Spent {

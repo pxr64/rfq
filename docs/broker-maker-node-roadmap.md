@@ -105,7 +105,12 @@ Shipped as five sequenced sub-PRs (see `.claude/plans/yes-lets-do-ti-lovely-grov
 - [x] **14b** — `InventoryStore` trait + `InMemoryInventoryStore`; remaining types (`InventoryStatus`, `InventoryUtxo`, `ReservationId`, `ExtendedInventorySnapshot`, `InventoryError`); legacy `InventorySnapshot` retained as `From<&ExtendedInventorySnapshot>` view.
 - [x] **14c** — Per-UTXO reservation in `MockMaker` behind `InventoryStore`. `CoinSelector` trait + `WholeUtxoSelector` placeholder (14d swaps in `GreedyExactFitSelector`). Atomic reservation under contention verified by 10-task concurrent test. Legacy `inventory_snapshot` / `inventory_summary` preserved as derived views.
 - [x] **14d** — `GreedyExactFitSelector` (exact-single → bounded 2-of-N exact up to N=2000 → bounded 3-of-N exact up to N=16 → smallest-change single → multi-UTXO greedy). Exclusion-based retry in `request_quote` so a fully deterministic selector still gets healthy concurrency. Fragmentation hot path verified: 100 dust UTXOs + 1 fat 10000 UTXO, request 20, picks `{10, 10}` not the fat one.
-- [ ] **14e** — Rebalance loop stub, extended metrics, failure handling, change re-ingestion; `docs/rebalancing-strategy.md`; deletion of legacy `Allocation` / `AllocationState` / `ManagedAllocation`.
+- [x] **14e** — `spawn_rebalance_loop` planner stub in maker-node + `RebalancePolicy` + `RebalancePlan`. Failure-handling `InventoryStore` methods (`mark_pending_bitcoin_confirm`, `mark_pending_rgb_acceptance`, `mark_broadcast_failed`, `mark_rgb_acceptance_failed`, `mark_reorged`, `mark_invalid`) + transition tests. Change re-ingestion in `MockMaker::accept_quote` when `expected_change > 0` (PendingBitcoinConfirm change UTXO). `docs/rebalancing-strategy.md` design doc. **Deferred to 14f:** deletion of legacy `Allocation` / `AllocationState` / `ManagedAllocation` types and the `RgbBackend::list_allocations` trait method — the cascade across maker-node bootstrap, rfq-api, and test fixtures is large enough to warrant an isolated cleanup PR.
+
+### Follow-up issues
+
+- **14f** — Delete legacy `Allocation` / `AllocationState` / `ManagedAllocation`. Replace `MockMaker::new(maker_id, allocations, rgb_backend)` with a path that takes `Vec<RgbInventoryUtxo>` or a pre-seeded `InventoryStore`. Remove `RgbBackend::list_allocations` from the trait. Migrate maker-node `build_maker` to consume `list_inventory_utxos` directly.
+- **Rebalance executor** — splice `RebalancePlan` merges/splits into the next outgoing settlement PSBT. Depends on #13's `create_transfer` being real. Includes the low-traffic fallback to standalone self-transfers (see `docs/rebalancing-strategy.md`).
 
 ## Issue #9: Settlement State Machine
 

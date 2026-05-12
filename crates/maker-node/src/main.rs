@@ -9,7 +9,7 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use rfq_client::{RfqClient, Url};
-use rfq_maker::MockMaker;
+use rfq_maker::{MockMaker, RebalancePolicy};
 use rfq_rgb::{LibRgbBackend, MockRgbBackend, RgbBackend};
 use rfq_router::MakerConnector;
 use rfq_store::{InMemoryQuoteStore, QuoteStore};
@@ -34,14 +34,46 @@ enum Command {
     Inventory,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct MakerNodeConfig {
     rfq_api_url: String,
     maker_listen_addr: String,
     maker_id: String,
     poll_interval_ms: u64,
     cleanup_interval_ms: u64,
+    rebalance_interval_ms: u64,
+    rebalance_policy: RebalancePolicyConfig,
     rgb: Option<RgbConfig>,
+}
+
+/// Mirror of `RebalancePolicy` with `PartialEq` for the config tests. The
+/// `RebalancePolicy` struct itself contains an `f64` and can't derive `Eq`.
+#[derive(Debug, Clone, PartialEq)]
+struct RebalancePolicyConfig {
+    fragmentation_threshold: f64,
+    max_utxo_count: u64,
+    min_utxo_count: u64,
+}
+
+impl From<&RebalancePolicyConfig> for RebalancePolicy {
+    fn from(c: &RebalancePolicyConfig) -> Self {
+        Self {
+            fragmentation_threshold: c.fragmentation_threshold,
+            max_utxo_count: c.max_utxo_count,
+            min_utxo_count: c.min_utxo_count,
+        }
+    }
+}
+
+impl Default for RebalancePolicyConfig {
+    fn default() -> Self {
+        let p = RebalancePolicy::default();
+        Self {
+            fragmentation_threshold: p.fragmentation_threshold,
+            max_utxo_count: p.max_utxo_count,
+            min_utxo_count: p.min_utxo_count,
+        }
+    }
 }
 
 /// Library-backed RGB adapter config. Populated from env when ALL fields resolve;
@@ -71,6 +103,24 @@ impl MakerNodeConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(1_000),
+            rebalance_interval_ms: env::var("REBALANCE_INTERVAL_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(60_000),
+            rebalance_policy: RebalancePolicyConfig {
+                fragmentation_threshold: env::var("REBALANCE_FRAGMENTATION_THRESHOLD")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.7),
+                max_utxo_count: env::var("REBALANCE_MAX_UTXO_COUNT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(50),
+                min_utxo_count: env::var("REBALANCE_MIN_UTXO_COUNT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(3),
+            },
             rgb: RgbConfig::from_env(),
         }
     }
@@ -133,10 +183,16 @@ async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> 
     println!("maker_listen_addr={}", config.maker_listen_addr);
     println!("poll_interval_ms={}", config.poll_interval_ms);
     println!("cleanup_interval_ms={}", config.cleanup_interval_ms);
+    println!("rebalance_interval_ms={}", config.rebalance_interval_ms);
     println!("wallet_sample_invoice={sample_invoice}");
     println!("maker_runtime={maker_type}");
 
     let cleanup_task = spawn_cleanup_loop(maker.clone(), config.cleanup_interval_ms);
+    let rebalance_task = spawn_rebalance_loop(
+        maker.clone(),
+        config.rebalance_interval_ms,
+        (&config.rebalance_policy).into(),
+    );
     let placeholder_task = spawn_placeholder_loop(config.poll_interval_ms);
     let server_task = tokio::spawn(async move {
         let result = axum::serve(listener, app)
@@ -154,9 +210,11 @@ async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> 
 
     let _ = shutdown_tx.send(());
     cleanup_task.abort();
+    rebalance_task.abort();
     placeholder_task.abort();
     let _ = server_task.await;
     let _ = cleanup_task.await;
+    let _ = rebalance_task.await;
     let _ = placeholder_task.await;
 
     Ok(())
@@ -338,6 +396,29 @@ fn spawn_cleanup_loop(maker: MockMaker, cleanup_interval_ms: u64) -> JoinHandle<
             let released = maker.release_expired_reservations().await;
             if released > 0 {
                 println!("released_expired_reservations={released}");
+            }
+        }
+    })
+}
+
+/// Periodic rebalance planner loop. Mirrors `spawn_cleanup_loop` in shape but
+/// runs on a slower cadence (default 60s vs 1s). Calls `maker.rebalance(policy)`
+/// and logs the trigger reasons when a plan fires. In 14e the loop only logs;
+/// the executor (settlement-tx piggyback) is a follow-up issue. See
+/// docs/rebalancing-strategy.md.
+fn spawn_rebalance_loop(
+    maker: MockMaker,
+    rebalance_interval_ms: u64,
+    policy: RebalancePolicy,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_millis(rebalance_interval_ms));
+
+        loop {
+            interval.tick().await;
+            let plan = maker.rebalance(&policy).await;
+            if !plan.is_empty() {
+                println!("rebalance_plan triggers={:?}", plan.triggers);
             }
         }
     })
@@ -543,6 +624,8 @@ mod tests {
             maker_id: "test-maker".to_owned(),
             poll_interval_ms: 1_000,
             cleanup_interval_ms: 1_000,
+            rebalance_interval_ms: 60_000,
+            rebalance_policy: RebalancePolicyConfig::default(),
             rgb: None,
         }
     }

@@ -106,15 +106,79 @@ pub trait InventoryStore: Send + Sync {
     /// count of UTXOs released.
     async fn release_expired_reservations(&self, now_ms: u64) -> usize;
 
-    /// Mark every UTXO in `reservation_id` as `Spent`. Idempotent: a repeat
-    /// call with the same `reservation_id` succeeds (no-op) if the UTXOs are
-    /// already `Spent` under that reservation's quote_id.
+    /// Mark every UTXO in `reservation_id` as `Spent`. Accepts UTXOs currently
+    /// in `Reserved` or `PendingRgbAcceptance` (the settlement state machine
+    /// will drive the latter; today's MockMaker uses the former directly).
+    /// Idempotent: a repeat call with the same `reservation_id` succeeds
+    /// (no-op) if the UTXOs are already `Spent` under the same witness_txid.
     async fn mark_spent(
         &self,
         reservation_id: &ReservationId,
         witness_txid: String,
         now_ms: u64,
     ) -> Result<usize, InventoryError>;
+
+    /// Transition every UTXO in `reservation_id` from `Reserved` to
+    /// `PendingBitcoinConfirm { witness_txid }`. Used by the settlement
+    /// state machine (#9) after the maker broadcasts the witness tx.
+    async fn mark_pending_bitcoin_confirm(
+        &self,
+        reservation_id: &ReservationId,
+        witness_txid: String,
+        now_ms: u64,
+    ) -> Result<usize, InventoryError>;
+
+    /// Transition every UTXO in `reservation_id` from `PendingBitcoinConfirm`
+    /// to `PendingRgbAcceptance`. Used by the settlement state machine (#9)
+    /// after the bitcoin tx confirms.
+    async fn mark_pending_rgb_acceptance(
+        &self,
+        reservation_id: &ReservationId,
+        now_ms: u64,
+    ) -> Result<usize, InventoryError>;
+
+    /// Release a reservation back to `Available` because the broadcast itself
+    /// failed (mempool rejected, indexer unreachable, etc). Same outcome as
+    /// `release_reservation` — distinct method name for observability and
+    /// because the settlement state machine (#9) will reach it via a
+    /// different state-transition edge than expiry.
+    async fn mark_broadcast_failed(
+        &self,
+        reservation_id: &ReservationId,
+        now_ms: u64,
+    ) -> Result<usize, InventoryError>;
+
+    /// Mark UTXOs in `reservation_id` as `Invalid` because the RGB
+    /// consignment was rejected by the counterparty after broadcast.
+    /// Input UTXOs cannot be reused — funds are locked behind the witness tx.
+    async fn mark_rgb_acceptance_failed(
+        &self,
+        reservation_id: &ReservationId,
+        reason: String,
+        now_ms: u64,
+    ) -> Result<usize, InventoryError>;
+
+    /// Reconcile chain state under a reorg that orphans `witness_txid`:
+    /// - Inputs spent into the reorged tx (`Spent { witness_txid: T }`) → `Available`.
+    /// - Outputs produced by the reorged tx (`PendingBitcoinConfirm` or
+    ///   `PendingRgbAcceptance` referencing T) → `Invalid`.
+    ///
+    /// Returns the count of UTXOs affected.
+    async fn mark_reorged(
+        &self,
+        witness_txid: &str,
+        now_ms: u64,
+    ) -> Result<usize, InventoryError>;
+
+    /// Mark a single UTXO as `Invalid` regardless of its current status. Used
+    /// for stash inconsistency detected at startup and any other case where
+    /// the maker can't safely treat the UTXO as inventory.
+    async fn mark_invalid(
+        &self,
+        outpoint: &Outpoint,
+        reason: String,
+        now_ms: u64,
+    ) -> Result<(), InventoryError>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -314,36 +378,190 @@ impl InventoryStore for InMemoryInventoryStore {
         let mut already_spent = 0;
 
         for utxo in utxos.values_mut() {
-            match &utxo.status {
+            let (matches, quote_id) = match &utxo.status {
                 InventoryStatus::Reserved {
                     reservation_id: rid,
                     quote_id,
                     ..
+                } if rid == reservation_id => (true, Some(quote_id.clone())),
+                InventoryStatus::PendingRgbAcceptance {
+                    reservation_id: rid,
+                    ..
                 } if rid == reservation_id => {
-                    matched_any = true;
-                    let quote_id = quote_id.clone();
-                    utxo.status = InventoryStatus::Spent {
-                        witness_txid: witness_txid.clone(),
-                        quote_id,
-                    };
-                    utxo.updated_at_ms = now_ms;
-                    updated += 1;
+                    // Quote id is recoverable from the original Reserved state
+                    // but not retained on PendingRgbAcceptance. For #9-driven
+                    // flows we'd need a side index; #14e callers don't reach
+                    // this branch yet, so synthesize a placeholder.
+                    (true, None)
                 }
                 InventoryStatus::Spent {
                     witness_txid: existing_txid,
                     ..
                 } if existing_txid == &witness_txid => {
-                    // Idempotent: already spent by this same witness_txid.
                     already_spent += 1;
+                    (false, None)
                 }
-                _ => {}
+                _ => (false, None),
+            };
+            if !matches {
+                continue;
             }
+            matched_any = true;
+            utxo.status = InventoryStatus::Spent {
+                witness_txid: witness_txid.clone(),
+                quote_id: quote_id
+                    .unwrap_or_else(|| QuoteId(format!("recovered-from-{}", reservation_id.0))),
+            };
+            utxo.updated_at_ms = now_ms;
+            updated += 1;
         }
 
         if !matched_any && already_spent == 0 {
             return Err(InventoryError::ReservationNotFound(reservation_id.clone()));
         }
         Ok(updated)
+    }
+
+    async fn mark_pending_bitcoin_confirm(
+        &self,
+        reservation_id: &ReservationId,
+        witness_txid: String,
+        now_ms: u64,
+    ) -> Result<usize, InventoryError> {
+        let mut utxos = self.utxos.write().await;
+        let mut updated = 0;
+        for utxo in utxos.values_mut() {
+            if let InventoryStatus::Reserved {
+                reservation_id: rid,
+                ..
+            } = &utxo.status
+            {
+                if rid == reservation_id {
+                    utxo.status = InventoryStatus::PendingBitcoinConfirm {
+                        reservation_id: reservation_id.clone(),
+                        witness_txid: witness_txid.clone(),
+                    };
+                    utxo.updated_at_ms = now_ms;
+                    updated += 1;
+                }
+            }
+        }
+        if updated == 0 {
+            return Err(InventoryError::ReservationNotFound(reservation_id.clone()));
+        }
+        Ok(updated)
+    }
+
+    async fn mark_pending_rgb_acceptance(
+        &self,
+        reservation_id: &ReservationId,
+        now_ms: u64,
+    ) -> Result<usize, InventoryError> {
+        let mut utxos = self.utxos.write().await;
+        let mut updated = 0;
+        for utxo in utxos.values_mut() {
+            if let InventoryStatus::PendingBitcoinConfirm {
+                reservation_id: rid,
+                witness_txid,
+            } = &utxo.status
+            {
+                if rid == reservation_id {
+                    utxo.status = InventoryStatus::PendingRgbAcceptance {
+                        reservation_id: reservation_id.clone(),
+                        witness_txid: witness_txid.clone(),
+                    };
+                    utxo.updated_at_ms = now_ms;
+                    updated += 1;
+                }
+            }
+        }
+        if updated == 0 {
+            return Err(InventoryError::ReservationNotFound(reservation_id.clone()));
+        }
+        Ok(updated)
+    }
+
+    async fn mark_broadcast_failed(
+        &self,
+        reservation_id: &ReservationId,
+        now_ms: u64,
+    ) -> Result<usize, InventoryError> {
+        self.release_reservation(reservation_id, now_ms).await
+    }
+
+    async fn mark_rgb_acceptance_failed(
+        &self,
+        reservation_id: &ReservationId,
+        reason: String,
+        now_ms: u64,
+    ) -> Result<usize, InventoryError> {
+        let mut utxos = self.utxos.write().await;
+        let mut updated = 0;
+        for utxo in utxos.values_mut() {
+            if let InventoryStatus::PendingRgbAcceptance {
+                reservation_id: rid,
+                ..
+            } = &utxo.status
+            {
+                if rid == reservation_id {
+                    utxo.status = InventoryStatus::Invalid {
+                        reason: reason.clone(),
+                    };
+                    utxo.updated_at_ms = now_ms;
+                    updated += 1;
+                }
+            }
+        }
+        if updated == 0 {
+            return Err(InventoryError::ReservationNotFound(reservation_id.clone()));
+        }
+        Ok(updated)
+    }
+
+    async fn mark_reorged(
+        &self,
+        witness_txid: &str,
+        now_ms: u64,
+    ) -> Result<usize, InventoryError> {
+        let mut utxos = self.utxos.write().await;
+        let mut updated = 0;
+        for utxo in utxos.values_mut() {
+            let new_status = match &utxo.status {
+                InventoryStatus::Spent {
+                    witness_txid: wt, ..
+                } if wt == witness_txid => Some(InventoryStatus::Available),
+                InventoryStatus::PendingBitcoinConfirm {
+                    witness_txid: wt, ..
+                }
+                | InventoryStatus::PendingRgbAcceptance {
+                    witness_txid: wt, ..
+                } if wt == witness_txid => Some(InventoryStatus::Invalid {
+                    reason: format!("reorged: witness tx {witness_txid} orphaned"),
+                }),
+                _ => None,
+            };
+            if let Some(status) = new_status {
+                utxo.status = status;
+                utxo.updated_at_ms = now_ms;
+                updated += 1;
+            }
+        }
+        Ok(updated)
+    }
+
+    async fn mark_invalid(
+        &self,
+        outpoint: &Outpoint,
+        reason: String,
+        now_ms: u64,
+    ) -> Result<(), InventoryError> {
+        let mut utxos = self.utxos.write().await;
+        let utxo = utxos
+            .get_mut(outpoint)
+            .ok_or_else(|| InventoryError::UtxoNotFound(outpoint.clone()))?;
+        utxo.status = InventoryStatus::Invalid { reason };
+        utxo.updated_at_ms = now_ms;
+        Ok(())
     }
 }
 
@@ -690,6 +908,241 @@ mod tests {
         let snap = store.extended_snapshot(&asset()).await;
         assert_eq!(snap.fragmentation_score, 0.0);
         assert_eq!(snap.total_amount, 0);
+    }
+
+    // --- 14e failure-handling tests ---
+
+    #[tokio::test]
+    async fn mark_pending_bitcoin_confirm_transitions_reserved_to_pending() {
+        let store = seeded_store(vec![utxo(asset(), 0, 100), utxo(asset(), 1, 200)]).await;
+        let rid = store
+            .reserve_utxos(
+                &RfqId("rfq-1".into()),
+                &QuoteId("q-1".into()),
+                &[outpoint(0), outpoint(1)],
+                NOW_MS + 30_000,
+                NOW_MS,
+            )
+            .await
+            .unwrap();
+
+        let count = store
+            .mark_pending_bitcoin_confirm(&rid, "wt-1".into(), NOW_MS + 100)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+
+        for vout in [0, 1] {
+            let status = store.get(&outpoint(vout)).await.unwrap().status;
+            match status {
+                InventoryStatus::PendingBitcoinConfirm {
+                    reservation_id,
+                    witness_txid,
+                } => {
+                    assert_eq!(reservation_id, rid);
+                    assert_eq!(witness_txid, "wt-1");
+                }
+                other => panic!("expected PendingBitcoinConfirm, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_pending_rgb_acceptance_transitions_pending_btc_to_pending_rgb() {
+        let store = seeded_store(vec![utxo(asset(), 0, 100)]).await;
+        let rid = store
+            .reserve_utxos(
+                &RfqId("rfq-1".into()),
+                &QuoteId("q-1".into()),
+                &[outpoint(0)],
+                NOW_MS + 30_000,
+                NOW_MS,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_pending_bitcoin_confirm(&rid, "wt-1".into(), NOW_MS + 100)
+            .await
+            .unwrap();
+
+        let count = store
+            .mark_pending_rgb_acceptance(&rid, NOW_MS + 200)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(matches!(
+            store.get(&outpoint(0)).await.unwrap().status,
+            InventoryStatus::PendingRgbAcceptance { ref witness_txid, .. } if witness_txid == "wt-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mark_spent_accepts_pending_rgb_acceptance_input() {
+        let store = seeded_store(vec![utxo(asset(), 0, 100)]).await;
+        let rid = store
+            .reserve_utxos(
+                &RfqId("rfq-1".into()),
+                &QuoteId("q-1".into()),
+                &[outpoint(0)],
+                NOW_MS + 30_000,
+                NOW_MS,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_pending_bitcoin_confirm(&rid, "wt-1".into(), NOW_MS + 100)
+            .await
+            .unwrap();
+        store
+            .mark_pending_rgb_acceptance(&rid, NOW_MS + 200)
+            .await
+            .unwrap();
+
+        let count = store
+            .mark_spent(&rid, "wt-1".into(), NOW_MS + 300)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(matches!(
+            store.get(&outpoint(0)).await.unwrap().status,
+            InventoryStatus::Spent { ref witness_txid, .. } if witness_txid == "wt-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mark_broadcast_failed_returns_to_available() {
+        let store = seeded_store(vec![utxo(asset(), 0, 100)]).await;
+        let rid = store
+            .reserve_utxos(
+                &RfqId("rfq-1".into()),
+                &QuoteId("q-1".into()),
+                &[outpoint(0)],
+                NOW_MS + 30_000,
+                NOW_MS,
+            )
+            .await
+            .unwrap();
+
+        let count = store
+            .mark_broadcast_failed(&rid, NOW_MS + 100)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(matches!(
+            store.get(&outpoint(0)).await.unwrap().status,
+            InventoryStatus::Available
+        ));
+    }
+
+    #[tokio::test]
+    async fn mark_rgb_acceptance_failed_transitions_to_invalid_with_reason() {
+        let store = seeded_store(vec![utxo(asset(), 0, 100)]).await;
+        let rid = store
+            .reserve_utxos(
+                &RfqId("rfq-1".into()),
+                &QuoteId("q-1".into()),
+                &[outpoint(0)],
+                NOW_MS + 30_000,
+                NOW_MS,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_pending_bitcoin_confirm(&rid, "wt-1".into(), NOW_MS + 100)
+            .await
+            .unwrap();
+        store
+            .mark_pending_rgb_acceptance(&rid, NOW_MS + 200)
+            .await
+            .unwrap();
+
+        let count = store
+            .mark_rgb_acceptance_failed(&rid, "counterparty rejected".into(), NOW_MS + 300)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(matches!(
+            store.get(&outpoint(0)).await.unwrap().status,
+            InventoryStatus::Invalid { ref reason } if reason == "counterparty rejected"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mark_reorged_releases_spent_inputs_and_invalidates_pending_outputs() {
+        let store = seeded_store(vec![
+            utxo(asset(), 0, 100),
+            utxo(asset(), 1, 50),
+            utxo(asset(), 2, 200),
+        ])
+        .await;
+        // UTXO 0: spent in the reorged tx → should go back to Available.
+        let rid_spent = store
+            .reserve_utxos(
+                &RfqId("rfq-1".into()),
+                &QuoteId("q-1".into()),
+                &[outpoint(0)],
+                NOW_MS + 30_000,
+                NOW_MS,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_spent(&rid_spent, "wt-reorged".into(), NOW_MS + 100)
+            .await
+            .unwrap();
+        // UTXO 1: an output (change-style) of the reorged tx that was awaiting
+        // bitcoin confirmation → should go to Invalid.
+        store
+            .ingest_change_utxo(InventoryUtxo {
+                status: InventoryStatus::PendingBitcoinConfirm {
+                    reservation_id: ReservationId("rid-x".into()),
+                    witness_txid: "wt-reorged".into(),
+                },
+                pending_txid: Some("wt-reorged".into()),
+                ..utxo(asset(), 5, 25)
+            })
+            .await
+            .unwrap();
+        // UTXO 2: unrelated; should not be touched.
+
+        let updated = store.mark_reorged("wt-reorged", NOW_MS + 200).await.unwrap();
+        assert_eq!(updated, 2);
+
+        assert!(matches!(
+            store.get(&outpoint(0)).await.unwrap().status,
+            InventoryStatus::Available
+        ));
+        assert!(matches!(
+            store.get(&outpoint(5)).await.unwrap().status,
+            InventoryStatus::Invalid { .. }
+        ));
+        assert!(matches!(
+            store.get(&outpoint(2)).await.unwrap().status,
+            InventoryStatus::Available
+        ));
+    }
+
+    #[tokio::test]
+    async fn mark_invalid_sets_status_regardless_of_prior_state() {
+        let store = seeded_store(vec![utxo(asset(), 0, 100)]).await;
+        store
+            .mark_invalid(&outpoint(0), "stash drift".into(), NOW_MS + 100)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.get(&outpoint(0)).await.unwrap().status,
+            InventoryStatus::Invalid { ref reason } if reason == "stash drift"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mark_invalid_unknown_outpoint_errors() {
+        let store = seeded_store(vec![]).await;
+        let err = store
+            .mark_invalid(&outpoint(99), "x".into(), NOW_MS)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, InventoryError::UtxoNotFound(_)));
     }
 
     #[tokio::test]
