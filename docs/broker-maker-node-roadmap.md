@@ -16,7 +16,9 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [x] Define regtest RGB20 integration plan
 - [x] Validate end-to-end NIA issuance + issuer→maker transfer on regtest
 - [ ] Issue #13: Implement library-backed `rfq-rgb` adapter
-- [ ] Issue #14: RGB maker UTXO inventory management (supersedes #11)
+- [x] Issue #14: RGB maker UTXO inventory management (supersedes #11)
+- [ ] Issue #15: Atomic swap settlement — buy side (BTC → RGB)
+- [ ] Issue #16: Atomic swap settlement — sell side (RGB → BTC)
 - [ ] Issue #9: Add RFQ settlement state machine
 - [ ] Issue #6: Add OpenAPI spec for public RFQ API
 
@@ -114,6 +116,29 @@ Shipped as six sequenced sub-PRs (see `.claude/plans/yes-lets-do-ti-lovely-grove
 - **Minimum liquidity floor** — explore how the maker guarantees at least N working-denomination UTXOs are always available so it can always serve a quote. The existing `min_utxo_count` rebalance trigger fires *after* the floor is breached but doesn't act. Design space: (a) hard floor on coin selection — refuse to fill quotes that would drop `available_utxos` below N, (b) proactive splits via the rebalance executor when approaching the floor, (c) reserved buffer subset that coin selection treats as untouchable. Likely a hybrid of (a) and (b). Should land alongside or after the rebalance executor.
 - **Split `crates/maker-node/src/main.rs`** — the file is approaching 700 lines mixing config parsing, CLI, HTTP handlers, bootstrap, periodic loops, and tests. Break into focused modules: `config.rs` (`MakerNodeConfig`, `RgbConfig`, `RebalancePolicyConfig`), `cli.rs` (clap surface + subcommand routing), `http.rs` (`maker_app` + handlers), `bootstrap.rs` (`build_maker` + RGB backend wiring), `loops.rs` (`spawn_cleanup_loop`, `spawn_rebalance_loop`, `spawn_placeholder_loop`). Pure refactor, no behavioral change.
 
+## BTC ↔ RGB Atomic Swap Settlement (Issues #15 + #16)
+
+Replace the unilateral `MakerConnector::accept_quote` transfer with a real atomic swap where the maker assembles a witness transaction anchoring both BTC and RGB legs and broadcasts it after the taker returns a signed PSBT. Full protocol spec lives in [`docs/swap-flows.md`](swap-flows.md).
+
+Two parent issues split by direction. Each parent has three lettered sub-issues following the #14 pattern.
+
+- **#15** Buy side (taker buys RGB with BTC):
+  - **15a** (#17) — Side-aware protocol types (`SwapLeg`, expanded `SettlementIntent` / `SettlementStatus`, new `Quote` fee fields, two new `MakerConnector` methods, three new `ApiError` variants).
+  - **15b** (#18) — `BitcoinClient` trait + electrum-backed impl in a new `rfq-btc` crate (`get_outpoint`, `broadcast`, `estimate_feerate`, `block_height`).
+  - **15c** (#19) — Buy-side flow wiring (mock end-to-end): maker constructs PSBT with RGB inputs only, taker adds BTC at `/sign`, maker finalizes and broadcasts.
+- **#16** Sell side (taker sells RGB for BTC):
+  - **16a** (#20) — `BtcInventoryStore` trait + `InMemoryBtcInventoryStore` (parallel to #14's RGB inventory, simpler shape).
+  - **16b** (#21) — Sell-side protocol additions (`SwapLeg::Sell` body, `Quote.maker_rgb_invoice`, new `POST /quotes/:id/consignment` endpoint, `SettlementStatus::AwaitingConsignment`).
+  - **16c** (#22) — Sell-side flow wiring (mock end-to-end): three round trips after accept (invoice → consignment → PSBT → sign → broadcast).
+
+Protocol invariant:
+
+> **Receiver of RGB assets creates the RGB invoice. Maker constructs the PSBT in both flows.**
+
+Plus: **maker is the only broadcaster** (both flows), **fee policy is taker-pays** (`Quote.estimated_fee_sats` + `Quote.fee_slippage_bps`, default 20%), **segwit-only** (lets `expected_witness_txid` pre-compute once all inputs are committed).
+
+Depends on **#14** (RGB inventory lifecycle is the same `Reserved → … → Spent` extended with `AwaitingTakerSignature` / `AwaitingConsignment` between accept and broadcast). Reuses existing `InventoryStore` failure-state methods (`mark_broadcast_failed`, `mark_reorged`, `mark_pending_bitcoin_confirm`, etc., from #14e). Touches **#9** — three new `SettlementStatus` variants. **#15 must land before #16** (sell reuses 15a's types and 15b's `BitcoinClient`).
+
 ## Issue #9: Settlement State Machine
 
 Make quote acceptance and settlement lifecycle explicit before real RGB/Bitcoin execution.
@@ -135,4 +160,6 @@ Document the broker contract once the core broker and maker-node surfaces stabil
 - Maker inventory remains maker-owned; the broker may observe inventory but should not reserve or mutate it directly.
 - The MVP targets Bitcoin regtest with a full RGB node and issued RGB20 assets.
 - Mocks remain the default for unit tests and local fast checks.
-- Whole-allocation reservation is the current MVP behavior; per-UTXO reservation + denomination-aware coin selection arrive under issue #14.
+- Per-UTXO reservation + denomination-aware coin selection are the current MVP behavior (shipped under #14); whole-allocation reservation is gone.
+- Receiver of RGB assets creates the RGB invoice in both directions; maker constructs the PSBT and broadcasts in both directions (see [`swap-flows.md`](swap-flows.md)).
+- Fee policy is taker-pays. `Quote` carries `estimated_fee_sats` + `fee_slippage_bps`; settlement aborts if accept-time feerate exceeds the cap.
