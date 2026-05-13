@@ -14,8 +14,8 @@ use rfq_router::{fanout_quote, MakerConnector};
 use rfq_store::{InMemoryQuoteStore, QuoteStore};
 pub use rfq_types::CreateRfqRequest;
 use rfq_types::{
-    AcceptQuoteRequest, Allocation, AssetId, AssetKind, BitcoinNetwork, HealthResponse, MakerId,
-    Quote, QuoteId, QuoteRequest, RfqId, SettlementIntent,
+    AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, HealthResponse, MakerId, Outpoint,
+    Quote, QuoteId, QuoteRequest, RfqId, RgbInventoryUtxo, SettlementIntent,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -38,13 +38,14 @@ pub fn app() -> Router {
         kind: AssetKind::Rgb20,
         id: "rgb-test-asset".to_owned(),
     };
-    let allocation = Allocation {
-        maker_id: maker_id.clone(),
-        asset: rgb_asset,
-        available_amount: 1_000_000,
+    let utxo = RgbInventoryUtxo {
+        outpoint: Outpoint::new(format!("{:064x}", 0u64), 0),
+        asset_id: rgb_asset,
+        amount: 1_000_000,
+        btc_sats: 0,
     };
-    let rgb_backend = Arc::new(MockRgbBackend::new(vec![allocation.clone()]));
-    let maker = Arc::new(MockMaker::new(maker_id, vec![allocation], rgb_backend));
+    let rgb_backend = Arc::new(MockRgbBackend::new(vec![utxo.clone()]));
+    let maker = Arc::new(MockMaker::new(maker_id, vec![utxo], rgb_backend));
 
     app_with_state(AppState {
         makers: vec![maker],

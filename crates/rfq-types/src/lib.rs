@@ -147,13 +147,6 @@ pub enum SettlementStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Allocation {
-    pub maker_id: MakerId,
-    pub asset: AssetId,
-    pub available_amount: u64,
-}
-
 /// Per-UTXO inventory entry returned by `RgbBackend::list_inventory_utxos`.
 /// `btc_sats` may be 0 when the backend hasn't surfaced bp-wallet UTXO data yet
 /// (the value is only used by the maker's fragmentation heuristics, which fall
@@ -346,24 +339,6 @@ impl std::fmt::Display for InventoryError {
 }
 
 impl std::error::Error for InventoryError {}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum AllocationState {
-    Available,
-    Reserved {
-        quote_id: QuoteId,
-        expires_at_ms: u64,
-    },
-    Spent {
-        quote_id: QuoteId,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ManagedAllocation {
-    pub allocation: Allocation,
-    pub state: AllocationState,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct InventorySnapshot {

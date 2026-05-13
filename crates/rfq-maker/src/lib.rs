@@ -5,10 +5,9 @@ use rfq_rgb::RgbBackend;
 use rfq_router::{MakerConnector, RouterError};
 use rfq_store::{InMemoryInventoryStore, InventoryStore};
 use rfq_types::{
-    AcceptQuoteRequest, Allocation, AllocationState, AssetId, ExtendedInventorySnapshot,
-    InventoryError, InventorySnapshot, InventoryStatus, InventoryUtxo, MakerId, ManagedAllocation,
-    Outpoint, Quote, QuoteId, QuoteRequest, ReservationId, RfqId, SettlementIntent,
-    SettlementStatus,
+    AcceptQuoteRequest, AssetId, ExtendedInventorySnapshot, InventoryError, InventorySnapshot,
+    InventoryStatus, InventoryUtxo, MakerId, Outpoint, Quote, QuoteId, QuoteRequest,
+    RgbInventoryUtxo, SettlementIntent, SettlementStatus,
 };
 use uuid::Uuid;
 
@@ -87,23 +86,22 @@ pub struct MockMaker {
 }
 
 impl MockMaker {
-    /// Backward-compatible constructor: seeds the inventory store with one
-    /// synthetic outpoint per `Allocation`. Used by call sites that haven't
-    /// migrated to building their own `InventoryUtxo` set yet.
+    /// Seed the inventory store from a per-UTXO chain view. All entries start
+    /// `Available`; tests needing pre-existing Reserved / Spent state should
+    /// build their own `InMemoryInventoryStore` and use `with_components`.
     pub fn new(
         maker_id: MakerId,
-        allocations: Vec<Allocation>,
+        utxos: Vec<RgbInventoryUtxo>,
         rgb_backend: Arc<dyn RgbBackend>,
     ) -> Self {
         let now = now_ms();
-        let utxos: Vec<InventoryUtxo> = allocations
+        let inv_utxos: Vec<InventoryUtxo> = utxos
             .into_iter()
-            .enumerate()
-            .map(|(idx, a)| InventoryUtxo {
-                outpoint: synth_outpoint(idx),
-                asset_id: a.asset,
-                amount: a.available_amount,
-                btc_sats: 0,
+            .map(|u| InventoryUtxo {
+                outpoint: u.outpoint,
+                asset_id: u.asset_id,
+                amount: u.amount,
+                btc_sats: u.btc_sats,
                 status: InventoryStatus::Available,
                 created_at_ms: now,
                 updated_at_ms: now,
@@ -112,38 +110,7 @@ impl MockMaker {
             .collect();
         Self::with_components(
             maker_id,
-            Arc::new(InMemoryInventoryStore::with_seed(utxos)),
-            Arc::new(GreedyExactFitSelector),
-            rgb_backend,
-        )
-    }
-
-    /// Seed from a `Vec<ManagedAllocation>` — used by legacy tests to pre-set
-    /// Reserved / Spent states. Non-`Available` states get synthesized
-    /// reservation_ids / rfq_ids / witness_txids so the conversion is total.
-    pub fn new_with_inventory(
-        maker_id: MakerId,
-        inventory: Vec<ManagedAllocation>,
-        rgb_backend: Arc<dyn RgbBackend>,
-    ) -> Self {
-        let now = now_ms();
-        let utxos: Vec<InventoryUtxo> = inventory
-            .into_iter()
-            .enumerate()
-            .map(|(idx, m)| InventoryUtxo {
-                outpoint: synth_outpoint(idx),
-                asset_id: m.allocation.asset,
-                amount: m.allocation.available_amount,
-                btc_sats: 0,
-                status: legacy_state_to_inventory_status(idx, m.state),
-                created_at_ms: now,
-                updated_at_ms: now,
-                pending_txid: None,
-            })
-            .collect();
-        Self::with_components(
-            maker_id,
-            Arc::new(InMemoryInventoryStore::with_seed(utxos)),
+            Arc::new(InMemoryInventoryStore::with_seed(inv_utxos)),
             Arc::new(GreedyExactFitSelector),
             rgb_backend,
         )
@@ -164,20 +131,6 @@ impl MockMaker {
             selector,
             rgb_backend,
         }
-    }
-
-    /// Legacy view: `Vec<ManagedAllocation>` sorted by outpoint. Internal
-    /// pending/invalid states (introduced by 14e) are not representable in
-    /// `AllocationState` and would panic; MockMaker doesn't transition into
-    /// those states until 14e, so the conversion is total today.
-    pub async fn inventory_snapshot(&self) -> Vec<ManagedAllocation> {
-        let mut utxos = self.store.list_all().await;
-        utxos.sort_by(|a, b| a.outpoint.cmp(&b.outpoint));
-        let maker_id = self.maker_id.clone();
-        utxos
-            .into_iter()
-            .map(|u| utxo_to_managed_allocation(u, maker_id.clone()))
-            .collect()
     }
 
     /// Per-UTXO view across all assets. Returned in outpoint order so callers
@@ -411,61 +364,15 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn synth_outpoint(idx: usize) -> Outpoint {
-    Outpoint::new(format!("{idx:064x}"), 0)
-}
-
-fn legacy_state_to_inventory_status(idx: usize, state: AllocationState) -> InventoryStatus {
-    match state {
-        AllocationState::Available => InventoryStatus::Available,
-        AllocationState::Reserved {
-            quote_id,
-            expires_at_ms,
-        } => InventoryStatus::Reserved {
-            reservation_id: ReservationId(format!("test-res-{idx}")),
-            rfq_id: RfqId(format!("test-rfq-{idx}")),
-            quote_id,
-            expires_at_ms,
-        },
-        AllocationState::Spent { quote_id } => InventoryStatus::Spent {
-            witness_txid: format!("test-wt-{idx}"),
-            quote_id,
-        },
-    }
-}
-
-fn utxo_to_managed_allocation(utxo: InventoryUtxo, maker_id: MakerId) -> ManagedAllocation {
-    let state = match utxo.status {
-        InventoryStatus::Available => AllocationState::Available,
-        InventoryStatus::Reserved {
-            quote_id,
-            expires_at_ms,
-            ..
-        } => AllocationState::Reserved {
-            quote_id,
-            expires_at_ms,
-        },
-        InventoryStatus::Spent { quote_id, .. } => AllocationState::Spent { quote_id },
-        other => panic!(
-            "inventory_snapshot() cannot represent {other:?}; \
-             use utxo_snapshot() or extended_inventory_summary() instead"
-        ),
-    };
-    ManagedAllocation {
-        allocation: Allocation {
-            maker_id,
-            asset: utxo.asset_id,
-            available_amount: utxo.amount,
-        },
-        state,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rfq_rgb::MockRgbBackend;
-    use rfq_types::{AssetId, AssetKind, BitcoinNetwork, Side};
+    use rfq_types::{AssetId, AssetKind, BitcoinNetwork, ReservationId, RfqId, Side};
+
+    fn synth_outpoint(idx: usize) -> Outpoint {
+        Outpoint::new(format!("{idx:064x}"), 0)
+    }
 
     fn maker_id() -> MakerId {
         MakerId("maker-1".to_owned())
@@ -487,36 +394,51 @@ mod tests {
         }
     }
 
-    fn allocation() -> Allocation {
-        Allocation {
-            maker_id: maker_id(),
-            asset: asset(),
-            available_amount: 100,
+    fn utxo_with_amount(idx: usize, amount: u64) -> RgbInventoryUtxo {
+        RgbInventoryUtxo {
+            outpoint: synth_outpoint(idx),
+            asset_id: asset(),
+            amount,
+            btc_sats: 0,
         }
     }
 
-    fn allocation_with_amount(amount: u64) -> Allocation {
-        Allocation {
-            maker_id: maker_id(),
-            asset: asset(),
-            available_amount: amount,
+    fn utxo() -> RgbInventoryUtxo {
+        utxo_with_amount(0, 100)
+    }
+
+    fn inv_utxo(idx: usize, amount: u64, status: InventoryStatus) -> InventoryUtxo {
+        let now = now_ms();
+        InventoryUtxo {
+            outpoint: synth_outpoint(idx),
+            asset_id: asset(),
+            amount,
+            btc_sats: 0,
+            status,
+            created_at_ms: now,
+            updated_at_ms: now,
+            pending_txid: None,
         }
     }
 
     fn maker() -> MockMaker {
-        let allocation = allocation();
-        let rgb_backend = Arc::new(MockRgbBackend::new(vec![allocation.clone()]));
-        MockMaker::new(maker_id(), vec![allocation], rgb_backend)
+        maker_with_utxos(vec![utxo()])
     }
 
-    fn maker_with_inventory(inventory: Vec<ManagedAllocation>) -> MockMaker {
-        let rgb_backend = Arc::new(MockRgbBackend::new(vec![allocation()]));
-        MockMaker::new_with_inventory(maker_id(), inventory, rgb_backend)
+    fn maker_with_utxos(utxos: Vec<RgbInventoryUtxo>) -> MockMaker {
+        let rgb_backend = Arc::new(MockRgbBackend::new(utxos.clone()));
+        MockMaker::new(maker_id(), utxos, rgb_backend)
     }
 
-    fn maker_with_allocations(allocations: Vec<Allocation>) -> MockMaker {
-        let rgb_backend = Arc::new(MockRgbBackend::new(allocations.clone()));
-        MockMaker::new(maker_id(), allocations, rgb_backend)
+    /// Seed the store directly so tests can pre-set Reserved / Spent statuses.
+    fn maker_with_store(rows: Vec<InventoryUtxo>) -> MockMaker {
+        let rgb_backend = Arc::new(MockRgbBackend::new(vec![utxo()]));
+        MockMaker::with_components(
+            maker_id(),
+            Arc::new(InMemoryInventoryStore::with_seed(rows)),
+            Arc::new(GreedyExactFitSelector),
+            rgb_backend,
+        )
     }
 
     fn quote_request(id: &str) -> QuoteRequest {
@@ -537,26 +459,20 @@ mod tests {
         let quote = maker.request_quote(quote_request("rfq-1")).await.unwrap();
 
         let quote = quote.expect("quote should be returned");
-        let inventory = maker.inventory_snapshot().await;
-        assert_eq!(inventory.len(), 1);
+        let utxos = maker.utxo_snapshot().await;
+        assert_eq!(utxos.len(), 1);
         assert!(matches!(
-            &inventory[0].state,
-            AllocationState::Reserved { quote_id, expires_at_ms }
+            &utxos[0].status,
+            InventoryStatus::Reserved { quote_id, expires_at_ms, .. }
                 if quote_id == &quote.quote_id && *expires_at_ms == quote.expires_at_ms
         ));
     }
 
     #[tokio::test]
     async fn inventory_summary_counts_initial_inventory_as_available() {
-        let maker = maker_with_inventory(vec![
-            ManagedAllocation {
-                allocation: allocation_with_amount(100),
-                state: AllocationState::Available,
-            },
-            ManagedAllocation {
-                allocation: allocation_with_amount(200),
-                state: AllocationState::Available,
-            },
+        let maker = maker_with_utxos(vec![
+            utxo_with_amount(0, 100),
+            utxo_with_amount(1, 200),
         ]);
 
         let snapshot = maker.inventory_summary().await;
@@ -594,68 +510,79 @@ mod tests {
 
     #[tokio::test]
     async fn inventory_summary_releases_expired_reservation() {
-        let maker = maker_with_inventory(vec![ManagedAllocation {
-            allocation: allocation(),
-            state: AllocationState::Reserved {
+        let maker = maker_with_store(vec![inv_utxo(
+            0,
+            100,
+            InventoryStatus::Reserved {
+                reservation_id: ReservationId("res-0".to_owned()),
+                rfq_id: RfqId("rfq-0".to_owned()),
                 quote_id: QuoteId("expired-quote".to_owned()),
                 expires_at_ms: 0,
             },
-        }]);
+        )]);
 
         let snapshot = maker.inventory_summary().await;
-        let inventory = maker.inventory_snapshot().await;
+        let utxos = maker.utxo_snapshot().await;
 
         assert_eq!(snapshot.available_amount, 100);
         assert_eq!(snapshot.reserved_amount, 0);
         assert_eq!(snapshot.available_allocations, 1);
         assert_eq!(snapshot.reserved_allocations, 0);
-        assert!(matches!(inventory[0].state, AllocationState::Available));
+        assert!(matches!(utxos[0].status, InventoryStatus::Available));
     }
 
     #[tokio::test]
     async fn release_expired_reservations_returns_count_and_releases() {
-        let maker = maker_with_inventory(vec![ManagedAllocation {
-            allocation: allocation(),
-            state: AllocationState::Reserved {
+        let maker = maker_with_store(vec![inv_utxo(
+            0,
+            100,
+            InventoryStatus::Reserved {
+                reservation_id: ReservationId("res-0".to_owned()),
+                rfq_id: RfqId("rfq-0".to_owned()),
                 quote_id: QuoteId("expired-quote".to_owned()),
                 expires_at_ms: 0,
             },
-        }]);
+        )]);
 
         let released = maker.release_expired_reservations().await;
-        let inventory = maker.inventory_snapshot().await;
+        let utxos = maker.utxo_snapshot().await;
 
         assert_eq!(released, 1);
-        assert!(matches!(inventory[0].state, AllocationState::Available));
+        assert!(matches!(utxos[0].status, InventoryStatus::Available));
     }
 
     #[tokio::test]
     async fn release_expired_reservations_ignores_active_and_spent() {
-        let maker = maker_with_inventory(vec![
-            ManagedAllocation {
-                allocation: allocation(),
-                state: AllocationState::Reserved {
+        let maker = maker_with_store(vec![
+            inv_utxo(
+                0,
+                100,
+                InventoryStatus::Reserved {
+                    reservation_id: ReservationId("res-0".to_owned()),
+                    rfq_id: RfqId("rfq-0".to_owned()),
                     quote_id: QuoteId("active-quote".to_owned()),
                     expires_at_ms: now_ms() + 30_000,
                 },
-            },
-            ManagedAllocation {
-                allocation: allocation(),
-                state: AllocationState::Spent {
+            ),
+            inv_utxo(
+                1,
+                100,
+                InventoryStatus::Spent {
+                    witness_txid: "wt-1".to_owned(),
                     quote_id: QuoteId("spent-quote".to_owned()),
                 },
-            },
+            ),
         ]);
 
         let released = maker.release_expired_reservations().await;
-        let inventory = maker.inventory_snapshot().await;
+        let utxos = maker.utxo_snapshot().await;
 
         assert_eq!(released, 0);
         assert!(matches!(
-            inventory[0].state,
-            AllocationState::Reserved { .. }
+            utxos[0].status,
+            InventoryStatus::Reserved { .. }
         ));
-        assert!(matches!(inventory[1].state, AllocationState::Spent { .. }));
+        assert!(matches!(utxos[1].status, InventoryStatus::Spent { .. }));
     }
 
     #[tokio::test]
@@ -672,21 +599,24 @@ mod tests {
     #[tokio::test]
     async fn expired_reservation_becomes_available() {
         let expired_quote_id = QuoteId("expired-quote".to_owned());
-        let maker = maker_with_inventory(vec![ManagedAllocation {
-            allocation: allocation(),
-            state: AllocationState::Reserved {
+        let maker = maker_with_store(vec![inv_utxo(
+            0,
+            100,
+            InventoryStatus::Reserved {
+                reservation_id: ReservationId("res-0".to_owned()),
+                rfq_id: RfqId("rfq-0".to_owned()),
                 quote_id: expired_quote_id,
                 expires_at_ms: 0,
             },
-        }]);
+        )]);
 
         let quote = maker.request_quote(quote_request("rfq-1")).await.unwrap();
 
         assert!(quote.is_some());
-        let inventory = maker.inventory_snapshot().await;
+        let utxos = maker.utxo_snapshot().await;
         assert!(matches!(
-            &inventory[0].state,
-            AllocationState::Reserved { quote_id, .. } if quote_id == &quote.unwrap().quote_id
+            &utxos[0].status,
+            InventoryStatus::Reserved { quote_id, .. } if quote_id == &quote.unwrap().quote_id
         ));
     }
 
@@ -711,10 +641,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(intent.status, SettlementStatus::Ready);
-        let inventory = maker.inventory_snapshot().await;
+        let utxos = maker.utxo_snapshot().await;
         assert!(matches!(
-            &inventory[0].state,
-            AllocationState::Spent { quote_id } if quote_id == &quote.quote_id
+            &utxos[0].status,
+            InventoryStatus::Spent { quote_id, .. } if quote_id == &quote.quote_id
         ));
     }
 
@@ -779,10 +709,10 @@ mod tests {
         // Three available UTXOs of 100 each. A request for 80 reserves exactly
         // one of them — the other two stay Available. This is the per-UTXO
         // win over the pre-#14 whole-allocation model.
-        let maker = maker_with_allocations(vec![
-            allocation_with_amount(100),
-            allocation_with_amount(100),
-            allocation_with_amount(100),
+        let maker = maker_with_utxos(vec![
+            utxo_with_amount(0, 100),
+            utxo_with_amount(1, 100),
+            utxo_with_amount(2, 100),
         ]);
 
         let mut request = quote_request("rfq-1");
@@ -799,18 +729,18 @@ mod tests {
 
     #[tokio::test]
     async fn expired_reservation_releases_per_utxo() {
-        let maker = maker_with_inventory(vec![
-            ManagedAllocation {
-                allocation: allocation_with_amount(100),
-                state: AllocationState::Reserved {
+        let maker = maker_with_store(vec![
+            inv_utxo(
+                0,
+                100,
+                InventoryStatus::Reserved {
+                    reservation_id: ReservationId("res-0".to_owned()),
+                    rfq_id: RfqId("rfq-0".to_owned()),
                     quote_id: QuoteId("expired".to_owned()),
                     expires_at_ms: 0,
                 },
-            },
-            ManagedAllocation {
-                allocation: allocation_with_amount(200),
-                state: AllocationState::Available,
-            },
+            ),
+            inv_utxo(1, 200, InventoryStatus::Available),
         ]);
 
         let released = maker.release_expired_reservations().await;
@@ -825,12 +755,12 @@ mod tests {
     async fn concurrent_request_quotes_do_not_double_reserve() {
         // Five UTXOs of 100 each. Spawn 10 concurrent quote requests of 50;
         // at most 5 should succeed (one UTXO per quote with WholeUtxoSelector).
-        let maker = Arc::new(maker_with_allocations(vec![
-            allocation_with_amount(100),
-            allocation_with_amount(100),
-            allocation_with_amount(100),
-            allocation_with_amount(100),
-            allocation_with_amount(100),
+        let maker = Arc::new(maker_with_utxos(vec![
+            utxo_with_amount(0, 100),
+            utxo_with_amount(1, 100),
+            utxo_with_amount(2, 100),
+            utxo_with_amount(3, 100),
+            utxo_with_amount(4, 100),
         ]));
 
         let mut handles = Vec::new();
@@ -862,7 +792,7 @@ mod tests {
     async fn rebalance_emits_no_triggers_for_healthy_inventory() {
         // Single big UTXO → fragmentation 0.0, available_utxos = 1 (between
         // min and max). All triggers should be silent.
-        let maker = maker_with_allocations(vec![allocation_with_amount(1000)]);
+        let maker = maker_with_utxos(vec![utxo_with_amount(0, 1000)]);
         let policy = RebalancePolicy {
             fragmentation_threshold: 0.7,
             max_utxo_count: 50,
@@ -876,12 +806,12 @@ mod tests {
     async fn rebalance_fires_high_fragmentation_above_threshold() {
         // 5 UTXOs of 100 each. Largest 100 / total 500 = 0.2 share →
         // fragmentation = 0.8, which crosses 0.7.
-        let maker = maker_with_allocations(vec![
-            allocation_with_amount(100),
-            allocation_with_amount(100),
-            allocation_with_amount(100),
-            allocation_with_amount(100),
-            allocation_with_amount(100),
+        let maker = maker_with_utxos(vec![
+            utxo_with_amount(0, 100),
+            utxo_with_amount(1, 100),
+            utxo_with_amount(2, 100),
+            utxo_with_amount(3, 100),
+            utxo_with_amount(4, 100),
         ]);
         let policy = RebalancePolicy {
             fragmentation_threshold: 0.7,
@@ -897,8 +827,8 @@ mod tests {
 
     #[tokio::test]
     async fn rebalance_fires_too_many_utxos_above_max() {
-        let allocations: Vec<_> = (0..10).map(|_| allocation_with_amount(10)).collect();
-        let maker = maker_with_allocations(allocations);
+        let utxos: Vec<_> = (0..10).map(|i| utxo_with_amount(i, 10)).collect();
+        let maker = maker_with_utxos(utxos);
         let policy = RebalancePolicy {
             fragmentation_threshold: 1.0, // suppress fragmentation trigger
             max_utxo_count: 5,
@@ -913,7 +843,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebalance_fires_too_few_utxos_below_min() {
-        let maker = maker_with_allocations(vec![allocation_with_amount(1000)]);
+        let maker = maker_with_utxos(vec![utxo_with_amount(0, 1000)]);
         let policy = RebalancePolicy {
             fragmentation_threshold: 1.0,
             max_utxo_count: 50,
@@ -928,12 +858,10 @@ mod tests {
 
     #[tokio::test]
     async fn accept_with_change_ingests_pending_bitcoin_confirm_utxo() {
-        // Single allocation of 100; request 60. Selection picks the 100 UTXO,
+        // Single UTXO of 100; request 60. Selection picks the 100 UTXO,
         // change = 40. After accept_quote, inventory should show the input
         // UTXO as Spent and a synthetic change UTXO as PendingBitcoinConfirm.
-        let allocation = allocation_with_amount(100);
-        let rgb_backend = Arc::new(MockRgbBackend::new(vec![allocation.clone()]));
-        let maker = MockMaker::new(maker_id(), vec![allocation], rgb_backend);
+        let maker = maker_with_utxos(vec![utxo_with_amount(0, 100)]);
 
         let mut request = quote_request("rfq-1");
         request.amount = 60;
@@ -998,18 +926,18 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_inventory_summary_matches_extended_downcast() {
-        let maker = maker_with_inventory(vec![
-            ManagedAllocation {
-                allocation: allocation_with_amount(100),
-                state: AllocationState::Available,
-            },
-            ManagedAllocation {
-                allocation: allocation_with_amount(200),
-                state: AllocationState::Reserved {
+        let maker = maker_with_store(vec![
+            inv_utxo(0, 100, InventoryStatus::Available),
+            inv_utxo(
+                1,
+                200,
+                InventoryStatus::Reserved {
+                    reservation_id: ReservationId("res-1".to_owned()),
+                    rfq_id: RfqId("rfq-1".to_owned()),
                     quote_id: QuoteId("q".to_owned()),
                     expires_at_ms: now_ms() + 60_000,
                 },
-            },
+            ),
         ]);
 
         let legacy = maker.inventory_summary().await;

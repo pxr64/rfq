@@ -230,7 +230,7 @@ The next implementation should add a CLI-backed adapter while preserving crate b
 
 - `rfq-rgb`: invokes RGB tooling to list allocations, validate invoices, and create transfers.
 - `rfq-wallet`: invokes wallet tooling for PSBT/key operations as needed.
-- `maker-node`: maps real RGB inventory into `Allocation` records and calls the real adapter on quote accept.
+- `maker-node`: pulls real RGB inventory via `list_inventory_utxos` and calls the real adapter on quote accept.
 - `rfq-api`, `rfq-router`, `rfq-core`, and `rfq-types`: remain free of concrete RGB dependencies.
 
 Normal Rust tests must remain independent of Docker and RGB tools. Real regtest tests should be ignored/manual until the stack is stable.

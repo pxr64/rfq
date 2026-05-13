@@ -14,8 +14,8 @@ use rfq_rgb::{LibRgbBackend, MockRgbBackend, RgbBackend};
 use rfq_router::MakerConnector;
 use rfq_store::{InMemoryQuoteStore, QuoteStore};
 use rfq_types::{
-    AcceptQuoteRequest, Allocation, AssetId, AssetKind, BitcoinNetwork, HealthResponse,
-    InventorySnapshot, MakerId, Quote, QuoteId, QuoteRequest, SettlementIntent,
+    AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, HealthResponse, InventorySnapshot,
+    MakerId, Outpoint, Quote, QuoteId, QuoteRequest, RgbInventoryUtxo, SettlementIntent,
 };
 use rfq_wallet::{MockWalletBackend, WalletBackend};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time};
@@ -271,30 +271,30 @@ async fn build_maker(config: &MakerNodeConfig) -> Result<MockMaker, Box<dyn std:
             .unwrap_or_else(|| "rgb-test-asset".to_owned()),
     };
 
-    let (allocations, rgb_backend): (Vec<Allocation>, Arc<dyn RgbBackend>) = match &config.rgb {
+    let (utxos, rgb_backend): (Vec<RgbInventoryUtxo>, Arc<dyn RgbBackend>) = match &config.rgb {
         Some(rgb_cfg) => {
             let backend = LibRgbBackend::new(
                 rgb_cfg.data_dir.clone(),
                 rgb_cfg.wallet_name.clone(),
                 rgb_cfg.network.clone(),
                 rgb_cfg.electrum_url.clone(),
-                maker_id.clone(),
             );
-            let allocations = backend.list_allocations(&asset).await?;
-            (allocations, Arc::new(backend))
+            let utxos = backend.list_inventory_utxos(&asset).await?;
+            (utxos, Arc::new(backend))
         }
         None => {
-            let allocation = Allocation {
-                maker_id: maker_id.clone(),
-                asset,
-                available_amount: 1_000_000,
+            let utxo = RgbInventoryUtxo {
+                outpoint: Outpoint::new(format!("{:064x}", 0u64), 0),
+                asset_id: asset,
+                amount: 1_000_000,
+                btc_sats: 0,
             };
-            let backend = MockRgbBackend::new(vec![allocation.clone()]);
-            (vec![allocation], Arc::new(backend))
+            let backend = MockRgbBackend::new(vec![utxo.clone()]);
+            (vec![utxo], Arc::new(backend))
         }
     };
 
-    Ok(MockMaker::new(maker_id, allocations, rgb_backend))
+    Ok(MockMaker::new(maker_id, utxos, rgb_backend))
 }
 
 #[derive(Clone)]

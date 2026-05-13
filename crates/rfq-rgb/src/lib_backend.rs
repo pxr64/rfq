@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use rfq_types::{Allocation, AssetId, MakerId, Outpoint, RgbInventoryUtxo, RgbTransfer};
+use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, RgbTransfer};
 
 use rgb::contract::FilterIncludeAll;
 use rgb::invoice::RgbInvoice;
@@ -25,7 +25,6 @@ pub struct LibRgbBackend {
     network: String,
     #[allow(dead_code)] // reserved for finalize_and_broadcast (electrum resolver)
     electrum_url: String,
-    maker_id: MakerId,
 }
 
 impl LibRgbBackend {
@@ -34,14 +33,12 @@ impl LibRgbBackend {
         wallet_name: String,
         network: String,
         electrum_url: String,
-        maker_id: MakerId,
     ) -> Self {
         Self {
             data_dir,
             wallet_name,
             network,
             electrum_url,
-            maker_id,
         }
     }
 
@@ -58,18 +55,6 @@ impl LibRgbBackend {
 
 #[async_trait]
 impl RgbBackend for LibRgbBackend {
-    async fn list_allocations(&self, asset: &AssetId) -> Result<Vec<Allocation>, RgbError> {
-        let utxos = self.list_inventory_utxos(asset).await?;
-        Ok(utxos
-            .into_iter()
-            .map(|utxo| Allocation {
-                maker_id: self.maker_id.clone(),
-                asset: utxo.asset_id,
-                available_amount: utxo.amount,
-            })
-            .collect())
-    }
-
     async fn list_inventory_utxos(
         &self,
         asset: &AssetId,

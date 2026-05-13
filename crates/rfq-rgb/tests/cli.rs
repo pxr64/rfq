@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use rfq_rgb::{LibRgbBackend, RgbBackend, RgbError};
-use rfq_types::{AssetId, AssetKind, BitcoinNetwork, MakerId};
+use rfq_types::{AssetId, AssetKind, BitcoinNetwork};
 
 fn env_or_skip(key: &str) -> Option<String> {
     match std::env::var(key) {
@@ -40,11 +40,8 @@ fn lib_backend() -> Option<(LibRgbBackend, AssetId)> {
         std::env::var("ELECTRUM_URL").unwrap_or_else(|_| "localhost:50001".to_owned());
     let wallet_name = std::env::var("RGB_WALLET").unwrap_or_else(|_| "maker".to_owned());
     let network = std::env::var("RGB_NETWORK").unwrap_or_else(|_| "regtest".to_owned());
-    let maker_id = MakerId(
-        std::env::var("MAKER_ID").unwrap_or_else(|_| "test-maker".to_owned()),
-    );
 
-    let backend = LibRgbBackend::new(data_dir, wallet_name, network, electrum_url, maker_id);
+    let backend = LibRgbBackend::new(data_dir, wallet_name, network, electrum_url);
     let asset = AssetId {
         network: BitcoinNetwork::Regtest,
         kind: AssetKind::Rgb20,
@@ -62,7 +59,6 @@ async fn validate_invoice_rejects_garbage() {
         "irrelevant".to_owned(),
         "regtest".to_owned(),
         "localhost:50001".to_owned(),
-        MakerId("test".to_owned()),
     );
 
     assert!(matches!(
@@ -77,31 +73,6 @@ async fn validate_invoice_rejects_garbage() {
         backend.validate_invoice("rgb:malformed").await,
         Err(RgbError::InvalidInvoice)
     ));
-}
-
-#[tokio::test]
-#[ignore = "requires the regtest stack with a NIA contract issued; see file header"]
-async fn list_allocations_returns_seeded_balance() {
-    let Some((backend, asset)) = lib_backend() else {
-        return;
-    };
-
-    let allocations = backend
-        .list_allocations(&asset)
-        .await
-        .expect("list_allocations should succeed against a live stash");
-
-    assert!(
-        !allocations.is_empty(),
-        "expected at least one allocation; is the contract issued and has the maker received any?"
-    );
-
-    let total: u64 = allocations.iter().map(|a| a.available_amount).sum();
-    assert!(total > 0, "expected positive total available_amount; got {total}");
-
-    for allocation in &allocations {
-        assert_eq!(allocation.asset, asset);
-    }
 }
 
 #[tokio::test]
@@ -121,6 +92,9 @@ async fn list_inventory_utxos_returns_per_utxo_outpoints() {
         "expected at least one UTXO; is the contract issued and has the maker received any?"
     );
 
+    let total: u64 = utxos.iter().map(|u| u.amount).sum();
+    assert!(total > 0, "expected positive total amount; got {total}");
+
     let zero_txid = "0".repeat(64);
     for utxo in &utxos {
         assert_eq!(utxo.asset_id, asset);
@@ -135,13 +109,6 @@ async fn list_inventory_utxos_returns_per_utxo_outpoints() {
             "outpoint txid should not be all-zeros; LibRgbBackend should surface real seal data"
         );
     }
-
-    // list_inventory_utxos and list_allocations should agree on total amount
-    // — list_allocations is implemented as a sum/aggregation of UTXOs.
-    let allocations = backend.list_allocations(&asset).await.unwrap();
-    let utxo_total: u64 = utxos.iter().map(|u| u.amount).sum();
-    let alloc_total: u64 = allocations.iter().map(|a| a.available_amount).sum();
-    assert_eq!(utxo_total, alloc_total);
 }
 
 #[tokio::test]
