@@ -124,12 +124,43 @@ pub struct Quote {
     pub amount: u64,
     pub price: u64,
     pub expires_at_ms: u64,
+    /// Maker's quote-time estimate of the network fee in sats. The taker pays
+    /// the fee (see `docs/swap-flows.md`); this lets the taker see expected
+    /// total (buy) or net (sell) up front. Zero until 15c wires real estimation.
+    pub estimated_fee_sats: u64,
+    /// Basis points the actual fee may exceed `estimated_fee_sats` at PSBT-build
+    /// time before settlement aborts with `FeeSlippageExceeded`. Default 2000
+    /// (= 20%).
+    pub fee_slippage_bps: u16,
+    /// Set on sell-side quotes only: the maker's RGB invoice the taker builds
+    /// a consignment to. `None` on buy-side quotes. Populated in 16b/16c.
+    pub maker_rgb_invoice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcceptQuoteRequest {
     pub quote_id: QuoteId,
-    pub rgb_invoice: String,
+    pub leg: SwapLeg,
+}
+
+/// Side-specific payload on `AcceptQuoteRequest`. See `docs/swap-flows.md` for
+/// the full flow on each side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "side", rename_all = "snake_case")]
+pub enum SwapLeg {
+    /// Taker is buying RGB and paying BTC. Taker contributes BTC funding
+    /// inputs at `/sign` time — the maker never touches a taker BTC address.
+    Buy { rgb_invoice: String },
+    /// Taker is selling RGB and receiving BTC. Maker publishes its own RGB
+    /// invoice on the `Quote` (`maker_rgb_invoice`); taker delivers a
+    /// consignment to that invoice via `/consignment`.
+    Sell {
+        btc_payout_addr: String,
+        /// Where leftover RGB change goes back to the taker, if the consigned
+        /// amount exceeds `quote.amount`. Optional — the maker MAY refuse
+        /// non-exact consignments.
+        rgb_change_invoice: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,13 +168,30 @@ pub struct SettlementIntent {
     pub quote_id: QuoteId,
     pub maker_id: MakerId,
     pub status: SettlementStatus,
-    pub transfer: Option<RgbTransfer>,
+    pub transfer: Option<SwapTransfer>,
+    /// Deadline for the current settlement stage. Cleanup loop polls this.
+    pub expires_at_ms: u64,
+    /// Set once the maker has broadcast the witness tx (after `/sign`).
+    pub witness_txid: Option<String>,
+    /// Witness-extended consignment emitted post-broadcast. The RGB receiver
+    /// imports this to advance their Stock.
+    pub final_consignment: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SettlementStatus {
     Pending,
-    Ready,
+    Accepted,
+    /// Sell-side only: maker is waiting for the taker to submit a consignment
+    /// via `/consignment`.
+    AwaitingConsignment,
+    /// Maker has built the PSBT (with its inputs signed) and is waiting for
+    /// the taker to submit a signed PSBT via `/sign`.
+    AwaitingTakerSignature,
+    /// Maker has broadcast the witness tx; awaiting bitcoin confirmation.
+    PendingBitcoinConfirm,
+    /// Tx confirmed; both legs final.
+    Settled,
     Failed,
 }
 
@@ -352,10 +400,22 @@ pub struct InventorySnapshot {
     pub spent_allocations: u64,
 }
 
+/// Half-signed swap PSBT + consignment returned by the maker. The taker
+/// validates the consignment (buy side) or has already built it (sell side),
+/// signs its inputs, and returns the fully-signed PSBT via `/sign`.
+///
+/// Wire format: `partial_psbt` and `consignment` are base64-encoded (see
+/// `psbt_base64` / `consignment_base64` parameter naming in `rfq-wallet`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RgbTransfer {
-    pub psbt: String,
-    pub consignment: String,
+pub struct SwapTransfer {
+    pub partial_psbt: String,
+    /// Maker-built consignment for the RGB leg (buy side). On sell side this
+    /// is `None` because the taker built and submitted the consignment via
+    /// `/consignment`.
+    pub consignment: Option<String>,
+    /// Pre-computed witness txid. Known once all inputs are committed —
+    /// after `/consignment` on sell side, after `/sign` on buy side.
+    pub expected_witness_txid: Option<String>,
 }
 
 #[cfg(test)]

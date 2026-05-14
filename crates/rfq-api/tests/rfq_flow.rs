@@ -5,7 +5,7 @@ use axum::{
 use rfq_api::{AcceptQuoteBody, CreateRfqRequest};
 use rfq_types::{
     AssetId, AssetKind, BitcoinNetwork, HealthResponse, Quote, SettlementIntent, SettlementStatus,
-    Side,
+    Side, SwapLeg,
 };
 use tower::ServiceExt;
 
@@ -71,7 +71,9 @@ async fn rfq_quote_accept_flow_succeeds() {
 
     let quote_id = quotes[0].quote_id.0.clone();
     let accept_body = AcceptQuoteBody {
-        rgb_invoice: "rgb:test_invoice".to_owned(),
+        leg: SwapLeg::Buy {
+            rgb_invoice: "rgb:test_invoice".to_owned(),
+        },
     };
 
     let response = app
@@ -90,6 +92,6 @@ async fn rfq_quote_accept_flow_succeeds() {
 
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let intent: SettlementIntent = serde_json::from_slice(&body).unwrap();
-    assert_eq!(intent.status, SettlementStatus::Ready);
+    assert_eq!(intent.status, SettlementStatus::AwaitingTakerSignature);
     assert!(intent.transfer.is_some());
 }

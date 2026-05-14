@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use async_trait::async_trait;
-use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, RgbTransfer};
+use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, SwapTransfer};
 
 use rgb::contract::FilterIncludeAll;
 use rgb::invoice::RgbInvoice;
@@ -97,7 +97,7 @@ impl RgbBackend for LibRgbBackend {
         &self,
         _invoice: &str,
         _amount: u64,
-    ) -> Result<RgbTransfer, RgbError> {
+    ) -> Result<SwapTransfer, RgbError> {
         // TODO(#13): implement via rgb-api's TransferBuilder + WalletProvider::pay
         // (mirrors Command::Transfer in rgb-cmd 0.11.1-rc.6 command.rs).
         // For now, callers should use the manual rgb-cmd flow described in

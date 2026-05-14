@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::Url;
 use rfq_core::{is_quote_expired, sort_quotes_best_price, validate_quote_request, RfqCoreError};
-use rfq_types::{AcceptQuoteRequest, MakerId, Quote, QuoteRequest, SettlementIntent};
+use rfq_types::{AcceptQuoteRequest, MakerId, Quote, QuoteId, QuoteRequest, SettlementIntent};
 use thiserror::Error;
 use tokio::time::timeout;
 
@@ -29,6 +29,33 @@ pub trait MakerConnector: Send + Sync {
         quote: Quote,
         request: AcceptQuoteRequest,
     ) -> Result<SettlementIntent, RouterError>;
+
+    /// Sell-side only. Taker submits the consignment built against the maker's
+    /// RGB invoice; maker validates, constructs the PSBT, signs its inputs,
+    /// returns `AwaitingTakerSignature` with the partial PSBT. Bodies land in
+    /// 16c; here in 15a the default impl returns "not yet implemented".
+    async fn deliver_consignment(
+        &self,
+        _quote_id: QuoteId,
+        _consignment_base64: String,
+    ) -> Result<SettlementIntent, RouterError> {
+        Err(RouterError::Maker(
+            "deliver_consignment not yet implemented".to_owned(),
+        ))
+    }
+
+    /// Both sides. Taker submits the fully-signed PSBT; maker finalizes,
+    /// broadcasts, transitions to `PendingBitcoinConfirm`. Bodies land in
+    /// 15c/16c; here in 15a the default impl returns "not yet implemented".
+    async fn submit_signed_psbt(
+        &self,
+        _quote_id: QuoteId,
+        _signed_psbt_base64: String,
+    ) -> Result<SettlementIntent, RouterError> {
+        Err(RouterError::Maker(
+            "submit_signed_psbt not yet implemented".to_owned(),
+        ))
+    }
 }
 
 pub struct HttpMakerConnector {
@@ -80,6 +107,50 @@ impl MakerConnector for HttpMakerConnector {
             .http
             .post(self.endpoint(&format!("quotes/{}/accept", quote.quote_id.0))?)
             .json(&request)
+            .send()
+            .await
+            .map_err(|error| RouterError::Maker(error.to_string()))?;
+
+        parse_maker_response(response).await
+    }
+
+    async fn deliver_consignment(
+        &self,
+        quote_id: QuoteId,
+        consignment_base64: String,
+    ) -> Result<SettlementIntent, RouterError> {
+        #[derive(serde::Serialize)]
+        struct Body {
+            consignment: String,
+        }
+        let response = self
+            .http
+            .post(self.endpoint(&format!("quotes/{}/consignment", quote_id.0))?)
+            .json(&Body {
+                consignment: consignment_base64,
+            })
+            .send()
+            .await
+            .map_err(|error| RouterError::Maker(error.to_string()))?;
+
+        parse_maker_response(response).await
+    }
+
+    async fn submit_signed_psbt(
+        &self,
+        quote_id: QuoteId,
+        signed_psbt_base64: String,
+    ) -> Result<SettlementIntent, RouterError> {
+        #[derive(serde::Serialize)]
+        struct Body {
+            signed_psbt: String,
+        }
+        let response = self
+            .http
+            .post(self.endpoint(&format!("quotes/{}/sign", quote_id.0))?)
+            .json(&Body {
+                signed_psbt: signed_psbt_base64,
+            })
             .send()
             .await
             .map_err(|error| RouterError::Maker(error.to_string()))?;

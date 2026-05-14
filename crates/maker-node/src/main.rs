@@ -443,7 +443,7 @@ mod tests {
         http::{Method, Request},
     };
     use clap::CommandFactory;
-    use rfq_types::{RfqId, SettlementStatus, Side};
+    use rfq_types::{RfqId, SettlementStatus, Side, SwapLeg};
     use std::sync::Mutex;
     use tower::ServiceExt;
 
@@ -574,7 +574,9 @@ mod tests {
         let quote = request_quote(app.clone(), "rfq-accept").await;
         let request = AcceptQuoteRequest {
             quote_id: quote.quote_id.clone(),
-            rgb_invoice: "rgb:test_invoice".to_owned(),
+            leg: SwapLeg::Buy {
+                rgb_invoice: "rgb:test_invoice".to_owned(),
+            },
         };
 
         let response = app
@@ -589,7 +591,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let settlement: SettlementIntent = read_json(response).await;
         assert_eq!(settlement.quote_id, quote.quote_id);
-        assert_eq!(settlement.status, SettlementStatus::Ready);
+        assert_eq!(settlement.status, SettlementStatus::AwaitingTakerSignature);
         assert!(settlement.transfer.is_some());
     }
 
@@ -597,7 +599,9 @@ mod tests {
     async fn maker_http_accept_unknown_quote_returns_not_found() {
         let request = AcceptQuoteRequest {
             quote_id: QuoteId("missing".to_owned()),
-            rgb_invoice: "rgb:test_invoice".to_owned(),
+            leg: SwapLeg::Buy {
+                rgb_invoice: "rgb:test_invoice".to_owned(),
+            },
         };
 
         let response = test_app()

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use rfq_types::{AssetId, RgbInventoryUtxo, RgbTransfer};
+use rfq_types::{AssetId, RgbInventoryUtxo, SwapTransfer};
 use thiserror::Error;
 
 mod lib_backend;
@@ -51,7 +51,7 @@ pub trait RgbBackend: Send + Sync {
     /// matching `invoice` for `amount` smallest units. Signing happens outside
     /// this trait (in `rfq-wallet`); the returned PSBT is later handed to
     /// `finalize_and_broadcast`.
-    async fn create_transfer(&self, invoice: &str, amount: u64) -> Result<RgbTransfer, RgbError>;
+    async fn create_transfer(&self, invoice: &str, amount: u64) -> Result<SwapTransfer, RgbError>;
 
     /// Finalize a signed PSBT, extract the witness tx, and broadcast it via the
     /// configured indexer. Returns the witness txid for tracking the
@@ -95,12 +95,13 @@ impl RgbBackend for MockRgbBackend {
         }
     }
 
-    async fn create_transfer(&self, invoice: &str, amount: u64) -> Result<RgbTransfer, RgbError> {
+    async fn create_transfer(&self, invoice: &str, amount: u64) -> Result<SwapTransfer, RgbError> {
         self.validate_invoice(invoice).await?;
 
-        Ok(RgbTransfer {
-            psbt: format!("mock-psbt-for-{amount}"),
-            consignment: "mock-consignment".to_owned(),
+        Ok(SwapTransfer {
+            partial_psbt: format!("mock-psbt-for-{amount}"),
+            consignment: Some("mock-consignment".to_owned()),
+            expected_witness_txid: None,
         })
     }
 

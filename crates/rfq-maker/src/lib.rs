@@ -7,7 +7,7 @@ use rfq_store::{InMemoryInventoryStore, InventoryStore};
 use rfq_types::{
     AcceptQuoteRequest, AssetId, ExtendedInventorySnapshot, InventoryError, InventorySnapshot,
     InventoryStatus, InventoryUtxo, MakerId, Outpoint, Quote, QuoteId, QuoteRequest,
-    RgbInventoryUtxo, SettlementIntent, SettlementStatus,
+    RgbInventoryUtxo, SettlementIntent, SettlementStatus, SwapLeg,
 };
 use uuid::Uuid;
 
@@ -265,6 +265,13 @@ impl MakerConnector for MockMaker {
             amount: selection.requested,
             price: selection.requested.saturating_mul(101),
             expires_at_ms,
+            // Placeholders until 15c wires real feerate estimation; 20% slippage
+            // cap is the v0 default per docs/swap-flows.md.
+            estimated_fee_sats: 0,
+            fee_slippage_bps: 2000,
+            // Set on sell-side quotes only — 16c populates this with a maker
+            // invoice. Buy-side quotes always carry None.
+            maker_rgb_invoice: None,
         }))
     }
 
@@ -273,6 +280,18 @@ impl MakerConnector for MockMaker {
         quote: Quote,
         request: AcceptQuoteRequest,
     ) -> Result<SettlementIntent, RouterError> {
+        // 15a pattern-matches the side. Sell side returns the typed "not yet
+        // supported" error; 16c fills in the body. Buy side runs the existing
+        // 14e behavior with a relabelled return status.
+        let rgb_invoice = match &request.leg {
+            SwapLeg::Buy { rgb_invoice } => rgb_invoice.clone(),
+            SwapLeg::Sell { .. } => {
+                return Err(RouterError::Maker(
+                    "sell side not yet supported".to_owned(),
+                ));
+            }
+        };
+
         let now = now_ms();
         self.store.release_expired_reservations(now).await;
 
@@ -303,7 +322,7 @@ impl MakerConnector for MockMaker {
 
         let transfer = match self
             .rgb_backend
-            .create_transfer(&request.rgb_invoice, quote.amount)
+            .create_transfer(&rgb_invoice, quote.amount)
             .await
         {
             Ok(t) => t,
@@ -348,11 +367,17 @@ impl MakerConnector for MockMaker {
             }
         }
 
+        // 15a relabels the success status from the now-deleted `Ready` to
+        // `AwaitingTakerSignature`. 15c will further refactor the body to
+        // defer `mark_spent` until `/sign`; for 15a the body still spends.
         Ok(SettlementIntent {
             quote_id: quote.quote_id,
             maker_id: self.maker_id.clone(),
-            status: SettlementStatus::Ready,
+            status: SettlementStatus::AwaitingTakerSignature,
             transfer: Some(transfer),
+            expires_at_ms: now + QUOTE_TTL_MS,
+            witness_txid: None,
+            final_consignment: None,
         })
     }
 }
@@ -634,13 +659,15 @@ mod tests {
                 quote.clone(),
                 AcceptQuoteRequest {
                     quote_id: quote.quote_id.clone(),
-                    rgb_invoice: "rgb:test_invoice".to_owned(),
+                    leg: SwapLeg::Buy {
+                        rgb_invoice: "rgb:test_invoice".to_owned(),
+                    },
                 },
             )
             .await
             .unwrap();
 
-        assert_eq!(intent.status, SettlementStatus::Ready);
+        assert_eq!(intent.status, SettlementStatus::AwaitingTakerSignature);
         let utxos = maker.utxo_snapshot().await;
         assert!(matches!(
             &utxos[0].status,
@@ -662,7 +689,9 @@ mod tests {
                 quote.clone(),
                 AcceptQuoteRequest {
                     quote_id: quote.quote_id,
-                    rgb_invoice: "rgb:test_invoice".to_owned(),
+                    leg: SwapLeg::Buy {
+                        rgb_invoice: "rgb:test_invoice".to_owned(),
+                    },
                 },
             )
             .await
@@ -691,7 +720,9 @@ mod tests {
                 quote.clone(),
                 AcceptQuoteRequest {
                     quote_id: quote.quote_id.clone(),
-                    rgb_invoice: "rgb:test_invoice".to_owned(),
+                    leg: SwapLeg::Buy {
+                        rgb_invoice: "rgb:test_invoice".to_owned(),
+                    },
                 },
             )
             .await
@@ -876,12 +907,14 @@ mod tests {
                 quote.clone(),
                 AcceptQuoteRequest {
                     quote_id: quote.quote_id.clone(),
-                    rgb_invoice: "rgb:test".into(),
+                    leg: SwapLeg::Buy {
+                        rgb_invoice: "rgb:test".into(),
+                    },
                 },
             )
             .await
             .unwrap();
-        assert_eq!(intent.status, SettlementStatus::Ready);
+        assert_eq!(intent.status, SettlementStatus::AwaitingTakerSignature);
 
         let utxos = maker.utxo_snapshot().await;
         let spent_count = utxos
@@ -912,7 +945,9 @@ mod tests {
                 quote.clone(),
                 AcceptQuoteRequest {
                     quote_id: quote.quote_id,
-                    rgb_invoice: "not-an-invoice".into(),
+                    leg: SwapLeg::Buy {
+                        rgb_invoice: "not-an-invoice".into(),
+                    },
                 },
             )
             .await;

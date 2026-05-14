@@ -15,7 +15,7 @@ use rfq_store::{InMemoryQuoteStore, QuoteStore};
 pub use rfq_types::CreateRfqRequest;
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, HealthResponse, MakerId, Outpoint,
-    Quote, QuoteId, QuoteRequest, RfqId, RgbInventoryUtxo, SettlementIntent,
+    Quote, QuoteId, QuoteRequest, RfqId, RgbInventoryUtxo, SettlementIntent, SwapLeg,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -28,7 +28,7 @@ pub struct AppState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcceptQuoteBody {
-    pub rgb_invoice: String,
+    pub leg: SwapLeg,
 }
 
 pub fn app() -> Router {
@@ -115,7 +115,7 @@ async fn accept_quote(
             quote,
             AcceptQuoteRequest {
                 quote_id,
-                rgb_invoice: body.rgb_invoice,
+                leg: body.leg,
             },
         )
         .await?;
@@ -123,12 +123,20 @@ async fn accept_quote(
     Ok(Json(intent))
 }
 
+// `ConsignmentRejected`, `PsbtInvalid`, and `FeeSlippageExceeded` are declared
+// here as part of 15a's contract surface but only constructed by 15c (`/sign`)
+// and 16b/16c (`/consignment` + sell-side `/sign`). Dead-code allowed until
+// those land.
+#[allow(dead_code)]
 #[derive(Debug)]
 enum ApiError {
     BadRequest(String),
     NotFound,
     QuoteExpired,
     MakerNotFound,
+    ConsignmentRejected(String),
+    PsbtInvalid(String),
+    FeeSlippageExceeded { estimated: u64, actual: u64 },
 }
 
 impl IntoResponse for ApiError {
@@ -140,6 +148,18 @@ impl IntoResponse for ApiError {
             ApiError::MakerNotFound => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "maker not found".to_owned(),
+            ),
+            ApiError::ConsignmentRejected(message) => (
+                StatusCode::BAD_REQUEST,
+                format!("consignment rejected: {message}"),
+            ),
+            ApiError::PsbtInvalid(message) => (
+                StatusCode::BAD_REQUEST,
+                format!("psbt invalid: {message}"),
+            ),
+            ApiError::FeeSlippageExceeded { estimated, actual } => (
+                StatusCode::BAD_REQUEST,
+                format!("fee slippage exceeded: estimated {estimated} sats, actual {actual} sats"),
             ),
         };
 
