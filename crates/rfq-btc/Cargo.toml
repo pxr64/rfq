@@ -1,0 +1,27 @@
+[package]
+name = "rfq-btc"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[features]
+# Optional electrum-backed BitcoinClient implementation. Off by default so the
+# library compiles without dragging in the rustls TLS stack or any blocking I/O.
+# Enable with `--features electrum` when bootstrapping a maker-node against a
+# real bitcoind+electrum stack (see infra/regtest).
+electrum = ["dep:electrum-client"]
+
+[dependencies]
+async-trait.workspace = true
+rfq-types = { path = "../rfq-types" }
+thiserror.workspace = true
+tokio = { workspace = true }
+
+# Optional. Pinned to the same release line bp-wallet's "electrum" feature uses,
+# so we can swap to a shared dep once 15c starts building real PSBTs. Default
+# features (`proxy`, `use-rustls`) are needed for `Client` to be reachable —
+# disabling them only exposes the trait, not the concrete client.
+electrum-client = { version = "0.21", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

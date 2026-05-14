@@ -73,6 +73,9 @@ mod tests {
             amount: 10,
             price,
             expires_at_ms: 2_000,
+            estimated_fee_sats: 0,
+            fee_slippage_bps: 2000,
+            maker_rgb_invoice: None,
         }
     }
 
