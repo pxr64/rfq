@@ -21,6 +21,7 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [ ] Issue #16: Atomic swap settlement — sell side (RGB → BTC)
 - [ ] Issue #9: Add RFQ settlement state machine
 - [ ] Issue #6: Add OpenAPI spec for public RFQ API
+- [ ] Future work: RGB ↔ RGB atomic swap (asset-for-asset). Two RGB state transitions committed in one Bitcoin tx; design pass deferred until #15/#16 land so we know the final `SwapLeg` / `RgbBackend` surface to extend.
 
 ## Issue #2: Inventory Snapshot
 
