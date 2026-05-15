@@ -91,26 +91,26 @@ mod tests {
 
     fn p2wpkh() -> Vec<u8> {
         let mut v = vec![0x00, 0x14];
-        v.extend(std::iter::repeat(0x42).take(20));
+        v.extend(std::iter::repeat_n(0x42, 20));
         v
     }
 
     fn p2wsh() -> Vec<u8> {
         let mut v = vec![0x00, 0x20];
-        v.extend(std::iter::repeat(0x42).take(32));
+        v.extend(std::iter::repeat_n(0x42, 32));
         v
     }
 
     fn p2tr() -> Vec<u8> {
         let mut v = vec![0x51, 0x20];
-        v.extend(std::iter::repeat(0x42).take(32));
+        v.extend(std::iter::repeat_n(0x42, 32));
         v
     }
 
     fn p2pkh() -> Vec<u8> {
         // 0x76 0xa9 0x14 <20> 0x88 0xac = 25 bytes
         let mut v = vec![0x76, 0xa9, 0x14];
-        v.extend(std::iter::repeat(0x42).take(20));
+        v.extend(std::iter::repeat_n(0x42, 20));
         v.push(0x88);
         v.push(0xac);
         v

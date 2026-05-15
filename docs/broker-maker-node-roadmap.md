@@ -17,8 +17,8 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [x] Validate end-to-end NIA issuance + issuer→maker transfer on regtest
 - [ ] Issue #13: Implement library-backed `rfq-rgb` adapter
 - [x] Issue #14: RGB maker UTXO inventory management (supersedes #11)
-- [ ] Issue #15: Atomic swap settlement — buy side (BTC → RGB)
-- [ ] Issue #16: Atomic swap settlement — sell side (RGB → BTC)
+- [x] Issue #15: Atomic swap settlement — buy side (BTC → RGB)
+- [x] Issue #16: Atomic swap settlement — sell side (RGB → BTC)
 - [ ] Issue #9: Add RFQ settlement state machine
 - [ ] Issue #6: Add OpenAPI spec for public RFQ API
 - [ ] Future work: RGB ↔ RGB atomic swap (asset-for-asset). Two RGB state transitions committed in one Bitcoin tx; design pass deferred until #15/#16 land so we know the final `SwapLeg` / `RgbBackend` surface to extend.
@@ -124,13 +124,17 @@ Replace the unilateral `MakerConnector::accept_quote` transfer with a real atomi
 Two parent issues split by direction. Each parent has three lettered sub-issues following the #14 pattern.
 
 - **#15** Buy side (taker buys RGB with BTC):
-  - **15a** (#17) — Side-aware protocol types (`SwapLeg`, expanded `SettlementIntent` / `SettlementStatus`, new `Quote` fee fields, two new `MakerConnector` methods, three new `ApiError` variants).
-  - **15b** (#18) — `BitcoinClient` trait + electrum-backed impl in a new `rfq-btc` crate (`get_outpoint`, `broadcast`, `estimate_feerate`, `block_height`).
-  - **15c** (#19) — Buy-side flow wiring (mock end-to-end): maker constructs PSBT with RGB inputs only, taker adds BTC at `/sign`, maker finalizes and broadcasts.
+  - [x] **15a** (#17) — Side-aware protocol types (`SwapLeg`, expanded `SettlementIntent` / `SettlementStatus`, new `Quote` fee fields, two new `MakerConnector` methods, three new `ApiError` variants).
+  - [x] **15b** (#18) — `BitcoinClient` trait + electrum-backed impl in a new `rfq-btc` crate (`get_outpoint`, `broadcast`, `estimate_feerate`, `block_height`).
+  - [x] **15c** (#19) — Buy-side flow wiring (mock end-to-end): maker constructs PSBT with RGB inputs only, taker adds BTC at `/sign`, maker finalizes and broadcasts.
 - **#16** Sell side (taker sells RGB for BTC):
-  - **16a** (#20) — `BtcInventoryStore` trait + `InMemoryBtcInventoryStore` (parallel to #14's RGB inventory, simpler shape).
-  - **16b** (#21) — Sell-side protocol additions (`SwapLeg::Sell` body, `Quote.maker_rgb_invoice`, new `POST /quotes/:id/consignment` endpoint, `SettlementStatus::AwaitingConsignment`).
-  - **16c** (#22) — Sell-side flow wiring (mock end-to-end): three round trips after accept (invoice → consignment → PSBT → sign → broadcast).
+  - [x] **16a** (#20) — `BtcInventoryStore` trait + `InMemoryBtcInventoryStore` (parallel to #14's RGB inventory, simpler shape).
+  - [x] **16b** (#21) — Sell-side protocol additions (`SwapLeg::Sell` body, `Quote.maker_rgb_invoice`, new `POST /quotes/:id/consignment` endpoint, `SettlementStatus::AwaitingConsignment`).
+  - [x] **16c** (#22) — Sell-side flow wiring (mock end-to-end): three round trips after accept (invoice → consignment → PSBT → sign → broadcast).
+
+Buy and sell both settle end-to-end against the mock backend stack
+(`MockMaker` + `MockRgbBackend` + `MockBitcoinClient`). The remaining gap is
+the real RGB backend — `LibRgbBackend`'s swap methods are stubbed pending #13.
 
 Protocol invariant:
 
