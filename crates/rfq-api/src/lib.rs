@@ -38,6 +38,13 @@ pub struct SignQuoteBody {
     pub signed_psbt: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsignmentBody {
+    /// Base64 RGB consignment the taker built against the maker's
+    /// `Quote.maker_rgb_invoice` (sell side). See `docs/swap-flows.md`.
+    pub consignment: String,
+}
+
 pub fn app() -> Router {
     let maker_id = MakerId("mock-maker-1".to_owned());
     let rgb_asset = AssetId {
@@ -66,6 +73,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/rfq", post(create_rfq))
         .route("/quotes/:id/accept", post(accept_quote))
+        .route("/quotes/:id/consignment", post(deliver_consignment))
         .route("/quotes/:id/sign", post(sign_quote))
         .with_state(state)
 }
@@ -127,6 +135,38 @@ async fn accept_quote(
                 leg: body.leg,
             },
         )
+        .await?;
+
+    Ok(Json(intent))
+}
+
+async fn deliver_consignment(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ConsignmentBody>,
+) -> Result<Json<SettlementIntent>, ApiError> {
+    let quote_id = QuoteId(id);
+    let quote = state
+        .store
+        .get_quote(&quote_id)
+        .await
+        .ok_or(ApiError::NotFound)?;
+
+    // Sell-side `/consignment` runs before `accept`, so the quote TTL still
+    // governs here — mirror `accept_quote`. 16c moves this onto the settlement
+    // stage TTL once accept(Sell) is wired.
+    if is_quote_expired(&quote, now_ms()) {
+        return Err(ApiError::QuoteExpired);
+    }
+
+    let maker = state
+        .makers
+        .iter()
+        .find(|maker| maker.maker_id() == quote.maker_id)
+        .ok_or(ApiError::MakerNotFound)?;
+
+    let intent = maker
+        .deliver_consignment(quote_id, body.consignment)
         .await?;
 
     Ok(Json(intent))
@@ -224,4 +264,91 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use rfq_store::QuoteStore;
+    use rfq_types::Side;
+    use tower::ServiceExt;
+
+    fn test_maker() -> Arc<dyn MakerConnector> {
+        let rgb_asset = AssetId {
+            network: BitcoinNetwork::Regtest,
+            kind: AssetKind::Rgb20,
+            id: "rgb-test-asset".to_owned(),
+        };
+        let utxo = RgbInventoryUtxo {
+            outpoint: Outpoint::new(format!("{:064x}", 0u64), 0),
+            asset_id: rgb_asset,
+            amount: 1_000_000,
+            btc_sats: 0,
+        };
+        let rgb_backend = Arc::new(MockRgbBackend::new(vec![utxo.clone()]));
+        let bitcoin_client = Arc::new(MockBitcoinClient::new());
+        Arc::new(MockMaker::new(
+            MakerId("mock-maker-1".to_owned()),
+            vec![utxo],
+            rgb_backend,
+            bitcoin_client,
+        ))
+    }
+
+    // `/consignment` runs before `accept`, so an elapsed quote TTL still aborts
+    // the call — the API layer rejects it before reaching the maker.
+    #[tokio::test]
+    async fn consignment_for_expired_quote_returns_400() {
+        let maker = test_maker();
+        let store = InMemoryQuoteStore::new();
+
+        let asset = |kind, id: &str| AssetId {
+            network: BitcoinNetwork::Regtest,
+            kind,
+            id: id.to_owned(),
+        };
+        store
+            .save_quote(Quote {
+                quote_id: QuoteId("expired-quote".to_owned()),
+                rfq_id: RfqId("rfq-x".to_owned()),
+                maker_id: maker.maker_id(),
+                base_asset: asset(AssetKind::Rgb20, "rgb-test-asset"),
+                quote_asset: asset(AssetKind::Btc, "btc"),
+                side: Side::Sell,
+                amount: 100,
+                price: 10_100,
+                // TTL lapsed an hour ago.
+                expires_at_ms: now_ms() - 3_600_000,
+                estimated_fee_sats: 0,
+                fee_slippage_bps: 2000,
+                maker_rgb_invoice: Some("rgb:mock-maker-invoice-expired-quote".to_owned()),
+            })
+            .await;
+
+        let app = app_with_state(AppState {
+            makers: vec![maker],
+            store,
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/quotes/expired-quote/consignment")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&ConsignmentBody {
+                            consignment: "mock-consignment:sell:amount=100".to_owned(),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }

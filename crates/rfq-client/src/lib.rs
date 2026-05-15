@@ -1,6 +1,9 @@
 use reqwest::StatusCode;
 pub use reqwest::Url;
-use rfq_types::{AcceptQuoteRequest, CreateRfqRequest, HealthResponse, Quote, SettlementIntent};
+use rfq_types::{
+    AcceptQuoteRequest, CreateRfqRequest, HealthResponse, Quote, QuoteId, SettlementIntent,
+};
+use serde::Serialize;
 use thiserror::Error;
 
 pub struct RfqClient {
@@ -43,11 +46,37 @@ impl RfqClient {
         parse_response(response).await
     }
 
+    /// Sell-side: submit the consignment the taker built against the maker's
+    /// `Quote.maker_rgb_invoice`. The maker validates it, builds the swap PSBT,
+    /// and returns a `SettlementIntent` in `AwaitingTakerSignature`.
+    pub async fn submit_consignment(
+        &self,
+        quote_id: QuoteId,
+        consignment_base64: String,
+    ) -> Result<SettlementIntent, RfqClientError> {
+        let url = self.endpoint(&format!("quotes/{}/consignment", quote_id.0))?;
+        let response = self
+            .http
+            .post(url)
+            .json(&ConsignmentRequest {
+                consignment: consignment_base64,
+            })
+            .send()
+            .await?;
+
+        parse_response(response).await
+    }
+
     fn endpoint(&self, path: &str) -> Result<Url, RfqClientError> {
         self.base_url
             .join(path)
             .map_err(|error| RfqClientError::InvalidUrl(error.to_string()))
     }
+}
+
+#[derive(Serialize)]
+struct ConsignmentRequest {
+    consignment: String,
 }
 
 async fn parse_response<T: serde::de::DeserializeOwned>(

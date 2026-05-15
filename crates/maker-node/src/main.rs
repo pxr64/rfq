@@ -314,6 +314,7 @@ fn maker_app(maker: MockMaker) -> Router {
         .route("/inventory", get(maker_inventory))
         .route("/quotes", post(maker_quote))
         .route("/quotes/:quote_id/accept", post(maker_accept_quote))
+        .route("/quotes/:quote_id/consignment", post(maker_consignment))
         .route("/quotes/:quote_id/sign", post(maker_sign_quote))
         .with_state(MakerNodeState {
             maker,
@@ -380,6 +381,32 @@ async fn maker_sign_quote(
 
     Ok(Json(
         state.maker.submit_signed_psbt(quote_id, body.signed_psbt).await?,
+    ))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ConsignmentBody {
+    consignment: String,
+}
+
+async fn maker_consignment(
+    State(state): State<MakerNodeState>,
+    Path(quote_id): Path<String>,
+    Json(body): Json<ConsignmentBody>,
+) -> Result<Json<SettlementIntent>, MakerNodeHttpError> {
+    let quote_id = QuoteId(quote_id);
+    // 404 for an unknown quote, mirroring maker_sign_quote.
+    state
+        .store
+        .get_quote(&quote_id)
+        .await
+        .ok_or(MakerNodeHttpError::NotFound)?;
+
+    Ok(Json(
+        state
+            .maker
+            .deliver_consignment(quote_id, body.consignment)
+            .await?,
     ))
 }
 

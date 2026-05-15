@@ -11,7 +11,8 @@ use rfq_store::{InMemoryInventoryStore, InventoryStore};
 use rfq_types::{
     AcceptQuoteRequest, AssetId, ExtendedInventorySnapshot, InventoryError, InventorySnapshot,
     InventoryStatus, InventoryUtxo, MakerId, Outpoint, Quote, QuoteId, QuoteRequest,
-    RgbInventoryUtxo, ReservationId, SettlementIntent, SettlementStatus, SwapLeg,
+    RgbInventoryUtxo, ReservationId, SettlementIntent, SettlementStatus, Side, SwapLeg,
+    SwapTransfer,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -92,6 +93,11 @@ const ESTIMATED_SWAP_VBYTES: u64 = 200;
 /// — the loop exits via the selector's Insufficient branch once exclusions
 /// have whittled the candidate set to empty.
 const RESERVE_RETRY_ATTEMPTS: u32 = 16;
+/// A mock-valid sell-side consignment string starts with this prefix. It's the
+/// shape check `MockMaker::deliver_consignment` applies in place of real RGB
+/// consignment validation against the maker's Stock (which lands in 16c), and
+/// mirrors the format `MockRgbBackend` emits for buy-side consignments.
+const MOCK_CONSIGNMENT_PREFIX: &str = "mock-consignment";
 
 /// Maker-side state for a buy-side swap held between `accept_quote` and
 /// `submit_signed_psbt`. The settlement state machine (#9) will formalize
@@ -322,6 +328,16 @@ impl MakerConnector for MockMaker {
         let feerate = self.bitcoin_client.estimate_feerate(3).await.unwrap_or(0);
         let estimated_fee_sats = feerate.saturating_mul(ESTIMATED_SWAP_VBYTES);
 
+        // Sell-side quotes carry the maker's own RGB invoice: the taker builds
+        // a consignment against it and delivers it via `/consignment`. Buy-side
+        // quotes never set this. The placeholder string stands in until 16c
+        // wires real invoice creation through `MockRgbBackend::create_invoice`.
+        let maker_rgb_invoice = if matches!(request.side, Side::Sell) {
+            Some(format!("rgb:mock-maker-invoice-{}", quote_id.0))
+        } else {
+            None
+        };
+
         Ok(Some(Quote {
             quote_id,
             rfq_id: request.rfq_id,
@@ -335,9 +351,7 @@ impl MakerConnector for MockMaker {
             estimated_fee_sats,
             // 20% slippage cap — the v0 default per docs/swap-flows.md.
             fee_slippage_bps: 2000,
-            // Set on sell-side quotes only — 16c populates this with a maker
-            // invoice. Buy-side quotes always carry None.
-            maker_rgb_invoice: None,
+            maker_rgb_invoice,
         }))
     }
 
@@ -567,6 +581,48 @@ impl MakerConnector for MockMaker {
             final_consignment: Some(finalized.final_consignment_base64),
         })
     }
+
+    async fn deliver_consignment(
+        &self,
+        quote_id: QuoteId,
+        consignment_base64: String,
+    ) -> Result<SettlementIntent, RouterError> {
+        // 16b lands the sell-side contract surface: shape-check the taker's
+        // consignment and return the `AwaitingTakerSignature` intent with a
+        // mock PSBT. Real consignment validation against the maker's Stock,
+        // BTC-inventory selection, and actual PSBT construction land in 16c.
+        if !consignment_base64.starts_with(MOCK_CONSIGNMENT_PREFIX) {
+            return Err(RouterError::ConsignmentRejected(format!(
+                "expected a consignment starting with `{MOCK_CONSIGNMENT_PREFIX}`"
+            )));
+        }
+
+        let partial_psbt = format!(
+            "mock-psbt:sell:quote={}:consignment_bytes={}",
+            quote_id.0,
+            consignment_base64.len()
+        );
+        // Sell side: with the taker's consignment in hand the maker commits
+        // every input itself, so the witness txid is known up front — unlike
+        // buy side, where the taker still has to add BTC inputs at `/sign`.
+        let expected_witness_txid = format!("mock-wt-sell-{}", quote_id.0);
+
+        Ok(SettlementIntent {
+            quote_id,
+            maker_id: self.maker_id.clone(),
+            status: SettlementStatus::AwaitingTakerSignature,
+            transfer: Some(SwapTransfer {
+                partial_psbt,
+                // Sell side: the taker built the consignment, so the maker
+                // doesn't echo one back.
+                consignment: None,
+                expected_witness_txid: Some(expected_witness_txid),
+            }),
+            expires_at_ms: now_ms() + TAKER_SIGNATURE_TTL_MS,
+            witness_txid: None,
+            final_consignment: None,
+        })
+    }
 }
 
 fn now_ms() -> u64 {
@@ -683,6 +739,68 @@ mod tests {
             amount: 100,
             created_at_ms: now_ms(),
         }
+    }
+
+    fn sell_quote_request(id: &str) -> QuoteRequest {
+        QuoteRequest {
+            side: Side::Sell,
+            ..quote_request(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn sell_quote_carries_maker_rgb_invoice() {
+        let quote = maker()
+            .request_quote(sell_quote_request("rfq-sell"))
+            .await
+            .unwrap()
+            .expect("quote should be returned");
+
+        // Sell side: the taker needs an invoice to build a consignment against.
+        assert!(quote.maker_rgb_invoice.is_some());
+    }
+
+    #[tokio::test]
+    async fn buy_quote_has_no_maker_rgb_invoice() {
+        let quote = maker()
+            .request_quote(quote_request("rfq-buy"))
+            .await
+            .unwrap()
+            .expect("quote should be returned");
+
+        assert!(quote.maker_rgb_invoice.is_none());
+    }
+
+    #[tokio::test]
+    async fn deliver_consignment_returns_awaiting_signature() {
+        let intent = maker()
+            .deliver_consignment(
+                QuoteId("q-sell-1".to_owned()),
+                "mock-consignment:sell:amount=100".to_owned(),
+            )
+            .await
+            .expect("a mock-valid consignment is accepted");
+
+        assert_eq!(intent.status, SettlementStatus::AwaitingTakerSignature);
+        let transfer = intent.transfer.expect("transfer");
+        assert!(!transfer.partial_psbt.is_empty());
+        // Sell side commits every input, so the witness txid is known up front.
+        assert!(transfer.expected_witness_txid.is_some());
+        // The taker built the consignment; the maker doesn't echo one back.
+        assert!(transfer.consignment.is_none());
+    }
+
+    #[tokio::test]
+    async fn deliver_consignment_rejects_malformed_consignment() {
+        let err = maker()
+            .deliver_consignment(
+                QuoteId("q-sell-2".to_owned()),
+                "not-a-real-consignment".to_owned(),
+            )
+            .await
+            .expect_err("a malformed consignment is rejected");
+
+        assert!(matches!(err, RouterError::ConsignmentRejected(_)));
     }
 
     #[tokio::test]
