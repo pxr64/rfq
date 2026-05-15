@@ -67,6 +67,27 @@ impl RfqClient {
         parse_response(response).await
     }
 
+    /// Both sides: submit the fully-signed PSBT. The maker finalizes the
+    /// witness tx, broadcasts it, and returns a `SettlementIntent` in
+    /// `PendingBitcoinConfirm`.
+    pub async fn submit_signed_psbt(
+        &self,
+        quote_id: QuoteId,
+        signed_psbt_base64: String,
+    ) -> Result<SettlementIntent, RfqClientError> {
+        let url = self.endpoint(&format!("quotes/{}/sign", quote_id.0))?;
+        let response = self
+            .http
+            .post(url)
+            .json(&SignedPsbtRequest {
+                signed_psbt: signed_psbt_base64,
+            })
+            .send()
+            .await?;
+
+        parse_response(response).await
+    }
+
     fn endpoint(&self, path: &str) -> Result<Url, RfqClientError> {
         self.base_url
             .join(path)
@@ -77,6 +98,11 @@ impl RfqClient {
 #[derive(Serialize)]
 struct ConsignmentRequest {
     consignment: String,
+}
+
+#[derive(Serialize)]
+struct SignedPsbtRequest {
+    signed_psbt: String,
 }
 
 async fn parse_response<T: serde::de::DeserializeOwned>(

@@ -62,6 +62,19 @@ pub trait BtcInventoryStore: Send + Sync {
         now_ms: u64,
     ) -> Result<ReservationId, BtcInventoryError>;
 
+    /// Push out the deadline of an active reservation. Used as the sell-side
+    /// settlement advances through its stages: the quote-stage reservation is
+    /// extended at `accept` (to the consignment window) and again at
+    /// `/consignment` (to the taker-signature window), so the cleanup loop
+    /// doesn't release BTC out from under an in-flight swap. Returns the count
+    /// of UTXOs whose deadline moved. Mirrors `InventoryStore::extend_reservation`.
+    async fn extend_reservation(
+        &self,
+        reservation_id: &ReservationId,
+        new_expires_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<usize, BtcInventoryError>;
+
     /// Release a specific reservation back to `Available`. Returns the count of
     /// UTXOs released.
     async fn release_reservation(
@@ -247,6 +260,42 @@ impl BtcInventoryStore for InMemoryBtcInventoryStore {
             utxo.updated_at_ms = now_ms;
         }
         Ok(reservation_id)
+    }
+
+    async fn extend_reservation(
+        &self,
+        reservation_id: &ReservationId,
+        new_expires_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<usize, BtcInventoryError> {
+        let mut utxos = self.utxos.write().await;
+        let mut updated = 0;
+        for utxo in utxos.values_mut() {
+            if let BtcInventoryStatus::Reserved {
+                reservation_id: rid,
+                rfq_id,
+                quote_id,
+                ..
+            } = &utxo.status
+            {
+                if rid == reservation_id {
+                    utxo.status = BtcInventoryStatus::Reserved {
+                        reservation_id: rid.clone(),
+                        rfq_id: rfq_id.clone(),
+                        quote_id: quote_id.clone(),
+                        expires_at_ms: new_expires_at_ms,
+                    };
+                    utxo.updated_at_ms = now_ms;
+                    updated += 1;
+                }
+            }
+        }
+        if updated == 0 {
+            return Err(BtcInventoryError::ReservationNotFound(
+                reservation_id.clone(),
+            ));
+        }
+        Ok(updated)
     }
 
     async fn release_reservation(
@@ -719,6 +768,34 @@ mod tests {
         assert!(matches!(
             store.ingest_change_utxo(dup).await,
             Err(BtcInventoryError::UtxoNotAvailable { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn extend_reservation_pushes_out_deadline() {
+        let store = InMemoryBtcInventoryStore::with_seed(vec![available(0, 100_000)]);
+        let res = store
+            .reserve(&rfq(), &quote("q1"), &[op(0)], 500, 0)
+            .await
+            .unwrap();
+
+        // Extend past the original 500ms deadline.
+        let moved = store.extend_reservation(&res, 10_000, 100).await.unwrap();
+        assert_eq!(moved, 1);
+
+        // The reservation now survives a sweep that would have freed it.
+        assert_eq!(store.release_expired_reservations(1_000).await, 0);
+        assert_eq!(store.snapshot().await.reserved_utxos, 1);
+    }
+
+    #[tokio::test]
+    async fn extend_reservation_unknown_id_errors() {
+        let store = InMemoryBtcInventoryStore::with_seed(vec![available(0, 100_000)]);
+        assert!(matches!(
+            store
+                .extend_reservation(&ReservationId("nope".to_owned()), 10_000, 0)
+                .await,
+            Err(BtcInventoryError::ReservationNotFound(_))
         ));
     }
 

@@ -1,9 +1,28 @@
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
 use async_trait::async_trait;
 use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, SwapTransfer};
 use thiserror::Error;
 
 mod lib_backend;
 pub use lib_backend::LibRgbBackend;
+
+/// Re-export of the bitcoin prevout type — a sell-side swap PSBT pins each RGB
+/// input's `scriptPubKey` + `value_sats`, which the consignment doesn't carry.
+pub use rfq_btc::TxOut;
+
+/// What the maker learns from a validated taker consignment on the sell side:
+/// the RGB amount transferred and the bitcoin outpoints carrying it (which
+/// become PSBT inputs). Real RGB validation (#13) will carry the contract id
+/// and per-allocation amounts; the mock keeps only what the swap flow consumes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsignmentInfo {
+    pub total_amount: u64,
+    pub outpoints: Vec<Outpoint>,
+}
 
 /// Output of `finalize_after_taker_sign`: the finalized witness transaction
 /// ready to hand to `BitcoinClient::broadcast`, plus the witness txid and the
@@ -66,18 +85,65 @@ pub trait RgbBackend: Send + Sync {
         signed_psbt_base64: &str,
         original_consignment_base64: &str,
     ) -> Result<FinalizedSwap, RgbError>;
+
+    /// Maker-side, sell flow: mint an RGB invoice binding the contract and the
+    /// expected `amount` to a maker-controlled seal. Published on the sell-side
+    /// `Quote` as `maker_rgb_invoice`; the taker builds a consignment to it.
+    async fn create_invoice(&self, asset: &AssetId, amount: u64) -> Result<String, RgbError>;
+
+    /// Maker-side, sell flow: validate a taker-submitted consignment against
+    /// the maker's expected invoice and return the RGB amount + the bitcoin
+    /// outpoints carrying it. `Err(TransferBuild)` when the consignment is
+    /// malformed or doesn't match `expected_invoice`.
+    async fn validate_incoming_consignment(
+        &self,
+        consignment_base64: &str,
+        expected_invoice: &str,
+    ) -> Result<ConsignmentInfo, RgbError>;
+
+    /// Sell-side swap PSBT construction. Inputs: the taker's RGB-bearing
+    /// outpoints (with prevout data) plus the maker's BTC funding inputs.
+    /// Outputs: the maker's RGB seal, the taker's BTC payout
+    /// (`gross_btc_sats - actual_fee_sats`), maker BTC change, and taker RGB
+    /// change to `rgb_change_invoice` if any. The maker signs its own inputs.
+    ///
+    /// All inputs are committed here, so `expected_witness_txid` is `Some(_)` —
+    /// unlike the buy side, where the taker's inputs are still outstanding.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_swap_psbt_sell(
+        &self,
+        consignment_info: &ConsignmentInfo,
+        taker_rgb_prevouts: &[(Outpoint, TxOut)],
+        maker_btc_inputs: &[(Outpoint, TxOut)],
+        maker_rgb_invoice: &str,
+        btc_payout_addr: &str,
+        rgb_change_invoice: Option<&str>,
+        gross_btc_sats: u64,
+        actual_fee_sats: u64,
+    ) -> Result<SwapTransfer, RgbError>;
 }
 
 #[derive(Debug, Clone)]
 pub struct MockRgbBackend {
     utxos: Vec<RgbInventoryUtxo>,
+    /// Monotonic counter so successive `create_invoice` calls mint distinct
+    /// invoice strings. Shared across clones — a cloned backend keeps minting
+    /// from the same sequence.
+    invoice_nonce: Arc<AtomicU64>,
 }
 
 impl MockRgbBackend {
     pub fn new(utxos: Vec<RgbInventoryUtxo>) -> Self {
-        Self { utxos }
+        Self {
+            utxos,
+            invoice_nonce: Arc::new(AtomicU64::new(0)),
+        }
     }
 }
+
+/// Prefix of a mock sell-side consignment. The taker builds the rest; see
+/// `MockRgbBackend::validate_incoming_consignment` for the field layout.
+pub const MOCK_SELL_CONSIGNMENT_PREFIX: &str = "mock-consignment|sell|";
 
 #[async_trait]
 impl RgbBackend for MockRgbBackend {
@@ -136,10 +202,120 @@ impl RgbBackend for MockRgbBackend {
         }
         Ok(FinalizedSwap {
             raw_tx: signed_psbt_base64.as_bytes().to_vec(),
-            witness_txid: mock_witness_txid(signed_psbt_base64),
+            witness_txid: extract_witness_txid(signed_psbt_base64),
             final_consignment_base64: format!("final:{original_consignment_base64}"),
         })
     }
+
+    async fn create_invoice(&self, asset: &AssetId, amount: u64) -> Result<String, RgbError> {
+        let nonce = self.invoice_nonce.fetch_add(1, Ordering::Relaxed);
+        Ok(format!("rgb:mock-invoice:{}:{amount}:{nonce}", asset.id))
+    }
+
+    async fn validate_incoming_consignment(
+        &self,
+        consignment_base64: &str,
+        expected_invoice: &str,
+    ) -> Result<ConsignmentInfo, RgbError> {
+        // Real Stock validation lands in #13. The mock parses a deterministic
+        // pipe-delimited blob the taker builds:
+        //   mock-consignment|sell|invoice=<inv>|amount=<n>|outpoints=<csv>
+        // and rejects the sentinel `rgb-invalid` so tests can drive the
+        // consignment-rejected path.
+        if consignment_base64.contains("rgb-invalid") {
+            return Err(RgbError::TransferBuild(
+                "consignment failed stock validation".to_owned(),
+            ));
+        }
+        let body = consignment_base64
+            .strip_prefix(MOCK_SELL_CONSIGNMENT_PREFIX)
+            .ok_or_else(|| {
+                RgbError::TransferBuild("not a sell-side consignment".to_owned())
+            })?;
+
+        let mut invoice = None;
+        let mut amount = None;
+        let mut outpoints: Vec<Outpoint> = Vec::new();
+        for field in body.split('|') {
+            if let Some(v) = field.strip_prefix("invoice=") {
+                invoice = Some(v.to_owned());
+            } else if let Some(v) = field.strip_prefix("amount=") {
+                amount = Some(
+                    v.parse::<u64>()
+                        .map_err(|_| RgbError::TransferBuild("bad amount field".to_owned()))?,
+                );
+            } else if let Some(v) = field.strip_prefix("outpoints=") {
+                for op in v.split(',').filter(|s| !s.is_empty()) {
+                    outpoints.push(op.parse::<Outpoint>().map_err(|_| {
+                        RgbError::TransferBuild(format!("bad outpoint `{op}`"))
+                    })?);
+                }
+            }
+        }
+
+        let invoice =
+            invoice.ok_or_else(|| RgbError::TransferBuild("missing invoice field".to_owned()))?;
+        if invoice != expected_invoice {
+            return Err(RgbError::TransferBuild(
+                "consignment invoice does not match the maker's quote".to_owned(),
+            ));
+        }
+        let total_amount =
+            amount.ok_or_else(|| RgbError::TransferBuild("missing amount field".to_owned()))?;
+        if outpoints.is_empty() {
+            return Err(RgbError::TransferBuild(
+                "consignment names no outpoints".to_owned(),
+            ));
+        }
+
+        Ok(ConsignmentInfo {
+            total_amount,
+            outpoints,
+        })
+    }
+
+    async fn create_swap_psbt_sell(
+        &self,
+        consignment_info: &ConsignmentInfo,
+        taker_rgb_prevouts: &[(Outpoint, TxOut)],
+        maker_btc_inputs: &[(Outpoint, TxOut)],
+        maker_rgb_invoice: &str,
+        btc_payout_addr: &str,
+        rgb_change_invoice: Option<&str>,
+        gross_btc_sats: u64,
+        actual_fee_sats: u64,
+    ) -> Result<SwapTransfer, RgbError> {
+        let rgb_in = join_outpoints(taker_rgb_prevouts.iter().map(|(o, _)| o));
+        let btc_in = join_outpoints(maker_btc_inputs.iter().map(|(o, _)| o));
+        let payout = gross_btc_sats.saturating_sub(actual_fee_sats);
+        // Deterministic mock PSBT. `rgb_in=[...]` lists every consigned
+        // outpoint verbatim so the maker's bait-and-switch check at /sign can
+        // confirm the signed PSBT still spends them. `maker-signed` stands in
+        // for the maker's signatures over its own BTC inputs.
+        let body = format!(
+            "mock-psbt:sell:maker_rgb_invoice={maker_rgb_invoice}:payout_addr={btc_payout_addr}\
+             :gross={gross_btc_sats}:fee={actual_fee_sats}:payout={payout}\
+             :rgb_amount={}:rgb_in=[{rgb_in}]:btc_in=[{btc_in}]:rgb_change={}:maker-signed",
+            consignment_info.total_amount,
+            rgb_change_invoice.unwrap_or("none"),
+        );
+        // All inputs are committed, so the witness txid is stable from here.
+        let partial_psbt = format!("{body}:wt={}", mock_witness_txid(&body));
+        Ok(SwapTransfer {
+            expected_witness_txid: Some(extract_witness_txid(&partial_psbt)),
+            partial_psbt,
+            // Sell side: the taker supplied the consignment; the maker has
+            // none of its own to hand back.
+            consignment: None,
+        })
+    }
+}
+
+fn join_outpoints<'a>(outpoints: impl Iterator<Item = &'a Outpoint>) -> String {
+    outpoints
+        .map(|o| o.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Deterministic 64-hex mock txid derived from the signed PSBT string. Lets
@@ -150,6 +326,21 @@ fn mock_witness_txid(signed_psbt: &str) -> String {
     signed_psbt.hash(&mut hasher);
     let h = hasher.finish();
     format!("{h:064x}")
+}
+
+/// Read back the witness txid a sell-side PSBT embeds (`:wt=<64-hex>`). With
+/// every input committed at build time the txid is stable, so the maker can
+/// publish it as `expected_witness_txid` and re-check it at `/sign`. Buy-side
+/// PSBTs carry no `wt=` token — the taker's BTC inputs land only at `/sign` —
+/// so there it falls back to hashing the signed bytes.
+fn extract_witness_txid(psbt: &str) -> String {
+    if let Some(idx) = psbt.find("wt=") {
+        let wt: String = psbt[idx + 3..].chars().take(64).collect();
+        if wt.len() == 64 && wt.chars().all(|c| c.is_ascii_hexdigit()) {
+            return wt;
+        }
+    }
+    mock_witness_txid(psbt)
 }
 
 #[cfg(test)]

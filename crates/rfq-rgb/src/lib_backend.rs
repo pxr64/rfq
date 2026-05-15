@@ -10,7 +10,7 @@ use rgb::persistence::Stock;
 use rgb::persistence::fs::FsBinStore;
 use rgb::ContractId;
 
-use crate::{FinalizedSwap, RgbBackend, RgbError};
+use crate::{ConsignmentInfo, FinalizedSwap, RgbBackend, RgbError, TxOut};
 
 /// Library-backed `RgbBackend` implementation. Talks directly to `rgb-api` /
 /// `rgb-ops` (the same libraries `rgb-cmd` is built on) — no subprocess.
@@ -119,6 +119,50 @@ impl RgbBackend for LibRgbBackend {
         // emit the witness-extended consignment.
         Err(RgbError::FinalizeFailed(
             "LibRgbBackend::finalize_after_taker_sign is not implemented yet (issue #13)"
+                .to_owned(),
+        ))
+    }
+
+    async fn create_invoice(&self, _asset: &AssetId, _amount: u64) -> Result<String, RgbError> {
+        // TODO(#13): mint via rgb-api's invoice builder against the maker's
+        // contract + a fresh seal UTXO.
+        Err(RgbError::TransferBuild(
+            "LibRgbBackend::create_invoice is not implemented yet (issue #13); \
+             use MockRgbBackend for now"
+                .to_owned(),
+        ))
+    }
+
+    async fn validate_incoming_consignment(
+        &self,
+        _consignment_base64: &str,
+        _expected_invoice: &str,
+    ) -> Result<ConsignmentInfo, RgbError> {
+        // TODO(#13): accept the consignment into a scratch Stock and validate
+        // the state transition against the maker's contract.
+        Err(RgbError::TransferBuild(
+            "LibRgbBackend::validate_incoming_consignment is not implemented yet (issue #13)"
+                .to_owned(),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_swap_psbt_sell(
+        &self,
+        _consignment_info: &ConsignmentInfo,
+        _taker_rgb_prevouts: &[(Outpoint, TxOut)],
+        _maker_btc_inputs: &[(Outpoint, TxOut)],
+        _maker_rgb_invoice: &str,
+        _btc_payout_addr: &str,
+        _rgb_change_invoice: Option<&str>,
+        _gross_btc_sats: u64,
+        _actual_fee_sats: u64,
+    ) -> Result<SwapTransfer, RgbError> {
+        // TODO(#13): build the sell-side swap PSBT via bp-std + rgb-api and
+        // sign the maker's BTC inputs.
+        Err(RgbError::TransferBuild(
+            "LibRgbBackend::create_swap_psbt_sell is not implemented yet (issue #13); \
+             use MockRgbBackend for now"
                 .to_owned(),
         ))
     }

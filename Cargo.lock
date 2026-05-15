@@ -1845,6 +1845,7 @@ dependencies = [
  "async-trait",
  "bp-std",
  "bp-wallet",
+ "rfq-btc",
  "rfq-types",
  "rgb-api",
  "thiserror 1.0.69",

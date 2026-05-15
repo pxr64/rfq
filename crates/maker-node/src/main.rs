@@ -15,8 +15,9 @@ use rfq_rgb::{LibRgbBackend, MockRgbBackend, RgbBackend};
 use rfq_router::MakerConnector;
 use rfq_store::{InMemoryQuoteStore, QuoteStore};
 use rfq_types::{
-    AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, HealthResponse, InventorySnapshot,
-    MakerId, Outpoint, Quote, QuoteId, QuoteRequest, RgbInventoryUtxo, SettlementIntent,
+    AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, BtcInventoryStatus, BtcInventoryUtxo,
+    HealthResponse, InventorySnapshot, MakerId, Outpoint, Quote, QuoteId, QuoteRequest,
+    RgbInventoryUtxo, SettlementIntent,
 };
 use rfq_wallet::{MockWalletBackend, WalletBackend};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time};
@@ -299,7 +300,31 @@ async fn build_maker(config: &MakerNodeConfig) -> Result<MockMaker, Box<dyn std:
     // estimation. maker-node runs against a mock until the electrum-backed
     // client is wired through config (#15b follow-up).
     let bitcoin_client = Arc::new(MockBitcoinClient::new());
-    Ok(MockMaker::new(maker_id, utxos, rgb_backend, bitcoin_client))
+    // 16c: seed mock BTC inventory so the node can also serve the sell side.
+    // A real maker resolves these from a wallet bootstrap; the demo round
+    // trip in docs/swap-flows.md uses these deterministic outpoints.
+    Ok(MockMaker::new(maker_id, utxos, rgb_backend, bitcoin_client)
+        .with_btc_inventory(mock_btc_inventory()))
+}
+
+/// Deterministic segwit BTC UTXOs the mock maker pays sell-side takers from.
+fn mock_btc_inventory() -> Vec<BtcInventoryUtxo> {
+    let p2wpkh = || {
+        let mut s = vec![0x00, 0x14];
+        s.extend(std::iter::repeat_n(0x11, 20));
+        s
+    };
+    (0..3u64)
+        .map(|i| BtcInventoryUtxo {
+            outpoint: Outpoint::new(format!("{:064x}", 0xb7c0 + i), 0),
+            value_sats: 1_000_000,
+            script_pubkey: p2wpkh(),
+            status: BtcInventoryStatus::Available,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            pending_txid: None,
+        })
+        .collect()
 }
 
 #[derive(Clone)]

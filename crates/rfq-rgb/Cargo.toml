@@ -6,6 +6,7 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+rfq-btc = { path = "../rfq-btc" }
 rfq-types = { path = "../rfq-types" }
 thiserror.workspace = true
 
