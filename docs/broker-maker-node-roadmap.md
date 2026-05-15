@@ -15,7 +15,7 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [x] Define broker-to-maker node protocol
 - [x] Define regtest RGB20 integration plan
 - [x] Validate end-to-end NIA issuance + issuer→maker transfer on regtest
-- [ ] Issue #13: Implement library-backed `rfq-rgb` adapter
+- [ ] Issue #13: Library-backed `rfq-rgb` adapter — foundation landed; real `LibRgbBackend` swap methods **parked**, issue needs a re-scope (see below)
 - [x] Issue #14: RGB maker UTXO inventory management (supersedes #11)
 - [x] Issue #15: Atomic swap settlement — buy side (BTC → RGB)
 - [x] Issue #16: Atomic swap settlement — sell side (RGB → BTC)
@@ -76,13 +76,46 @@ Define how the mock-only scaffolding becomes a real regtest MVP without leaking 
 
 ## Library-Backed `rfq-rgb` Adapter (Issue #13)
 
-Wrap the proven manual regtest RGB flow behind adapter traits, using `rgb-std` + `bp-wallet` crates directly (the same libraries `rgb-cmd` builds on). Subprocess shell-outs were considered and rejected: brittle text parsing, no type safety, no win on isolation since the RGB dep graph still lives inside `rfq-rgb` either way.
+**Status: foundation landed; real swap methods PARKED — issue needs a re-scope.**
 
-- Add `LibRgbBackend` in `rfq-rgb` using `Stock`, `RgbWallet`, `RgbInvoice`, `ContractBuilder` directly.
-- Expand the `RgbBackend` trait with `finalize_and_broadcast` so signing stays outside rfq-rgb (lives in rfq-wallet eventually).
-- Add maker-node config for RGB data dir, contract id, Electrum URL, wallet name, network.
-- Keep `rgb-*` / `bp-*` deps strictly inside `crates/rfq-rgb`; downstream callers only import the rfq-rgb trait.
-- Keep normal tests mocked; add `#[ignore]` integration tests under `crates/rfq-rgb/tests/cli.rs` for the Docker regtest stack.
+Wrap the proven manual regtest RGB flow behind the `RgbBackend` trait, using
+`rgb-api` + `bp-std` + `bp-wallet` directly (the same libraries `rgb-cmd` builds
+on). Subprocess shell-outs were considered and rejected: brittle text parsing,
+no type safety, no isolation win since the RGB dep graph lives inside `rfq-rgb`
+either way.
+
+**Landed** (commit `664d51a` + #14a):
+
+- `LibRgbBackend` skeleton in `crates/rfq-rgb/src/lib_backend.rs`, with real
+  `list_inventory_utxos` (reads the `Stock`) and `validate_invoice`.
+- `RgbConfig` on `MakerNodeConfig` (env-driven: `RGB_NETWORK`, `ELECTRUM_URL`,
+  `RGB_DATA_DIR`, `RGB_WALLET`, `RGB_CONTRACT_ID`); backend selection in
+  `maker-node` + `rfq-api` (`Some(cfg)` → `LibRgbBackend`, `None` →
+  `MockRgbBackend`).
+- `rgb-*` / `bp-*` deps stay strictly inside `crates/rfq-rgb`; downstream
+  callers import only the `RgbBackend` trait.
+
+**Parked** — the five swap methods (`create_invoice`,
+`validate_incoming_consignment`, `create_swap_psbt_buy`,
+`create_swap_psbt_sell`, `finalize_after_taker_sign`) remain stubbed with
+`TODO(#13)`. Reasons it needs a re-scope before being picked up:
+
+- The original issue text predates the atomic-swap design (#15–#22): it
+  describes `create_transfer` / `finalize_and_broadcast` / `list_allocations`,
+  all since replaced or deleted. The trait the stubs must satisfy is the
+  atomic-swap trait, not the unilateral-transfer one the issue assumes.
+- The real work is atomic-swap PSBT construction: a *partial* PSBT the maker
+  contributes only RGB inputs to, which the taker later funds with BTC inputs,
+  with the witness txid deferred. `rgb-api` 0.11.1-rc.6 exposes only
+  whole-transaction `wallet.pay()` / `construct_psbt()`; the two-party
+  partial-PSBT shape needs custom assembly on top of those primitives.
+- Acceptance is gated on live regtest Docker tests (`cargo test -p rfq-rgb --
+  --ignored`), so the work needs an infra session to verify — it can't be
+  signed off offline.
+
+**Next step:** rewrite the #13 issue against the current atomic-swap
+`RgbBackend` trait, then implement against a running regtest stack. Until then
+the mock backend stack (`MockRgbBackend`) carries the buy/sell flows end-to-end.
 
 ## RGB Maker UTXO Inventory Management (Issue #14)
 
@@ -113,7 +146,7 @@ Shipped as six sequenced sub-PRs (see `.claude/plans/yes-lets-do-ti-lovely-grove
 
 ### Follow-up issues
 
-- **Rebalance executor** — splice `RebalancePlan` merges/splits into the next outgoing settlement PSBT. Depends on #13's `create_transfer` being real. Includes the low-traffic fallback to standalone self-transfers (see `docs/rebalancing-strategy.md`).
+- **Rebalance executor** — splice `RebalancePlan` merges/splits into the next outgoing settlement PSBT. Depends on #13's real `LibRgbBackend` swap-PSBT construction. Includes the low-traffic fallback to standalone self-transfers (see `docs/rebalancing-strategy.md`).
 - **Minimum liquidity floor** — explore how the maker guarantees at least N working-denomination UTXOs are always available so it can always serve a quote. The existing `min_utxo_count` rebalance trigger fires *after* the floor is breached but doesn't act. Design space: (a) hard floor on coin selection — refuse to fill quotes that would drop `available_utxos` below N, (b) proactive splits via the rebalance executor when approaching the floor, (c) reserved buffer subset that coin selection treats as untouchable. Likely a hybrid of (a) and (b). Should land alongside or after the rebalance executor.
 - **Split `crates/maker-node/src/main.rs`** — the file is approaching 700 lines mixing config parsing, CLI, HTTP handlers, bootstrap, periodic loops, and tests. Break into focused modules: `config.rs` (`MakerNodeConfig`, `RgbConfig`, `RebalancePolicyConfig`), `cli.rs` (clap surface + subcommand routing), `http.rs` (`maker_app` + handlers), `bootstrap.rs` (`build_maker` + RGB backend wiring), `loops.rs` (`spawn_cleanup_loop`, `spawn_rebalance_loop`, `spawn_placeholder_loop`). Pure refactor, no behavioral change.
 
