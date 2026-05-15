@@ -178,9 +178,30 @@ pub struct SettlementIntent {
     pub final_consignment: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Lifecycle state of a single settlement, from quote acceptance to a final
+/// outcome. The valid transitions form this graph:
+///
+/// ```text
+///   Pending ──▶ Accepted ──┐
+///      │           │       │
+///      └───────────┴──▶ AwaitingConsignment ──▶ AwaitingTakerSignature
+///      │                                              │
+///      └──────────────────────────────────────────────┤
+///                                                      ▼
+///                                          PendingBitcoinConfirm ──▶ Settled
+///
+///   any non-terminal state ──▶ Failed
+/// ```
+///
+/// `Settled` and `Failed` are terminal. `can_transition_to` / `transition`
+/// enforce the graph; `Pending` and `Accepted` are part of the lifecycle spec
+/// but the mock maker currently emits intents starting at the `Awaiting*`
+/// states (it has no pre-accept settlement object).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum SettlementStatus {
+    /// Genesis: a settlement exists but the maker has taken no action yet.
     Pending,
+    /// Quote accepted, side-specific work not yet started.
     Accepted,
     /// Sell-side only: maker is waiting for the taker to submit a consignment
     /// via `/consignment`.
@@ -190,10 +211,69 @@ pub enum SettlementStatus {
     AwaitingTakerSignature,
     /// Maker has broadcast the witness tx; awaiting bitcoin confirmation.
     PendingBitcoinConfirm,
-    /// Tx confirmed; both legs final.
+    /// Tx confirmed; both legs final. Terminal.
     Settled,
+    /// Settlement aborted (rejected consignment, fee slippage, broadcast
+    /// failure, TTL lapse, reorg). Terminal.
     Failed,
 }
+
+impl SettlementStatus {
+    /// True for states with no outgoing transitions — the settlement is over.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Settled | Self::Failed)
+    }
+
+    /// States reachable from `self` in one valid lifecycle step.
+    pub fn allowed_next(self) -> &'static [SettlementStatus] {
+        use SettlementStatus::*;
+        match self {
+            Pending => &[Accepted, AwaitingConsignment, AwaitingTakerSignature, Failed],
+            Accepted => &[AwaitingConsignment, AwaitingTakerSignature, Failed],
+            AwaitingConsignment => &[AwaitingTakerSignature, Failed],
+            AwaitingTakerSignature => &[PendingBitcoinConfirm, Failed],
+            PendingBitcoinConfirm => &[Settled, Failed],
+            Settled | Failed => &[],
+        }
+    }
+
+    /// Whether `self -> next` is a valid lifecycle step. A state is never a
+    /// valid transition target of itself.
+    pub fn can_transition_to(self, next: SettlementStatus) -> bool {
+        self.allowed_next().contains(&next)
+    }
+
+    /// Apply a transition, rejecting any step the lifecycle graph disallows.
+    pub fn transition(
+        self,
+        next: SettlementStatus,
+    ) -> Result<SettlementStatus, SettlementTransitionError> {
+        if self.can_transition_to(next) {
+            Ok(next)
+        } else {
+            Err(SettlementTransitionError { from: self, to: next })
+        }
+    }
+}
+
+/// A rejected `SettlementStatus` transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettlementTransitionError {
+    pub from: SettlementStatus,
+    pub to: SettlementStatus,
+}
+
+impl std::fmt::Display for SettlementTransitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid settlement transition: {:?} -> {:?}",
+            self.from, self.to
+        )
+    }
+}
+
+impl std::error::Error for SettlementTransitionError {}
 
 /// Per-UTXO inventory entry returned by `RgbBackend::list_inventory_utxos`.
 /// `btc_sats` may be 0 when the backend hasn't surfaced bp-wallet UTXO data yet
@@ -621,5 +701,87 @@ mod tests {
         let json = serde_json::to_string(&op).unwrap();
         let parsed: Outpoint = serde_json::from_str(&json).unwrap();
         assert_eq!(op, parsed);
+    }
+
+    // --- SettlementStatus state machine (#9) ---
+
+    use SettlementStatus::*;
+
+    #[test]
+    fn buy_side_lifecycle_is_a_valid_path() {
+        // Pending -> AwaitingTakerSignature -> PendingBitcoinConfirm -> Settled
+        assert!(Pending.can_transition_to(AwaitingTakerSignature));
+        assert!(AwaitingTakerSignature.can_transition_to(PendingBitcoinConfirm));
+        assert!(PendingBitcoinConfirm.can_transition_to(Settled));
+    }
+
+    #[test]
+    fn sell_side_lifecycle_is_a_valid_path() {
+        // Pending -> AwaitingConsignment -> AwaitingTakerSignature -> PendingBitcoinConfirm
+        assert!(Pending.can_transition_to(AwaitingConsignment));
+        assert!(AwaitingConsignment.can_transition_to(AwaitingTakerSignature));
+        assert!(AwaitingTakerSignature.can_transition_to(PendingBitcoinConfirm));
+    }
+
+    #[test]
+    fn any_non_terminal_state_can_fail() {
+        for state in [
+            Pending,
+            Accepted,
+            AwaitingConsignment,
+            AwaitingTakerSignature,
+            PendingBitcoinConfirm,
+        ] {
+            assert!(state.can_transition_to(Failed), "{state:?} should reach Failed");
+        }
+    }
+
+    #[test]
+    fn stage_skips_and_rewinds_are_rejected() {
+        // Skipping the signature stage.
+        assert!(!AwaitingConsignment.can_transition_to(PendingBitcoinConfirm));
+        // Jumping straight to Settled.
+        assert!(!AwaitingTakerSignature.can_transition_to(Settled));
+        // Rewinding.
+        assert!(!PendingBitcoinConfirm.can_transition_to(AwaitingTakerSignature));
+        // Sell stage on the buy path.
+        assert!(!AwaitingTakerSignature.can_transition_to(AwaitingConsignment));
+    }
+
+    #[test]
+    fn a_state_never_transitions_to_itself() {
+        for state in [
+            Pending,
+            Accepted,
+            AwaitingConsignment,
+            AwaitingTakerSignature,
+            PendingBitcoinConfirm,
+            Settled,
+            Failed,
+        ] {
+            assert!(!state.can_transition_to(state), "{state:?} -> {state:?}");
+        }
+    }
+
+    #[test]
+    fn terminal_states_have_no_outgoing_transitions() {
+        assert!(Settled.is_terminal());
+        assert!(Failed.is_terminal());
+        assert!(Settled.allowed_next().is_empty());
+        assert!(Failed.allowed_next().is_empty());
+        assert!(!AwaitingTakerSignature.is_terminal());
+    }
+
+    #[test]
+    fn transition_returns_next_state_or_rejects() {
+        assert_eq!(
+            AwaitingTakerSignature.transition(PendingBitcoinConfirm),
+            Ok(PendingBitcoinConfirm),
+        );
+        let err = AwaitingTakerSignature
+            .transition(Settled)
+            .expect_err("skipping PendingBitcoinConfirm must be rejected");
+        assert_eq!(err.from, AwaitingTakerSignature);
+        assert_eq!(err.to, Settled);
     }
 }

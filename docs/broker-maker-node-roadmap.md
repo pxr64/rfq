@@ -19,7 +19,7 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [x] Issue #14: RGB maker UTXO inventory management (supersedes #11)
 - [x] Issue #15: Atomic swap settlement — buy side (BTC → RGB)
 - [x] Issue #16: Atomic swap settlement — sell side (RGB → BTC)
-- [ ] Issue #9: Add RFQ settlement state machine
+- [x] Issue #9: Add RFQ settlement state machine
 - [ ] Issue #6: Add OpenAPI spec for public RFQ API
 - [ ] Future work: RGB ↔ RGB atomic swap (asset-for-asset). Two RGB state transitions committed in one Bitcoin tx; design pass deferred until #15/#16 land so we know the final `SwapLeg` / `RgbBackend` surface to extend.
 
@@ -177,13 +177,27 @@ Plus: **maker is the only broadcaster** (both flows), **fee policy is taker-pays
 
 Depends on **#14** (RGB inventory lifecycle is the same `Reserved → … → Spent` extended with `AwaitingTakerSignature` / `AwaitingConsignment` between accept and broadcast). Reuses existing `InventoryStore` failure-state methods (`mark_broadcast_failed`, `mark_reorged`, `mark_pending_bitcoin_confirm`, etc., from #14e). Touches **#9** — three new `SettlementStatus` variants. **#15 must land before #16** (sell reuses 15a's types and 15b's `BitcoinClient`).
 
-## Issue #9: Settlement State Machine
+## Issue #9: Settlement State Machine — done
 
-Make quote acceptance and settlement lifecycle explicit before real RGB/Bitcoin execution.
+Make the quote-acceptance / settlement lifecycle explicit. The issue's
+originally-proposed state names (`PsbtCreated`, `Broadcasted`,
+`ConsignmentSent`, `Validated`) predated the atomic-swap design; the machine
+is built on the actual `SettlementStatus` variants instead.
 
-- Add explicit settlement states and transition validation.
-- Keep Bitcoin/RGB execution mocked.
-- Reject invalid transitions in tests.
+Landed:
+
+- `SettlementStatus` carries a documented transition graph (`Pending →
+  Accepted/Awaiting* → AwaitingTakerSignature → PendingBitcoinConfirm →
+  Settled`; any non-terminal → `Failed`).
+- `SettlementStatus::{is_terminal, allowed_next, can_transition_to,
+  transition}` in `rfq-types`; `transition` rejects disallowed steps with
+  `SettlementTransitionError`.
+- Tests cover both side-specific happy paths, stage skips / rewinds, self-
+  transitions, and terminal dead-ends.
+
+Follow-up (not #9): route the maker's per-quote status changes through
+`transition()` at runtime — needs a persisted per-settlement status, which
+belongs with settlement tracking / the `rfq-store` settlement records.
 
 ## Issue #6: OpenAPI Spec
 
