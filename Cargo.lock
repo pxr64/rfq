@@ -1808,10 +1808,13 @@ dependencies = [
 name = "rfq-client"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "reqwest",
+ "rfq-api",
  "rfq-types",
  "serde",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

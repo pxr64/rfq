@@ -10,3 +10,8 @@ rfq-types = { path = "../rfq-types" }
 serde.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+rfq-api = { path = "../rfq-api" }
+axum.workspace = true
+tokio.workspace = true
+
