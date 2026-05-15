@@ -8,6 +8,12 @@ use rfq_types::{
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+mod btc;
+pub use btc::{
+    BtcCoinSelectionError, BtcCoinSelector, BtcInventoryStore, BtcSelection,
+    GreedyLargestFirstSelector, InMemoryBtcInventoryStore,
+};
+
 #[async_trait]
 pub trait QuoteStore: Send + Sync {
     async fn save_quote(&self, quote: Quote);

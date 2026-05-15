@@ -400,6 +400,148 @@ pub struct InventorySnapshot {
     pub spent_allocations: u64,
 }
 
+// --- Maker BTC inventory (issue #20 / 16a) ---
+//
+// The maker holds plain (non-RGB) BTC UTXOs to pay out on the sell-side swap.
+// These types mirror the RGB inventory shapes above — same lifecycle, simpler
+// per-row data (sats + scriptPubKey, no asset id or token amount). The RGB
+// `PendingRgbAcceptance` stage has no BTC analogue: a plain BTC payout is
+// final once the witness tx confirms.
+
+/// Lifecycle state of a single BTC UTXO in the maker's BTC inventory.
+/// `Available → Reserved → PendingBitcoinConfirm → Spent`, with `Invalid` for
+/// reorg-orphaned outputs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BtcInventoryStatus {
+    Available,
+    Reserved {
+        reservation_id: ReservationId,
+        rfq_id: RfqId,
+        quote_id: QuoteId,
+        expires_at_ms: u64,
+    },
+    PendingBitcoinConfirm {
+        reservation_id: ReservationId,
+        witness_txid: String,
+    },
+    Spent {
+        witness_txid: String,
+        quote_id: QuoteId,
+    },
+    Invalid {
+        reason: String,
+    },
+}
+
+/// One BTC UTXO row in the maker's BTC inventory store. `script_pubkey` is
+/// retained so PSBT input construction (16c) doesn't have to re-fetch it via
+/// `BitcoinClient::get_outpoint`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BtcInventoryUtxo {
+    pub outpoint: Outpoint,
+    pub value_sats: u64,
+    pub script_pubkey: Vec<u8>,
+    pub status: BtcInventoryStatus,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    /// Set when this UTXO entered inventory as the change output of a still-
+    /// unconfirmed broadcast tx. Cleared once the tx confirms.
+    pub pending_txid: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BtcInventorySnapshot {
+    pub total_sats: u64,
+    pub available_sats: u64,
+    pub reserved_sats: u64,
+    pub pending_settlement_sats: u64,
+    pub spent_sats: u64,
+    pub total_utxos: u64,
+    pub available_utxos: u64,
+    pub reserved_utxos: u64,
+    pub pending_settlement_utxos: u64,
+    pub spent_utxos: u64,
+    pub invalid_utxos: u64,
+}
+
+impl BtcInventorySnapshot {
+    /// Aggregate a snapshot from a UTXO iterator. The rules here are the spec
+    /// for `BtcInventoryStore::snapshot` — backends should delegate to this or
+    /// match its output exactly.
+    pub fn from_utxos<'a, I>(utxos: I) -> Self
+    where
+        I: IntoIterator<Item = &'a BtcInventoryUtxo>,
+    {
+        let mut snap = BtcInventorySnapshot::default();
+        for utxo in utxos {
+            snap.total_sats = snap.total_sats.saturating_add(utxo.value_sats);
+            snap.total_utxos += 1;
+            match &utxo.status {
+                BtcInventoryStatus::Available => {
+                    snap.available_sats = snap.available_sats.saturating_add(utxo.value_sats);
+                    snap.available_utxos += 1;
+                }
+                BtcInventoryStatus::Reserved { .. } => {
+                    snap.reserved_sats = snap.reserved_sats.saturating_add(utxo.value_sats);
+                    snap.reserved_utxos += 1;
+                }
+                BtcInventoryStatus::PendingBitcoinConfirm { .. } => {
+                    snap.pending_settlement_sats =
+                        snap.pending_settlement_sats.saturating_add(utxo.value_sats);
+                    snap.pending_settlement_utxos += 1;
+                }
+                BtcInventoryStatus::Spent { .. } => {
+                    snap.spent_sats = snap.spent_sats.saturating_add(utxo.value_sats);
+                    snap.spent_utxos += 1;
+                }
+                BtcInventoryStatus::Invalid { .. } => {
+                    snap.invalid_utxos += 1;
+                }
+            }
+        }
+        snap
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BtcInventoryError {
+    UtxoNotFound(Outpoint),
+    UtxoNotAvailable {
+        outpoint: Outpoint,
+        status: BtcInventoryStatus,
+    },
+    ReservationNotFound(ReservationId),
+    /// A multi-UTXO reservation or coin selection couldn't cover `requested`.
+    Insufficient {
+        requested: u64,
+        available: u64,
+    },
+}
+
+impl std::fmt::Display for BtcInventoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UtxoNotFound(op) => write!(f, "btc utxo not found: {op}"),
+            Self::UtxoNotAvailable { outpoint, status } => write!(
+                f,
+                "btc utxo {outpoint} is not available (status: {status:?})"
+            ),
+            Self::ReservationNotFound(id) => {
+                write!(f, "btc reservation not found: {}", id.0)
+            }
+            Self::Insufficient {
+                requested,
+                available,
+            } => write!(
+                f,
+                "insufficient btc inventory: requested {requested} sats, available {available} sats"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BtcInventoryError {}
+
 /// Half-signed swap PSBT + consignment returned by the maker. The taker
 /// validates the consignment (buy side) or has already built it (sell side),
 /// signs its inputs, and returns the fully-signed PSBT via `/sign`.
