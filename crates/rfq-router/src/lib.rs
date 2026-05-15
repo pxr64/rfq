@@ -16,6 +16,18 @@ pub enum RouterError {
     InvalidRequest(#[from] RfqCoreError),
     #[error("maker error: {0}")]
     Maker(String),
+    /// Maker re-estimated the network feerate at PSBT-build time and the result
+    /// exceeded the quote's `fee_slippage_bps` cap. Settlement aborted.
+    #[error("fee slippage exceeded: estimated {estimated} sats, actual {actual} sats")]
+    FeeSlippageExceeded { estimated: u64, actual: u64 },
+    /// Sell-side: the taker's consignment failed validation against the maker's
+    /// Stock. Constructed in 16c.
+    #[error("consignment rejected: {0}")]
+    ConsignmentRejected(String),
+    /// `/sign`: the submitted PSBT was malformed, unfinalizable, or its txid
+    /// diverged from the pre-computed `expected_witness_txid`.
+    #[error("psbt invalid: {0}")]
+    PsbtInvalid(String),
 }
 
 #[async_trait]

@@ -112,8 +112,8 @@ async fn list_inventory_utxos_returns_per_utxo_outpoints() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on LibRgbBackend::create_transfer (issue #13); flip when impl lands"]
-async fn create_transfer_produces_psbt_and_consignment() {
+#[ignore = "blocked on LibRgbBackend::create_swap_psbt_buy (issue #13); flip when impl lands"]
+async fn create_swap_psbt_buy_produces_psbt_and_consignment() {
     let Some((backend, _asset)) = lib_backend() else {
         return;
     };
@@ -122,7 +122,7 @@ async fn create_transfer_produces_psbt_and_consignment() {
     // have a real beneficiary to transfer to. For now this test just documents
     // the intended shape and is skipped via #[ignore].
     let result = backend
-        .create_transfer("rgb:dummy/~/XabF/bcrt:utxob:dummy", 1000)
+        .create_swap_psbt_buy("rgb:dummy/~/XabF/bcrt:utxob:dummy", 1000, &[])
         .await;
 
     assert!(
@@ -132,18 +132,20 @@ async fn create_transfer_produces_psbt_and_consignment() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on LibRgbBackend::finalize_and_broadcast (issue #13); flip when impl lands"]
-async fn finalize_and_broadcast_returns_witness_txid() {
+#[ignore = "blocked on LibRgbBackend::finalize_after_taker_sign (issue #13); flip when impl lands"]
+async fn finalize_after_taker_sign_returns_witness_txid() {
     let Some((backend, _asset)) = lib_backend() else {
         return;
     };
 
-    // TODO(#13): plug in a real signed PSBT once create_transfer + an out-of-
-    // band sign step exist. For now we assert the stub error.
-    let result = backend.finalize_and_broadcast(&[]).await;
+    // TODO(#13): plug in a real signed PSBT once create_swap_psbt_buy + an
+    // out-of-band sign step exist. For now we assert the stub error.
+    let result = backend
+        .finalize_after_taker_sign("c2lnbmVk", "Y29uc2lnbm1lbnQ=")
+        .await;
 
     assert!(
-        matches!(result, Err(RgbError::BroadcastFailed(_))),
-        "stub should return BroadcastFailed error until issue #13 lands"
+        matches!(result, Err(RgbError::FinalizeFailed(_))),
+        "stub should return FinalizeFailed error until issue #13 lands"
     );
 }

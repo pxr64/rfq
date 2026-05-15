@@ -10,7 +10,7 @@ use rgb::persistence::Stock;
 use rgb::persistence::fs::FsBinStore;
 use rgb::ContractId;
 
-use crate::{RgbBackend, RgbError, WitnessTxid};
+use crate::{FinalizedSwap, RgbBackend, RgbError};
 
 /// Library-backed `RgbBackend` implementation. Talks directly to `rgb-api` /
 /// `rgb-ops` (the same libraries `rgb-cmd` is built on) — no subprocess.
@@ -93,30 +93,32 @@ impl RgbBackend for LibRgbBackend {
             .map_err(|_| RgbError::InvalidInvoice)
     }
 
-    async fn create_transfer(
+    async fn create_swap_psbt_buy(
         &self,
-        _invoice: &str,
+        _rgb_invoice: &str,
         _amount: u64,
+        _maker_rgb_utxos: &[Outpoint],
     ) -> Result<SwapTransfer, RgbError> {
-        // TODO(#13): implement via rgb-api's TransferBuilder + WalletProvider::pay
-        // (mirrors Command::Transfer in rgb-cmd 0.11.1-rc.6 command.rs).
-        // For now, callers should use the manual rgb-cmd flow described in
-        // docs/regtest-rgb20-nia-dev-infra.md.
+        // TODO(#13): build the swap PSBT via rgb-api's TransferBuilder +
+        // bp-std PSBT construction (mirrors Command::Transfer in rgb-cmd
+        // 0.11.1-rc.6 command.rs). For now, callers should use MockRgbBackend
+        // or the manual rgb-cmd flow in docs/regtest-rgb20-nia-dev-infra.md.
         Err(RgbError::TransferBuild(
-            "LibRgbBackend::create_transfer is not implemented yet (issue #13); \
-             use the manual rgb-cmd flow for now"
+            "LibRgbBackend::create_swap_psbt_buy is not implemented yet (issue #13); \
+             use MockRgbBackend for now"
                 .to_owned(),
         ))
     }
 
-    async fn finalize_and_broadcast(
+    async fn finalize_after_taker_sign(
         &self,
-        _signed_psbt: &[u8],
-    ) -> Result<WitnessTxid, RgbError> {
-        // TODO(#13): finalize PSBT with bp-std, extract tx, broadcast via
-        // rgb::resolvers::AnyResolver against self.electrum_url.
-        Err(RgbError::BroadcastFailed(
-            "LibRgbBackend::finalize_and_broadcast is not implemented yet (issue #13)"
+        _signed_psbt_base64: &str,
+        _original_consignment_base64: &str,
+    ) -> Result<FinalizedSwap, RgbError> {
+        // TODO(#13): finalize the PSBT with bp-std, extract the witness tx,
+        // emit the witness-extended consignment.
+        Err(RgbError::FinalizeFailed(
+            "LibRgbBackend::finalize_after_taker_sign is not implemented yet (issue #13)"
                 .to_owned(),
         ))
     }

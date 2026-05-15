@@ -1414,6 +1414,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "rfq-btc",
  "rfq-client",
  "rfq-maker",
  "rfq-rgb",
@@ -1778,6 +1779,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "http",
+ "rfq-btc",
  "rfq-core",
  "rfq-maker",
  "rfq-rgb",
@@ -1825,6 +1827,7 @@ name = "rfq-maker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "rfq-btc",
  "rfq-rgb",
  "rfq-router",
  "rfq-store",

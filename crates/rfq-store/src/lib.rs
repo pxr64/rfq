@@ -112,6 +112,18 @@ pub trait InventoryStore: Send + Sync {
     /// count of UTXOs released.
     async fn release_expired_reservations(&self, now_ms: u64) -> usize;
 
+    /// Push out the deadline of an active reservation. Used at accept time:
+    /// the quote-stage reservation (`QUOTE_TTL_MS`) is extended to the longer
+    /// settlement window (`TAKER_SIGNATURE_TTL_MS`) so the cleanup loop doesn't
+    /// release UTXOs out from under an in-flight settlement. Returns the count
+    /// of UTXOs whose deadline moved.
+    async fn extend_reservation(
+        &self,
+        reservation_id: &ReservationId,
+        new_expires_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<usize, InventoryError>;
+
     /// Mark every UTXO in `reservation_id` as `Spent`. Accepts UTXOs currently
     /// in `Reserved` or `PendingRgbAcceptance` (the settlement state machine
     /// will drive the latter; today's MockMaker uses the former directly).
@@ -370,6 +382,40 @@ impl InventoryStore for InMemoryInventoryStore {
             }
         }
         released
+    }
+
+    async fn extend_reservation(
+        &self,
+        reservation_id: &ReservationId,
+        new_expires_at_ms: u64,
+        now_ms: u64,
+    ) -> Result<usize, InventoryError> {
+        let mut utxos = self.utxos.write().await;
+        let mut updated = 0;
+        for utxo in utxos.values_mut() {
+            if let InventoryStatus::Reserved {
+                reservation_id: rid,
+                rfq_id,
+                quote_id,
+                ..
+            } = &utxo.status
+            {
+                if rid == reservation_id {
+                    utxo.status = InventoryStatus::Reserved {
+                        reservation_id: rid.clone(),
+                        rfq_id: rfq_id.clone(),
+                        quote_id: quote_id.clone(),
+                        expires_at_ms: new_expires_at_ms,
+                    };
+                    utxo.updated_at_ms = now_ms;
+                    updated += 1;
+                }
+            }
+        }
+        if updated == 0 {
+            return Err(InventoryError::ReservationNotFound(reservation_id.clone()));
+        }
+        Ok(updated)
     }
 
     async fn mark_spent(

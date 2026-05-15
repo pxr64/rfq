@@ -6,6 +6,7 @@ version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+rfq-btc = { path = "../rfq-btc" }
 rfq-rgb = { path = "../rfq-rgb" }
 rfq-router = { path = "../rfq-router" }
 rfq-store = { path = "../rfq-store" }

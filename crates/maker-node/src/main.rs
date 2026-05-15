@@ -8,6 +8,7 @@ use axum::{
     Json, Router,
 };
 use clap::{Parser, Subcommand};
+use rfq_btc::MockBitcoinClient;
 use rfq_client::{RfqClient, Url};
 use rfq_maker::{MockMaker, RebalancePolicy};
 use rfq_rgb::{LibRgbBackend, MockRgbBackend, RgbBackend};
@@ -294,7 +295,11 @@ async fn build_maker(config: &MakerNodeConfig) -> Result<MockMaker, Box<dyn std:
         }
     };
 
-    Ok(MockMaker::new(maker_id, utxos, rgb_backend))
+    // 15c wires a BitcoinClient into the maker for broadcast + feerate
+    // estimation. maker-node runs against a mock until the electrum-backed
+    // client is wired through config (#15b follow-up).
+    let bitcoin_client = Arc::new(MockBitcoinClient::new());
+    Ok(MockMaker::new(maker_id, utxos, rgb_backend, bitcoin_client))
 }
 
 #[derive(Clone)]
@@ -309,6 +314,7 @@ fn maker_app(maker: MockMaker) -> Router {
         .route("/inventory", get(maker_inventory))
         .route("/quotes", post(maker_quote))
         .route("/quotes/:quote_id/accept", post(maker_accept_quote))
+        .route("/quotes/:quote_id/sign", post(maker_sign_quote))
         .with_state(MakerNodeState {
             maker,
             store: InMemoryQuoteStore::new(),
@@ -351,6 +357,30 @@ async fn maker_accept_quote(
     request.quote_id = quote_id;
 
     Ok(Json(state.maker.accept_quote(quote, request).await?))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SignedPsbtBody {
+    signed_psbt: String,
+}
+
+async fn maker_sign_quote(
+    State(state): State<MakerNodeState>,
+    Path(quote_id): Path<String>,
+    Json(body): Json<SignedPsbtBody>,
+) -> Result<Json<SettlementIntent>, MakerNodeHttpError> {
+    let quote_id = QuoteId(quote_id);
+    // 404 for an unknown quote, mirroring maker_accept_quote; settlement-stage
+    // expiry is enforced inside submit_signed_psbt.
+    state
+        .store
+        .get_quote(&quote_id)
+        .await
+        .ok_or(MakerNodeHttpError::NotFound)?;
+
+    Ok(Json(
+        state.maker.submit_signed_psbt(quote_id, body.signed_psbt).await?,
+    ))
 }
 
 #[derive(Debug)]

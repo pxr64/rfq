@@ -1,14 +1,19 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
+use rfq_btc::BitcoinClient;
 use rfq_rgb::RgbBackend;
 use rfq_router::{MakerConnector, RouterError};
 use rfq_store::{InMemoryInventoryStore, InventoryStore};
 use rfq_types::{
     AcceptQuoteRequest, AssetId, ExtendedInventorySnapshot, InventoryError, InventorySnapshot,
     InventoryStatus, InventoryUtxo, MakerId, Outpoint, Quote, QuoteId, QuoteRequest,
-    RgbInventoryUtxo, SettlementIntent, SettlementStatus, SwapLeg,
+    RgbInventoryUtxo, ReservationId, SettlementIntent, SettlementStatus, SwapLeg,
 };
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 mod coin_select;
@@ -71,11 +76,36 @@ pub struct SplitAction {
 }
 
 const QUOTE_TTL_MS: u64 = 30_000;
+/// After the taker accepts, the maker holds the reservation this long awaiting
+/// the signed PSBT via `/sign` — longer than `QUOTE_TTL_MS` because the taker
+/// now has to add BTC inputs and sign. See `docs/swap-flows.md`.
+const TAKER_SIGNATURE_TTL_MS: u64 = 600_000;
+/// After broadcast, the reservation sits in `PendingBitcoinConfirm` until the
+/// witness tx confirms (or a reorg / timeout intervenes).
+const BROADCAST_CONFIRM_TTL_MS: u64 = 7_200_000;
+/// Rough vbyte footprint of a 2-in / 3-out segwit swap tx. Multiplied by the
+/// feerate estimate to turn it into an absolute fee on the quote. A real
+/// estimate would size the actual PSBT; this is a deliberate v0 placeholder.
+const ESTIMATED_SWAP_VBYTES: u64 = 200;
 /// Upper bound on reservation retries under contention. With outpoint
 /// exclusion on each retry, the effective bound is `min(this, available_utxo_count)`
 /// — the loop exits via the selector's Insufficient branch once exclusions
 /// have whittled the candidate set to empty.
 const RESERVE_RETRY_ATTEMPTS: u32 = 16;
+
+/// Maker-side state for a buy-side swap held between `accept_quote` and
+/// `submit_signed_psbt`. The settlement state machine (#9) will formalize
+/// this; for 15c a per-quote map keyed by `QuoteId` is enough.
+#[derive(Clone)]
+struct PendingBuySettlement {
+    quote: Quote,
+    reservation_id: ReservationId,
+    /// Maker-built consignment handed to the taker at accept; needed again to
+    /// finalize once the taker returns the signed PSBT.
+    consignment: String,
+    /// Sats the maker over-selected — re-ingested as a change UTXO post-broadcast.
+    expected_change: u64,
+}
 
 #[derive(Clone)]
 pub struct MockMaker {
@@ -83,6 +113,8 @@ pub struct MockMaker {
     store: Arc<dyn InventoryStore>,
     selector: Arc<dyn CoinSelector>,
     rgb_backend: Arc<dyn RgbBackend>,
+    bitcoin_client: Arc<dyn BitcoinClient>,
+    pending: Arc<RwLock<HashMap<QuoteId, PendingBuySettlement>>>,
 }
 
 impl MockMaker {
@@ -93,6 +125,7 @@ impl MockMaker {
         maker_id: MakerId,
         utxos: Vec<RgbInventoryUtxo>,
         rgb_backend: Arc<dyn RgbBackend>,
+        bitcoin_client: Arc<dyn BitcoinClient>,
     ) -> Self {
         let now = now_ms();
         let inv_utxos: Vec<InventoryUtxo> = utxos
@@ -113,6 +146,7 @@ impl MockMaker {
             Arc::new(InMemoryInventoryStore::with_seed(inv_utxos)),
             Arc::new(GreedyExactFitSelector),
             rgb_backend,
+            bitcoin_client,
         )
     }
 
@@ -124,12 +158,15 @@ impl MockMaker {
         store: Arc<dyn InventoryStore>,
         selector: Arc<dyn CoinSelector>,
         rgb_backend: Arc<dyn RgbBackend>,
+        bitcoin_client: Arc<dyn BitcoinClient>,
     ) -> Self {
         Self {
             maker_id,
             store,
             selector,
             rgb_backend,
+            bitcoin_client,
+            pending: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -155,7 +192,31 @@ impl MockMaker {
     }
 
     pub async fn release_expired_reservations(&self) -> usize {
-        self.store.release_expired_reservations(now_ms()).await
+        let released = self.store.release_expired_reservations(now_ms()).await;
+        // Prune buy-settlement state whose reservation no longer exists —
+        // either expired above, or already transitioned out of `Reserved` by
+        // a completed `submit_signed_psbt`. `find_reservation_for_quote` only
+        // matches `Reserved`, so a settled quote reads as "gone" here, which
+        // is fine: `submit_signed_psbt` already removed its own entry.
+        let quote_ids: Vec<QuoteId> = self.pending.read().await.keys().cloned().collect();
+        let mut stale = Vec::new();
+        for quote_id in quote_ids {
+            if self
+                .store
+                .find_reservation_for_quote(&quote_id)
+                .await
+                .is_none()
+            {
+                stale.push(quote_id);
+            }
+        }
+        if !stale.is_empty() {
+            let mut pending = self.pending.write().await;
+            for quote_id in stale {
+                pending.remove(&quote_id);
+            }
+        }
+        released
     }
 
     /// Periodic rebalance planner. Reads `extended_inventory_summary()` and
@@ -255,6 +316,12 @@ impl MakerConnector for MockMaker {
             }
         };
 
+        // Quote-time fee estimate. A failed estimate falls back to 0, which
+        // disables the slippage check in `submit_signed_psbt` (can't compare
+        // against an unknown baseline) rather than rejecting every quote.
+        let feerate = self.bitcoin_client.estimate_feerate(3).await.unwrap_or(0);
+        let estimated_fee_sats = feerate.saturating_mul(ESTIMATED_SWAP_VBYTES);
+
         Ok(Some(Quote {
             quote_id,
             rfq_id: request.rfq_id,
@@ -265,9 +332,8 @@ impl MakerConnector for MockMaker {
             amount: selection.requested,
             price: selection.requested.saturating_mul(101),
             expires_at_ms,
-            // Placeholders until 15c wires real feerate estimation; 20% slippage
-            // cap is the v0 default per docs/swap-flows.md.
-            estimated_fee_sats: 0,
+            estimated_fee_sats,
+            // 20% slippage cap — the v0 default per docs/swap-flows.md.
             fee_slippage_bps: 2000,
             // Set on sell-side quotes only — 16c populates this with a maker
             // invoice. Buy-side quotes always carry None.
@@ -303,26 +369,29 @@ impl MakerConnector for MockMaker {
                 RouterError::Maker("quote reservation not found or expired".to_owned())
             })?;
 
-        // Compute expected change before mark_spent transitions the
-        // reservation. The Reserved variant is the only status that still
-        // carries reservation_id at this point.
-        let reserved_total: u64 = self
+        // Reserved UTXOs for this quote: their outpoints feed the swap PSBT,
+        // and their summed amount minus the quote amount is the maker's RGB
+        // change. `Reserved` is the only status still carrying reservation_id.
+        let reserved: Vec<InventoryUtxo> = self
             .store
             .list_for_asset(&quote.base_asset)
             .await
             .into_iter()
-            .filter_map(|u| match &u.status {
-                InventoryStatus::Reserved { reservation_id: rid, .. } if rid == &reservation_id => {
-                    Some(u.amount)
-                }
-                _ => None,
+            .filter(|u| {
+                matches!(&u.status,
+                    InventoryStatus::Reserved { reservation_id: rid, .. } if rid == &reservation_id)
             })
-            .sum();
+            .collect();
+        let reserved_total: u64 = reserved.iter().map(|u| u.amount).sum();
+        let reserved_outpoints: Vec<Outpoint> =
+            reserved.iter().map(|u| u.outpoint.clone()).collect();
         let expected_change = reserved_total.saturating_sub(quote.amount);
 
+        // Build the maker-RGB-side PSBT + consignment. On failure the
+        // reservation goes back to Available.
         let transfer = match self
             .rgb_backend
-            .create_transfer(&rgb_invoice, quote.amount)
+            .create_swap_psbt_buy(&rgb_invoice, quote.amount, &reserved_outpoints)
             .await
         {
             Ok(t) => t,
@@ -335,49 +404,167 @@ impl MakerConnector for MockMaker {
             }
         };
 
-        // Synthesize a witness txid until #13 wires the real broadcast path.
-        let witness_txid = format!("mock-wt-{}", quote.quote_id.0);
+        // The reservation carries a 30s quote TTL; extend it to the settlement
+        // window so the cleanup loop doesn't release it mid-signature.
+        let expires_at_ms = now_ms() + TAKER_SIGNATURE_TTL_MS;
         self.store
-            .mark_spent(&reservation_id, witness_txid.clone(), now_ms())
+            .extend_reservation(&reservation_id, expires_at_ms, now_ms())
             .await
             .map_err(|e| RouterError::Maker(e.to_string()))?;
 
-        // Change re-ingestion: when the selection had to take more than
-        // requested, the broadcast tx would produce a change output back to
-        // the maker. The mock synthesizes the outpoint (vout=1) and registers
-        // it as PendingBitcoinConfirm. Best-effort — ingestion failure
-        // (collision) doesn't block settlement.
-        if expected_change > 0 {
+        // Stash the per-quote state `submit_signed_psbt` needs. A buy-side
+        // transfer always carries `Some(consignment)`; default defensively.
+        self.pending.write().await.insert(
+            quote.quote_id.clone(),
+            PendingBuySettlement {
+                quote: quote.clone(),
+                reservation_id: reservation_id.clone(),
+                consignment: transfer.consignment.clone().unwrap_or_default(),
+                expected_change,
+            },
+        );
+
+        Ok(SettlementIntent {
+            quote_id: quote.quote_id,
+            maker_id: self.maker_id.clone(),
+            status: SettlementStatus::AwaitingTakerSignature,
+            transfer: Some(transfer),
+            expires_at_ms,
+            witness_txid: None,
+            final_consignment: None,
+        })
+    }
+
+    async fn submit_signed_psbt(
+        &self,
+        quote_id: QuoteId,
+        signed_psbt_base64: String,
+    ) -> Result<SettlementIntent, RouterError> {
+        self.store.release_expired_reservations(now_ms()).await;
+
+        let pending = self
+            .pending
+            .read()
+            .await
+            .get(&quote_id)
+            .cloned()
+            .ok_or_else(|| RouterError::Maker("no pending settlement for quote".to_owned()))?;
+
+        // The reservation must still be live. If the cleanup loop already
+        // released it (taker took longer than TAKER_SIGNATURE_TTL_MS), the
+        // settlement is dead — drop the stale entry and report it.
+        if self
+            .store
+            .find_reservation_for_quote(&quote_id)
+            .await
+            .is_none()
+        {
+            self.pending.write().await.remove(&quote_id);
+            return Err(RouterError::Maker(
+                "settlement expired before signature was submitted".to_owned(),
+            ));
+        }
+
+        let reservation_id = pending.reservation_id.clone();
+        let quote = &pending.quote;
+
+        // Fee-slippage guard. Skipped when the quote-time estimate was 0 (the
+        // feerate estimate failed at quote time — no baseline to compare).
+        if quote.estimated_fee_sats > 0 {
+            let feerate = self
+                .bitcoin_client
+                .estimate_feerate(3)
+                .await
+                .map_err(|e| RouterError::Maker(format!("feerate estimate failed: {e}")))?;
+            let actual_fee = feerate.saturating_mul(ESTIMATED_SWAP_VBYTES);
+            let cap = quote
+                .estimated_fee_sats
+                .saturating_mul(10_000 + u64::from(quote.fee_slippage_bps))
+                / 10_000;
+            if actual_fee > cap {
+                let _ = self
+                    .store
+                    .mark_broadcast_failed(&reservation_id, now_ms())
+                    .await;
+                self.pending.write().await.remove(&quote_id);
+                return Err(RouterError::FeeSlippageExceeded {
+                    estimated: quote.estimated_fee_sats,
+                    actual: actual_fee,
+                });
+            }
+        }
+
+        // Finalize the taker-signed PSBT into a broadcastable tx.
+        let finalized = match self
+            .rgb_backend
+            .finalize_after_taker_sign(&signed_psbt_base64, &pending.consignment)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = self
+                    .store
+                    .mark_broadcast_failed(&reservation_id, now_ms())
+                    .await;
+                self.pending.write().await.remove(&quote_id);
+                return Err(RouterError::PsbtInvalid(e.to_string()));
+            }
+        };
+
+        // Broadcast. A failure here releases the reservation — the swap tx
+        // never hit the network, so the maker's UTXOs are still spendable.
+        if let Err(e) = self.bitcoin_client.broadcast(&finalized.raw_tx).await {
+            let _ = self
+                .store
+                .mark_broadcast_failed(&reservation_id, now_ms())
+                .await;
+            self.pending.write().await.remove(&quote_id);
+            return Err(RouterError::Maker(format!("broadcast failed: {e}")));
+        }
+
+        // Tx is on the wire — move the reserved UTXOs to PendingBitcoinConfirm.
+        self.store
+            .mark_pending_bitcoin_confirm(
+                &reservation_id,
+                finalized.witness_txid.clone(),
+                now_ms(),
+            )
+            .await
+            .map_err(|e| RouterError::Maker(e.to_string()))?;
+
+        // Change re-ingestion: the broadcast tx produces an RGB change output
+        // back to the maker when the selection over-shot. Best-effort — an
+        // ingestion collision doesn't undo a settled swap.
+        if pending.expected_change > 0 {
             let now = now_ms();
             let change_utxo = InventoryUtxo {
-                outpoint: Outpoint::new(witness_txid.clone(), 1),
+                outpoint: Outpoint::new(finalized.witness_txid.clone(), 1),
                 asset_id: quote.base_asset.clone(),
-                amount: expected_change,
+                amount: pending.expected_change,
                 btc_sats: 0,
                 status: InventoryStatus::PendingBitcoinConfirm {
                     reservation_id: reservation_id.clone(),
-                    witness_txid: witness_txid.clone(),
+                    witness_txid: finalized.witness_txid.clone(),
                 },
                 created_at_ms: now,
                 updated_at_ms: now,
-                pending_txid: Some(witness_txid.clone()),
+                pending_txid: Some(finalized.witness_txid.clone()),
             };
             if let Err(e) = self.store.ingest_change_utxo(change_utxo).await {
                 eprintln!("change re-ingestion failed (continuing): {e}");
             }
         }
 
-        // 15a relabels the success status from the now-deleted `Ready` to
-        // `AwaitingTakerSignature`. 15c will further refactor the body to
-        // defer `mark_spent` until `/sign`; for 15a the body still spends.
+        self.pending.write().await.remove(&quote_id);
+
         Ok(SettlementIntent {
-            quote_id: quote.quote_id,
+            quote_id,
             maker_id: self.maker_id.clone(),
-            status: SettlementStatus::AwaitingTakerSignature,
-            transfer: Some(transfer),
-            expires_at_ms: now + QUOTE_TTL_MS,
-            witness_txid: None,
-            final_consignment: None,
+            status: SettlementStatus::PendingBitcoinConfirm,
+            transfer: None,
+            expires_at_ms: now_ms() + BROADCAST_CONFIRM_TTL_MS,
+            witness_txid: Some(finalized.witness_txid),
+            final_consignment: Some(finalized.final_consignment_base64),
         })
     }
 }
@@ -392,6 +579,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rfq_btc::MockBitcoinClient;
     use rfq_rgb::MockRgbBackend;
     use rfq_types::{AssetId, AssetKind, BitcoinNetwork, ReservationId, RfqId, Side};
 
@@ -451,8 +639,17 @@ mod tests {
     }
 
     fn maker_with_utxos(utxos: Vec<RgbInventoryUtxo>) -> MockMaker {
+        maker_with_btc(utxos, Arc::new(MockBitcoinClient::new()))
+    }
+
+    /// Like `maker_with_utxos` but lets a test hold the `MockBitcoinClient` it
+    /// passed in, so it can drive broadcast-failure / feerate scenarios.
+    fn maker_with_btc(
+        utxos: Vec<RgbInventoryUtxo>,
+        bitcoin_client: Arc<MockBitcoinClient>,
+    ) -> MockMaker {
         let rgb_backend = Arc::new(MockRgbBackend::new(utxos.clone()));
-        MockMaker::new(maker_id(), utxos, rgb_backend)
+        MockMaker::new(maker_id(), utxos, rgb_backend, bitcoin_client)
     }
 
     /// Seed the store directly so tests can pre-set Reserved / Spent statuses.
@@ -463,7 +660,18 @@ mod tests {
             Arc::new(InMemoryInventoryStore::with_seed(rows)),
             Arc::new(GreedyExactFitSelector),
             rgb_backend,
+            Arc::new(MockBitcoinClient::new()),
         )
+    }
+
+    /// Build a `SwapLeg::Buy` accept request for `quote`.
+    fn buy_request(quote: &Quote, invoice: &str) -> AcceptQuoteRequest {
+        AcceptQuoteRequest {
+            quote_id: quote.quote_id.clone(),
+            leg: SwapLeg::Buy {
+                rgb_invoice: invoice.to_owned(),
+            },
+        }
     }
 
     fn quote_request(id: &str) -> QuoteRequest {
@@ -646,7 +854,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_marks_reserved_allocation_spent() {
+    async fn accept_keeps_utxo_reserved_awaiting_signature() {
+        // Under the swap flow, `accept` no longer spends — it builds the PSBT
+        // and waits for the taker's signature. The reserved UTXO stays
+        // `Reserved` (with its deadline extended to the settlement window).
         let maker = maker();
         let quote = maker
             .request_quote(quote_request("rfq-1"))
@@ -655,28 +866,24 @@ mod tests {
             .expect("quote should be returned");
 
         let intent = maker
-            .accept_quote(
-                quote.clone(),
-                AcceptQuoteRequest {
-                    quote_id: quote.quote_id.clone(),
-                    leg: SwapLeg::Buy {
-                        rgb_invoice: "rgb:test_invoice".to_owned(),
-                    },
-                },
-            )
+            .accept_quote(quote.clone(), buy_request(&quote, "rgb:test_invoice"))
             .await
             .unwrap();
 
         assert_eq!(intent.status, SettlementStatus::AwaitingTakerSignature);
+        assert!(intent.transfer.is_some());
         let utxos = maker.utxo_snapshot().await;
         assert!(matches!(
             &utxos[0].status,
-            InventoryStatus::Spent { quote_id, .. } if quote_id == &quote.quote_id
+            InventoryStatus::Reserved { quote_id, .. } if quote_id == &quote.quote_id
         ));
     }
 
     #[tokio::test]
-    async fn inventory_summary_counts_spent_after_accept() {
+    async fn inventory_counts_pending_confirm_after_sign() {
+        // accept → sign drives the input UTXO to `PendingBitcoinConfirm`
+        // (broadcast, awaiting confirmation) — not `Spent`, which only happens
+        // once the witness tx confirms.
         let maker = maker();
         let quote = maker
             .request_quote(quote_request("rfq-1"))
@@ -684,27 +891,21 @@ mod tests {
             .unwrap()
             .expect("quote should be returned");
 
+        let intent = maker
+            .accept_quote(quote.clone(), buy_request(&quote, "rgb:test_invoice"))
+            .await
+            .unwrap();
+        let psbt = intent.transfer.expect("transfer").partial_psbt;
         maker
-            .accept_quote(
-                quote.clone(),
-                AcceptQuoteRequest {
-                    quote_id: quote.quote_id,
-                    leg: SwapLeg::Buy {
-                        rgb_invoice: "rgb:test_invoice".to_owned(),
-                    },
-                },
-            )
+            .submit_signed_psbt(quote.quote_id.clone(), format!("{psbt}|signed"))
             .await
             .unwrap();
 
-        let snapshot = maker.inventory_summary().await;
-
-        assert_eq!(snapshot.available_amount, 0);
-        assert_eq!(snapshot.reserved_amount, 0);
-        assert_eq!(snapshot.spent_amount, 100);
-        assert_eq!(snapshot.available_allocations, 0);
-        assert_eq!(snapshot.reserved_allocations, 0);
-        assert_eq!(snapshot.spent_allocations, 1);
+        let ext = maker.extended_inventory_summary().await;
+        assert_eq!(ext.available_utxos, 0);
+        assert_eq!(ext.reserved_utxos, 0);
+        assert_eq!(ext.pending_settlement_utxos, 1);
+        assert_eq!(ext.pending_settlement_amount, 100);
     }
 
     #[tokio::test]
@@ -888,10 +1089,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accept_with_change_ingests_pending_bitcoin_confirm_utxo() {
-        // Single UTXO of 100; request 60. Selection picks the 100 UTXO,
-        // change = 40. After accept_quote, inventory should show the input
-        // UTXO as Spent and a synthetic change UTXO as PendingBitcoinConfirm.
+    async fn sign_with_change_ingests_pending_bitcoin_confirm_utxo() {
+        // Single UTXO of 100; request 60 → change = 40. Change re-ingestion
+        // happens at `/sign` (post-broadcast), not at accept. After sign, the
+        // input UTXO is PendingBitcoinConfirm and a synthetic change UTXO of
+        // 40 has been ingested, also PendingBitcoinConfirm.
         let maker = maker_with_utxos(vec![utxo_with_amount(0, 100)]);
 
         let mut request = quote_request("rfq-1");
@@ -903,31 +1105,187 @@ mod tests {
             .expect("quote should be issued");
 
         let intent = maker
-            .accept_quote(
-                quote.clone(),
-                AcceptQuoteRequest {
-                    quote_id: quote.quote_id.clone(),
-                    leg: SwapLeg::Buy {
-                        rgb_invoice: "rgb:test".into(),
-                    },
-                },
-            )
+            .accept_quote(quote.clone(), buy_request(&quote, "rgb:test"))
+            .await
+            .unwrap();
+        let psbt = intent.transfer.expect("transfer").partial_psbt;
+        maker
+            .submit_signed_psbt(quote.quote_id.clone(), format!("{psbt}|signed"))
+            .await
+            .unwrap();
+
+        let utxos = maker.utxo_snapshot().await;
+        let pending: Vec<_> = utxos
+            .iter()
+            .filter(|u| matches!(u.status, InventoryStatus::PendingBitcoinConfirm { .. }))
+            .collect();
+        // Input (100) + change (40), both PendingBitcoinConfirm.
+        assert_eq!(pending.len(), 2);
+        let change = pending
+            .iter()
+            .find(|u| u.amount == 40)
+            .expect("expected a change UTXO");
+        assert!(change.pending_txid.is_some());
+    }
+
+    #[tokio::test]
+    async fn buy_flow_settles_through_accept_then_sign() {
+        let maker = maker();
+        let quote = maker
+            .request_quote(quote_request("rfq-1"))
+            .await
+            .unwrap()
+            .expect("quote should be returned");
+
+        let intent = maker
+            .accept_quote(quote.clone(), buy_request(&quote, "rgb:invoice"))
             .await
             .unwrap();
         assert_eq!(intent.status, SettlementStatus::AwaitingTakerSignature);
+        let transfer = intent.transfer.expect("transfer");
+        assert!(transfer.consignment.is_some());
+
+        let final_intent = maker
+            .submit_signed_psbt(
+                quote.quote_id.clone(),
+                format!("{}|signed", transfer.partial_psbt),
+            )
+            .await
+            .unwrap();
+        assert_eq!(final_intent.status, SettlementStatus::PendingBitcoinConfirm);
+        assert!(final_intent.witness_txid.is_some());
+        assert!(final_intent.final_consignment.is_some());
 
         let utxos = maker.utxo_snapshot().await;
-        let spent_count = utxos
-            .iter()
-            .filter(|u| matches!(u.status, InventoryStatus::Spent { .. }))
-            .count();
-        let pending_change = utxos
-            .iter()
-            .find(|u| matches!(u.status, InventoryStatus::PendingBitcoinConfirm { .. }));
-        assert_eq!(spent_count, 1);
-        let pending_change = pending_change.expect("expected a change UTXO");
-        assert_eq!(pending_change.amount, 40);
-        assert!(pending_change.pending_txid.is_some());
+        assert!(matches!(
+            utxos[0].status,
+            InventoryStatus::PendingBitcoinConfirm { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn submit_signed_psbt_unknown_quote_errors() {
+        let maker = maker();
+        let result = maker
+            .submit_signed_psbt(QuoteId("no-such-quote".to_owned()), "psbt".to_owned())
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn submit_signed_psbt_rejects_unsigned_psbt() {
+        // MockRgbBackend::finalize_after_taker_sign rejects an empty PSBT.
+        let maker = maker();
+        let quote = maker
+            .request_quote(quote_request("rfq-1"))
+            .await
+            .unwrap()
+            .expect("quote");
+        maker
+            .accept_quote(quote.clone(), buy_request(&quote, "rgb:invoice"))
+            .await
+            .unwrap();
+
+        let result = maker
+            .submit_signed_psbt(quote.quote_id.clone(), String::new())
+            .await;
+        assert!(matches!(result, Err(RouterError::PsbtInvalid(_))));
+        // Reservation released back to Available.
+        let utxos = maker.utxo_snapshot().await;
+        assert!(matches!(utxos[0].status, InventoryStatus::Available));
+    }
+
+    #[tokio::test]
+    async fn submit_signed_psbt_fee_slippage_releases_reservation() {
+        // Default mock feerate (5 sat/vB) × 200 vB = 1000 sat actual. Crafting
+        // the accepted quote with a tiny baseline + zero slippage tolerance
+        // makes the submit-time re-estimate blow the cap.
+        let maker = maker();
+        let mut quote = maker
+            .request_quote(quote_request("rfq-1"))
+            .await
+            .unwrap()
+            .expect("quote");
+        quote.estimated_fee_sats = 1;
+        quote.fee_slippage_bps = 0;
+
+        let intent = maker
+            .accept_quote(quote.clone(), buy_request(&quote, "rgb:invoice"))
+            .await
+            .unwrap();
+        let psbt = intent.transfer.expect("transfer").partial_psbt;
+
+        let result = maker
+            .submit_signed_psbt(quote.quote_id.clone(), format!("{psbt}|signed"))
+            .await;
+        assert!(matches!(
+            result,
+            Err(RouterError::FeeSlippageExceeded { .. })
+        ));
+        let utxos = maker.utxo_snapshot().await;
+        assert!(matches!(utxos[0].status, InventoryStatus::Available));
+    }
+
+    #[tokio::test]
+    async fn submit_signed_psbt_broadcast_failure_releases_reservation() {
+        let btc = Arc::new(MockBitcoinClient::new());
+        let maker = maker_with_btc(vec![utxo()], btc.clone());
+        let quote = maker
+            .request_quote(quote_request("rfq-1"))
+            .await
+            .unwrap()
+            .expect("quote");
+        let intent = maker
+            .accept_quote(quote.clone(), buy_request(&quote, "rgb:invoice"))
+            .await
+            .unwrap();
+        let psbt = intent.transfer.expect("transfer").partial_psbt;
+
+        btc.fail_next_broadcast("simulated rpc failure");
+        let result = maker
+            .submit_signed_psbt(quote.quote_id.clone(), format!("{psbt}|signed"))
+            .await;
+        assert!(result.is_err());
+        let utxos = maker.utxo_snapshot().await;
+        assert!(matches!(utxos[0].status, InventoryStatus::Available));
+    }
+
+    #[tokio::test]
+    async fn submit_signed_psbt_after_settlement_window_lapse_errors() {
+        // Simulate the taker missing the TAKER_SIGNATURE_TTL_MS window: once
+        // the cleanup loop has released the reservation, submit_signed_psbt
+        // must refuse, drop the stale pending entry, and leave the maker's
+        // UTXO back on Available — no broadcast.
+        let maker = maker();
+        let quote = maker
+            .request_quote(quote_request("rfq-1"))
+            .await
+            .unwrap()
+            .expect("quote");
+        let intent = maker
+            .accept_quote(quote.clone(), buy_request(&quote, "rgb:invoice"))
+            .await
+            .unwrap();
+        let psbt = intent.transfer.expect("transfer").partial_psbt;
+
+        // Stand in for the cleanup loop expiring the settlement window.
+        let reservation_id = maker
+            .store
+            .find_reservation_for_quote(&quote.quote_id)
+            .await
+            .expect("reservation live after accept");
+        maker
+            .store
+            .release_reservation(&reservation_id, now_ms())
+            .await
+            .unwrap();
+
+        let result = maker
+            .submit_signed_psbt(quote.quote_id.clone(), format!("{psbt}|signed"))
+            .await;
+        assert!(result.is_err());
+        let utxos = maker.utxo_snapshot().await;
+        assert!(matches!(utxos[0].status, InventoryStatus::Available));
     }
 
     #[tokio::test]

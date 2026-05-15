@@ -7,6 +7,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use rfq_btc::MockBitcoinClient;
 use rfq_core::is_quote_expired;
 use rfq_maker::MockMaker;
 use rfq_rgb::MockRgbBackend;
@@ -31,6 +32,12 @@ pub struct AcceptQuoteBody {
     pub leg: SwapLeg,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignQuoteBody {
+    /// Base64 PSBT, taker-signed. See `docs/swap-flows.md`.
+    pub signed_psbt: String,
+}
+
 pub fn app() -> Router {
     let maker_id = MakerId("mock-maker-1".to_owned());
     let rgb_asset = AssetId {
@@ -45,7 +52,8 @@ pub fn app() -> Router {
         btc_sats: 0,
     };
     let rgb_backend = Arc::new(MockRgbBackend::new(vec![utxo.clone()]));
-    let maker = Arc::new(MockMaker::new(maker_id, vec![utxo], rgb_backend));
+    let bitcoin_client = Arc::new(MockBitcoinClient::new());
+    let maker = Arc::new(MockMaker::new(maker_id, vec![utxo], rgb_backend, bitcoin_client));
 
     app_with_state(AppState {
         makers: vec![maker],
@@ -58,6 +66,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/rfq", post(create_rfq))
         .route("/quotes/:id/accept", post(accept_quote))
+        .route("/quotes/:id/sign", post(sign_quote))
         .with_state(state)
 }
 
@@ -123,11 +132,31 @@ async fn accept_quote(
     Ok(Json(intent))
 }
 
-// `ConsignmentRejected`, `PsbtInvalid`, and `FeeSlippageExceeded` are declared
-// here as part of 15a's contract surface but only constructed by 15c (`/sign`)
-// and 16b/16c (`/consignment` + sell-side `/sign`). Dead-code allowed until
-// those land.
-#[allow(dead_code)]
+async fn sign_quote(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SignQuoteBody>,
+) -> Result<Json<SettlementIntent>, ApiError> {
+    let quote_id = QuoteId(id);
+    // No `is_quote_expired` check here: past accept the settlement runs on its
+    // own TTL window, which `submit_signed_psbt` enforces internally.
+    let quote = state
+        .store
+        .get_quote(&quote_id)
+        .await
+        .ok_or(ApiError::NotFound)?;
+
+    let maker = state
+        .makers
+        .iter()
+        .find(|maker| maker.maker_id() == quote.maker_id)
+        .ok_or(ApiError::MakerNotFound)?;
+
+    let intent = maker.submit_signed_psbt(quote_id, body.signed_psbt).await?;
+
+    Ok(Json(intent))
+}
+
 #[derive(Debug)]
 enum ApiError {
     BadRequest(String),
@@ -174,6 +203,13 @@ impl From<rfq_router::RouterError> for ApiError {
                 ApiError::BadRequest(error.to_string())
             }
             rfq_router::RouterError::Maker(error) => ApiError::BadRequest(error),
+            rfq_router::RouterError::FeeSlippageExceeded { estimated, actual } => {
+                ApiError::FeeSlippageExceeded { estimated, actual }
+            }
+            rfq_router::RouterError::ConsignmentRejected(msg) => {
+                ApiError::ConsignmentRejected(msg)
+            }
+            rfq_router::RouterError::PsbtInvalid(msg) => ApiError::PsbtInvalid(msg),
         }
     }
 }

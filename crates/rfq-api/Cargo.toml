@@ -7,6 +7,7 @@ version.workspace = true
 [dependencies]
 axum.workspace = true
 http.workspace = true
+rfq-btc = { path = "../rfq-btc" }
 rfq-core = { path = "../rfq-core" }
 rfq-maker = { path = "../rfq-maker" }
 rfq-rgb = { path = "../rfq-rgb" }

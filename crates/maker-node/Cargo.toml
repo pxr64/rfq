@@ -7,6 +7,7 @@ version.workspace = true
 [dependencies]
 axum.workspace = true
 clap.workspace = true
+rfq-btc = { path = "../rfq-btc" }
 rfq-client = { path = "../rfq-client" }
 rfq-maker = { path = "../rfq-maker" }
 rfq-rgb = { path = "../rfq-rgb" }
@@ -14,9 +15,9 @@ rfq-router = { path = "../rfq-router" }
 rfq-store = { path = "../rfq-store" }
 rfq-types = { path = "../rfq-types" }
 rfq-wallet = { path = "../rfq-wallet" }
+serde.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-serde.workspace = true
 serde_json.workspace = true
 tower.workspace = true
