@@ -76,7 +76,7 @@ Define how the mock-only scaffolding becomes a real regtest MVP without leaking 
 
 ## Library-Backed `rfq-rgb` Adapter (Issue #13)
 
-**Status: foundation landed; real swap methods PARKED — issue needs a re-scope.**
+**Status: foundation + `create_invoice` landed; remaining real methods still parked pending a regtest-verifiable session.**
 
 Wrap the proven manual regtest RGB flow behind the `RgbBackend` trait, using
 `rgb-api` + `bp-std` + `bp-wallet` directly (the same libraries `rgb-cmd` builds
@@ -84,7 +84,7 @@ on). Subprocess shell-outs were considered and rejected: brittle text parsing,
 no type safety, no isolation win since the RGB dep graph lives inside `rfq-rgb`
 either way.
 
-**Landed** (commit `664d51a` + #14a):
+**Landed** (commits `664d51a` + #14a + this session):
 
 - `LibRgbBackend` skeleton in `crates/rfq-rgb/src/lib_backend.rs`, with real
   `list_inventory_utxos` (reads the `Stock`) and `validate_invoice`.
@@ -94,11 +94,17 @@ either way.
   `MockRgbBackend`).
 - `rgb-*` / `bp-*` deps stay strictly inside `crates/rfq-rgb`; downstream
   callers import only the `RgbBackend` trait.
+- Real `LibRgbBackend::load_wallet()` (Stock + `Wallet<XpubDerivable, RgbDescr>`
+  via `bpwallet::fs::FsTextStore`) and `LibRgbBackend::resolver()` (Electrum-
+  backed `AnyResolver`, network-checked) — the plumbing every remaining real
+  method depends on.
+- Real `LibRgbBackend::create_invoice`: coin-selects a keychain-9 outpoint,
+  binds a fresh `GraphSeal`, stores the secret seal, emits an `RgbInvoice` via
+  `RgbInvoiceBuilder`. Mirrors `rgb-cmd`'s `Invoice` command.
 
-**Parked** — the five swap methods (`create_invoice`,
-`validate_incoming_consignment`, `create_swap_psbt_buy`,
-`create_swap_psbt_sell`, `finalize_after_taker_sign`) remain stubbed with
-`TODO(#13)`. Reasons it needs a re-scope before being picked up:
+**Still parked** — `validate_incoming_consignment`, `create_swap_psbt_buy`,
+`create_swap_psbt_sell`, `finalize_after_taker_sign` remain stubbed with
+`TODO(#13)`. Reasons they still need a regtest-verifiable session:
 
 - The original issue text predates the atomic-swap design (#15–#22): it
   describes `create_transfer` / `finalize_and_broadcast` / `list_allocations`,

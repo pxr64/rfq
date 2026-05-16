@@ -112,6 +112,30 @@ async fn list_inventory_utxos_returns_per_utxo_outpoints() {
 }
 
 #[tokio::test]
+#[ignore = "requires the regtest stack with a NIA contract + a funded maker keychain-9 outpoint"]
+async fn create_invoice_returns_rgb_invoice_referencing_the_contract() {
+    let Some((backend, asset)) = lib_backend() else {
+        return;
+    };
+
+    let invoice = backend
+        .create_invoice(&asset, 100)
+        .await
+        .expect("create_invoice should succeed against a live wallet");
+
+    assert!(
+        invoice.starts_with("rgb:"),
+        "expected an rgb: invoice, got `{invoice}`"
+    );
+    // The contract id is BAID-encoded inside the invoice; the substring check
+    // is a coarse smoke test that the binding actually happened.
+    assert!(
+        invoice.contains(&asset.id) || invoice.contains(&asset.id[4..]),
+        "invoice should reference the contract id; got `{invoice}`"
+    );
+}
+
+#[tokio::test]
 #[ignore = "blocked on LibRgbBackend::create_swap_psbt_buy (issue #13); flip when impl lands"]
 async fn create_swap_psbt_buy_produces_psbt_and_consignment() {
     let Some((backend, _asset)) = lib_backend() else {

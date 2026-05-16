@@ -4,11 +4,18 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, SwapTransfer};
 
+use bpstd::{Network, Sats, XpubDerivable};
+use bpwallet::fs::FsTextStore;
+use bpwallet::Wallet;
 use rgb::contract::FilterIncludeAll;
-use rgb::invoice::RgbInvoice;
-use rgb::persistence::Stock;
+use rgb::invoice::{Beneficiary, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgb::persistence::fs::FsBinStore;
-use rgb::ContractId;
+use rgb::persistence::Stock;
+use rgb::resolvers::AnyResolver;
+use rgb::validation::ResolveWitness;
+use rgb::{
+    ChainNet, ContractId, GraphSeal, RgbDescr, RgbKeychain, RgbWallet, StateType,
+};
 
 use crate::{ConsignmentInfo, FinalizedSwap, RgbBackend, RgbError, TxOut};
 
@@ -20,10 +27,11 @@ use crate::{ConsignmentInfo, FinalizedSwap, RgbBackend, RgbError, TxOut};
 /// --wpkh ...` are reusable without re-import.
 pub struct LibRgbBackend {
     data_dir: PathBuf,
-    #[allow(dead_code)] // reserved for upcoming create_transfer + finalize work
     wallet_name: String,
     network: String,
-    #[allow(dead_code)] // reserved for finalize_and_broadcast (electrum resolver)
+    // Wired into the resolver below; consumed by `validate_incoming_consignment`
+    // + the swap-PSBT methods (next #13 session).
+    #[allow(dead_code)]
     electrum_url: String,
 }
 
@@ -42,14 +50,71 @@ impl LibRgbBackend {
         }
     }
 
+    /// Stock lives at `<data_dir>/<network>/` — same layout rgb-cmd's
+    /// `GeneralOpts::base_dir()` resolves to, so existing stashes are reusable.
     fn stock_path(&self) -> PathBuf {
         self.data_dir.join(&self.network)
+    }
+
+    /// Wallet sits one level below the stock dir, keyed by wallet name —
+    /// mirrors rgb-cmd's `GeneralOpts::wallet_dir(name)`.
+    fn wallet_path(&self) -> PathBuf {
+        self.stock_path().join(&self.wallet_name)
     }
 
     fn load_stock(&self) -> Result<Stock, RgbError> {
         let provider = FsBinStore::new(self.stock_path())
             .map_err(|e| RgbError::StashLoad(e.to_string()))?;
         Stock::load(provider, true).map_err(|e| RgbError::StashLoad(e.to_string()))
+    }
+
+    /// Load the full RGB wallet: a `bp-wallet` `Wallet<XpubDerivable, RgbDescr>`
+    /// wrapped with the maker's `Stock`. The wallet descriptor must already
+    /// exist on disk (e.g. via `make rgb-wallets-init` + `rgb create --wpkh`).
+    fn load_wallet(&self) -> Result<RgbWallet<Wallet<XpubDerivable, RgbDescr>>, RgbError> {
+        let stock = self.load_stock()?;
+        let provider = FsTextStore::new(self.wallet_path())
+            .map_err(|e| RgbError::StashLoad(format!("wallet provider: {e}")))?;
+        let wallet: Wallet<XpubDerivable, RgbDescr> = Wallet::load(provider, true)
+            .map_err(|e| RgbError::StashLoad(format!("wallet load: {e}")))?;
+        Ok(RgbWallet::new(stock, wallet))
+    }
+
+    /// Construct an Electrum-backed witness resolver pinned to the configured
+    /// network. Mirrors `rgb-cmd`'s `RgbArgs::resolver`. Consumed by
+    /// `validate_incoming_consignment` + the swap-PSBT methods (next session).
+    #[allow(dead_code)]
+    fn resolver(&self) -> Result<AnyResolver, RgbError> {
+        let network = self.parse_network()?;
+        let resolver = AnyResolver::electrum_blocking(&self.electrum_url, None)
+            .map_err(|e| RgbError::StashLoad(format!("resolver: {e}")))?;
+        resolver
+            .check_chain_net(chain_net_for(network))
+            .map_err(|e| RgbError::StashLoad(format!("resolver chain check: {e}")))?;
+        Ok(resolver)
+    }
+
+    #[allow(dead_code)]
+    fn parse_network(&self) -> Result<Network, RgbError> {
+        match self.network.as_str() {
+            "mainnet" | "bitcoin" => Ok(Network::Mainnet),
+            "regtest" => Ok(Network::Regtest),
+            "signet" => Ok(Network::Signet),
+            "testnet" | "testnet3" => Ok(Network::Testnet3),
+            "testnet4" => Ok(Network::Testnet4),
+            other => Err(RgbError::StashLoad(format!("unknown network `{other}`"))),
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn chain_net_for(network: Network) -> ChainNet {
+    match network {
+        Network::Mainnet => ChainNet::BitcoinMainnet,
+        Network::Regtest => ChainNet::BitcoinRegtest,
+        Network::Signet => ChainNet::BitcoinSignet,
+        Network::Testnet3 => ChainNet::BitcoinTestnet3,
+        Network::Testnet4 => ChainNet::BitcoinTestnet4,
     }
 }
 
@@ -123,14 +188,59 @@ impl RgbBackend for LibRgbBackend {
         ))
     }
 
-    async fn create_invoice(&self, _asset: &AssetId, _amount: u64) -> Result<String, RgbError> {
-        // TODO(#13): mint via rgb-api's invoice builder against the maker's
-        // contract + a fresh seal UTXO.
-        Err(RgbError::TransferBuild(
-            "LibRgbBackend::create_invoice is not implemented yet (issue #13); \
-             use MockRgbBackend for now"
-                .to_owned(),
-        ))
+    async fn create_invoice(&self, asset: &AssetId, amount: u64) -> Result<String, RgbError> {
+        // Mirrors rgb-cmd's `Invoice` command for the blinded-seal / fungible
+        // case: coin-select a seal-anchor outpoint (keychain 9), bind a fresh
+        // graph seal to it, store it in the maker's stash, and emit an
+        // `RgbInvoice` against the contract for `amount`. Real cryptographic
+        // material — meaningful only with a live regtest/electrum stack.
+        let mut wallet = self.load_wallet()?;
+        let contract_id = ContractId::from_str(&asset.id)
+            .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
+
+        let outpoint = wallet
+            .wallet()
+            .coinselect(Sats::ZERO, |utxo| {
+                RgbKeychain::contains_rgb(utxo.terminal.keychain)
+            })
+            .next()
+            .ok_or_else(|| {
+                RgbError::TransferBuild(
+                    "no seal-anchor outpoint available; fund a keychain-9 address \
+                     (see docs/regtest-rgb20-nia-dev-infra.md)"
+                        .to_owned(),
+                )
+            })?;
+
+        let network = wallet.wallet().network();
+        let seal = GraphSeal::new_random(outpoint.txid, outpoint.vout);
+        wallet
+            .stock_mut()
+            .store_secret_seal(seal)
+            .map_err(|e| RgbError::TransferBuild(format!("store seal: {e}")))?;
+        let beneficiary = Beneficiary::BlindedSeal(seal.to_secret_seal());
+
+        let mut builder = RgbInvoiceBuilder::new(XChainNet::bitcoin(network, beneficiary))
+            .set_contract(contract_id)
+            .set_amount_raw(amount);
+
+        // For NIA-like single-assignment fungible contracts the assignment
+        // name is unambiguous; fall back to leaving it unset (the invoice
+        // remains usable, just less strictly typed) for ambiguous schemas.
+        if let Ok(contract) = wallet.stock().contract_data(contract_id) {
+            let assignment_types = contract
+                .schema
+                .assignment_types_for_state(StateType::Fungible);
+            if assignment_types.len() == 1 {
+                let name = contract
+                    .schema
+                    .assignment_name(*assignment_types[0])
+                    .clone();
+                builder = builder.set_assignment_name(name);
+            }
+        }
+
+        Ok(builder.finish().to_string())
     }
 
     async fn validate_incoming_consignment(
