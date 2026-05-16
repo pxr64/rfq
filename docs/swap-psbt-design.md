@@ -14,6 +14,42 @@ implement to un-mock the swap path.
 - `create_swap_psbt_sell(&consignment_info, &taker_rgb_prevouts, &maker_btc_inputs, …) -> SwapTransfer`
 - `finalize_after_taker_sign(signed_psbt_base64, original_consignment_base64) -> FinalizedSwap`
 
+## Trait-method timeline
+
+Where each trait method fires in the broader protocol. `MakerNode` is the
+process holding `LibRgbBackend`; `Taker` is the counterparty.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as Taker
+    participant N as MakerNode<br/>(LibRgbBackend)
+
+    Note over T,N: Buy side
+    T->>N: ACCEPT { rgb_invoice }
+    N->>N: create_swap_psbt_buy(...)<br/>→ partial PSBT (maker RGB inputs,<br/>SIGHASH_ALL\|ANYONECANPAY) + consignment
+    N->>T: SwapTransfer { partial_psbt, consignment,<br/>expected_witness_txid=None }
+    T->>T: add BTC inputs, sign everything
+    T->>N: SIGN_PSBT { signed_psbt }
+    N->>N: finalize_after_taker_sign(...)<br/>→ rgb_commit + extract witness tx +<br/>witness-extended consignment
+    N->>T: FinalizedSwap { raw_tx, witness_txid, final_consignment }
+
+    Note over T,N: Sell side
+    T->>N: ACCEPT { btc_payout_addr } (then INVOICE round trip)
+    T->>N: DELIVER_CONSIGNMENT { consignment }
+    N->>N: validate_incoming_consignment(...)  ✅ done
+    N->>N: create_swap_psbt_sell(...)<br/>→ PSBT (taker RGB inputs unsigned +<br/>maker BTC inputs SIGHASH_ALL) +<br/>expected_witness_txid (stable)
+    N->>T: SwapTransfer { partial_psbt, consignment=None,<br/>expected_witness_txid=Some }
+    T->>T: sign taker RGB inputs
+    T->>N: SIGN_PSBT { signed_psbt }
+    N->>N: finalize_after_taker_sign(...)
+    N->>T: FinalizedSwap { raw_tx, witness_txid, final_consignment }
+```
+
+The three methods together carry the swap from "taker accepted" to "tx ready
+to broadcast." Everything else in the swap flow is already implemented (mock
+or real).
+
 ## Why this is composition, not a port
 
 `rgb-cmd 0.11.1-rc.6` is the canonical example we've mirrored everywhere

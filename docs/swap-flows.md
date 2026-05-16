@@ -13,19 +13,20 @@ This document is the canonical spec for the buy-side (taker buys RGB with BTC) a
 
 ## Buy side: taker buys RGB with BTC
 
-```
-1. Taker            generates RGB invoice (blinded seal where RGB lands)
-2. Taker  → Maker   ACCEPT { rgb_invoice }
-3. Maker            selects RGB inventory, builds RGB state transition,
-                    constructs PSBT with: maker RGB inputs +
-                    outputs[taker RGB seal, maker BTC payout, maker change],
-                    signs maker (RGB) inputs, attaches consignment
-4. Maker  → Taker   PSBT (maker-signed half) + consignment
-5. Taker            validates consignment against own Stock, adds own BTC
-                    funding inputs + own BTC change output, signs BTC inputs
-6. Taker  → Maker   SIGN_PSBT { signed_psbt }
-7. Maker            finalizes PSBT, broadcasts witness tx
-8. Maker  → Taker   FINAL_STATE { witness_txid, witness_extended_consignment }
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as Taker
+    participant M as Maker
+
+    T->>T: generate RGB invoice<br/>(blinded seal where RGB lands)
+    T->>M: ACCEPT { rgb_invoice }
+    M->>M: select RGB inventory, build RGB transition,<br/>construct PSBT (maker RGB inputs + outputs:<br/>taker RGB seal, maker RGB change?, rgb commitment),<br/>sign maker RGB inputs, build consignment
+    M->>T: PSBT (maker-signed half) + consignment
+    T->>T: validate consignment against own Stock,<br/>add own BTC inputs + change, sign BTC inputs
+    T->>M: SIGN_PSBT { signed_psbt }
+    M->>M: finalize PSBT, broadcast witness tx
+    M->>T: FINAL_STATE { witness_txid,<br/>witness_extended_consignment }
 ```
 
 ### Key properties
@@ -36,17 +37,12 @@ This document is the canonical spec for the buy-side (taker buys RGB with BTC) a
 
 ### Inventory transitions (maker side)
 
-```
-Available  ──quote──►  Reserved
-                          │
-                          ▼ accept
-                       (still Reserved, settlement metadata = AwaitingTakerSignature)
-                          │
-                          ▼ /sign (taker submits)
-                       PendingBitcoinConfirm
-                          │
-                          ▼ N confirms
-                       Spent
+```mermaid
+stateDiagram-v2
+    Available --> Reserved: quote
+    Reserved --> Reserved: accept<br/>(settlement = AwaitingTakerSignature)
+    Reserved --> PendingBitcoinConfirm: /sign
+    PendingBitcoinConfirm --> Spent: N confirms
 ```
 
 Failure transitions: `mark_broadcast_failed` (release) at any pre-broadcast failure; `mark_reorged` if the witness tx gets dropped.
@@ -55,27 +51,23 @@ Failure transitions: `mark_broadcast_failed` (release) at any pre-broadcast fail
 
 Three round trips after `accept` (vs. two on buy side) — the maker needs the consignment before it can build the PSBT inputs.
 
-```
-1. Taker  → Maker   ACCEPT { btc_payout_addr, [rgb_change_invoice] }
-2. Maker            reserves BTC inventory + RGB invoice seal,
-                    generates RGB invoice (where RGB lands on maker side)
-3. Maker  → Taker   INVOICE { maker_rgb_invoice }
-4. Taker            builds consignment from taker's allocations to
-                    maker_rgb_invoice seal (uses taker's Stock)
-5. Taker  → Maker   DELIVER_CONSIGNMENT { consignment }
-6. Maker            validates consignment against own Stock,
-                    extracts taker's RGB-bearing outpoints from consignment,
-                    fetches Bitcoin prevout data via BitcoinClient::get_outpoint,
-                    constructs PSBT with: taker RGB-bearing inputs + maker BTC inputs +
-                    outputs[maker RGB seal, taker BTC payout, maker BTC change,
-                            taker RGB change if any],
-                    signs maker BTC inputs
-7. Maker  → Taker   PSBT (maker-signed half)
-8. Taker            verifies PSBT (matches consignment, payout addr, amounts),
-                    signs RGB-bearing inputs (taker's bitcoin inputs that hold RGB)
-9. Taker  → Maker   SIGN_PSBT { signed_psbt }
-10. Maker           finalizes PSBT, broadcasts witness tx
-11. Maker → Taker   FINAL_STATE { witness_txid, witness_extended_consignment }
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as Taker
+    participant M as Maker
+
+    T->>M: ACCEPT { btc_payout_addr, [rgb_change_invoice] }
+    M->>M: reserve BTC inventory + RGB invoice seal,<br/>generate maker RGB invoice
+    M->>T: INVOICE { maker_rgb_invoice }
+    T->>T: build consignment from taker allocations<br/>to maker_rgb_invoice seal
+    T->>M: DELIVER_CONSIGNMENT { consignment }
+    M->>M: validate consignment against own Stock,<br/>extract taker RGB outpoints,<br/>fetch prevouts via BitcoinClient::get_outpoint,<br/>build PSBT (taker RGB inputs + maker BTC inputs +<br/>outputs: maker RGB seal, taker BTC payout,<br/>maker BTC change, taker RGB change?),<br/>sign maker BTC inputs
+    M->>T: PSBT (maker-signed half)
+    T->>T: verify PSBT (matches consignment,<br/>payout addr, amounts),<br/>sign RGB-bearing inputs
+    T->>M: SIGN_PSBT { signed_psbt }
+    M->>M: finalize PSBT, broadcast witness tx
+    M->>T: FINAL_STATE { witness_txid,<br/>witness_extended_consignment }
 ```
 
 ### Key properties
@@ -90,20 +82,13 @@ Three round trips after `accept` (vs. two on buy side) — the maker needs the c
 
 Sell side uses BTC inventory (see [#20](https://github.com/pxr64/rfq/issues/20)) and does not consume RGB inventory.
 
-```
-Available  ──quote──►  Reserved (BTC)
-                          │
-                          ▼ accept
-                       Reserved (BTC), settlement metadata = AwaitingConsignment
-                          │
-                          ▼ /consignment (taker submits valid consignment)
-                       Reserved (BTC), settlement metadata = AwaitingTakerSignature
-                          │
-                          ▼ /sign (taker submits signed PSBT)
-                       PendingBitcoinConfirm
-                          │
-                          ▼ N confirms
-                       Spent
+```mermaid
+stateDiagram-v2
+    Available --> Reserved: quote
+    Reserved --> Reserved: accept<br/>(AwaitingConsignment)
+    Reserved --> Reserved: /consignment<br/>(AwaitingTakerSignature)
+    Reserved --> PendingBitcoinConfirm: /sign
+    PendingBitcoinConfirm --> Spent: N confirms
 ```
 
 ## Endpoints
@@ -124,25 +109,22 @@ The broker exposes four RFQ endpoints (plus existing `/quotes` for quote request
 
 ## Settlement state machine
 
-```
-                  Pending
-                    │ quote
-                    ▼
-                 Accepted ────────────────► Failed
-                    │
-        ┌───────────┴───────────┐
-        │ buy                   │ sell
-        ▼                       ▼
-   AwaitingTakerSignature   AwaitingConsignment
-        │                       │ deliver_consignment
-        │ submit_signed_psbt    ▼
-        │                  AwaitingTakerSignature
-        │                       │ submit_signed_psbt
-        ▼                       ▼
-   PendingBitcoinConfirm ◄──────┘
-        │ N confirms
-        ▼
-     Settled
+```mermaid
+stateDiagram-v2
+    [*] --> Pending: quote requested
+    Pending --> Accepted: accept_quote
+    Accepted --> AwaitingTakerSignature: buy
+    Accepted --> AwaitingConsignment: sell
+    AwaitingConsignment --> AwaitingTakerSignature: deliver_consignment
+    AwaitingTakerSignature --> PendingBitcoinConfirm: submit_signed_psbt
+    PendingBitcoinConfirm --> Settled: N confirms
+    Pending --> Failed
+    Accepted --> Failed
+    AwaitingConsignment --> Failed
+    AwaitingTakerSignature --> Failed
+    PendingBitcoinConfirm --> Failed
+    Settled --> [*]
+    Failed --> [*]
 ```
 
 Each waiting state has a TTL — see Timeouts below. Overlap with [#9](https://github.com/pxr64/rfq/issues/9) (settlement state machine).
