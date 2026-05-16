@@ -61,7 +61,7 @@ SIGHASH_ALL across the whole PSBT.
 
 Atomic swap PSBTs are two-party. There's no convenience wrapper for that
 shape; `pay()` covers the unilateral case and stops. But every primitive we
-need *is* publicly available — bp-std exposes `Psbt::new` + manual
+need *is* publicly available — bp-std exposes `Psbt::from_tx` + manual
 input/output construction + per-input `sighash_type`, bp-wallet's `psbt.sign(&signer)`
 naturally signs only inputs whose keys the signer holds (so partial signing
 falls out for free), and rgb-api exposes the RGB transition builder + the
@@ -156,16 +156,31 @@ Trait signature picks up a new `btc_funding_addr` parameter (lives on
        builder = builder.add_fungible_state_raw(..., maker_change_seal, sum_inputs - amount)
    main = builder.complete_transition()
    batch = Batch { main, extras: empty }
-8. // Build the bp-std PSBT manually
-   psbt = Psbt::new(version)
-   for each (outpoint, txout) in maker_rgb_inputs ++ selection.chosen:
-       psbt.add_input(outpoint, txout, sighash_type = SIGHASH_ALL)
-   psbt.add_output(taker_rgb_seal_script, 0)                    // RGB seal, dust
-   psbt.add_output(maker_btc_payout_script, quote.price)        // maker BTC receive
-   psbt.add_output(btc_funding_addr_script, taker_change_sats)  // taker BTC change → same addr
-   if maker_rgb_change > 0:
-       psbt.add_output(maker_rgb_change_seal_script, 0)
-   psbt.add_output(rgb_commitment_output)                       // opret or tapret
+8. // Build the bp-std PSBT via Psbt::from_tx (see U3).
+   //   `Psbt::create` exists too but `Psbt.inputs` is pub(crate); only
+   //   from_tx accepts a caller-supplied input set without going through
+   //   bp-wallet's PsbtConstructor (which would re-pick funding).
+   unsigned_tx = UnsignedTx {
+       version: TxVer::V2,
+       inputs: maker_rgb_inputs ++ selection.chosen → UnsignedTxIn,
+       outputs: [
+           TxOut(taker_rgb_seal_script,   Sats::ZERO),           // RGB seal, dust
+           TxOut(maker_btc_payout_script, quote.price),          // maker BTC receive
+           TxOut(btc_funding_addr_script, taker_change_sats),    // taker BTC change → same addr
+           // + TxOut(maker_rgb_change_seal_script, Sats::ZERO) if over-selected
+           // + rgb commitment output (opret/tapret) — produced via psbt.set_rgb_close_method
+       ],
+       lock_time: LockTime::ZERO,
+   };
+   psbt = Psbt::from_tx(unsigned_tx);
+   // Enrich each input through psbt.input_mut(i):
+   //   - witness_utxo (the Prevout we already have from inventory + list_unspent)
+   //   - sighash_type = SighashType::all_standard()
+   //   - for maker-keyed inputs: bip32_derivation + witness_script +
+   //     tap_internal_key from maker_descriptor.derive(keychain, idx)
+   //   - for taker-keyed inputs: leave bip32 empty; taker's signer scans
+   //     its own keys against witness_utxo.script_pubkey at /sign time
+   psbt.complete_construction()  // pay.rs:499 — required before rgb_embed
 9. psbt.set_rgb_close_method(close_method); psbt.rgb_embed(batch)?
 10. // Sign ONLY the maker's RGB inputs (psbt.sign skips inputs the
     //   signer's keys don't cover — taker BTC inputs are left unsigned)
@@ -213,20 +228,26 @@ inputs left to sign.
        builder = builder.add_fungible_state_raw(..., change_seal, surplus)
    main = builder.complete_transition()
    batch = Batch { main, extras: empty }
-5. // Build the bp-std PSBT
-   psbt = Psbt::new(version)
-   // taker RGB inputs (unsigned, no sighash flag yet — taker chooses)
-   for each (outpoint, txout) in taker_rgb_prevouts:
-       psbt.add_input(outpoint, txout, sighash_type = ALL)
-   // maker BTC inputs (will be signed below)
-   for each (outpoint, txout) in maker_btc_inputs:
-       psbt.add_input(outpoint, txout, sighash_type = ALL)
-   psbt.add_output(maker_rgb_seal_script, 0)
-   psbt.add_output(btc_payout_addr_script, gross_btc_sats - actual_fee_sats)
-   psbt.add_output(maker_btc_change_script, sum(maker_btc_inputs.values) - gross_btc_sats)
-   if rgb_change_invoice.is_some():
-       psbt.add_output(taker_rgb_change_seal_script, 0)
-   psbt.add_output(rgb_commitment_output)
+5. // Build the bp-std PSBT via Psbt::from_tx (same shape as buy — see U3).
+   unsigned_tx = UnsignedTx {
+       version: TxVer::V2,
+       inputs: taker_rgb_prevouts ++ maker_btc_inputs → UnsignedTxIn,
+       outputs: [
+           TxOut(maker_rgb_seal_script, Sats::ZERO),
+           TxOut(btc_payout_addr_script, gross_btc_sats - actual_fee_sats),
+           TxOut(maker_btc_change_script, sum(maker_btc_inputs.values) - gross_btc_sats),
+           // + TxOut(taker_rgb_change_seal_script, Sats::ZERO) if rgb_change_invoice
+           // + rgb commitment output
+       ],
+       lock_time: LockTime::ZERO,
+   };
+   psbt = Psbt::from_tx(unsigned_tx);
+   // Enrich each input via psbt.input_mut(i):
+   //   - witness_utxo, sighash_type = SighashType::all_standard()
+   //   - for maker BTC inputs: bip32_derivation + witness_script + tap_internal_key
+   //     from maker_descriptor.derive(...)
+   //   - for taker RGB inputs: leave bip32 empty; taker fills at /sign
+   psbt.complete_construction()
 6. psbt.set_rgb_close_method(close_method)
 7. psbt.rgb_embed(batch)?
 8. // Sign ONLY the maker's BTC inputs — the taker signs its RGB inputs at /sign
@@ -379,13 +400,57 @@ With declared-funding both sides use plain `SIGHASH_ALL` on every input.
 bp-std's per-input `sighash_type` field is still there if we ever need it,
 but we don't.
 
-### U3 — Manual PSBT input construction without coin-selection
+### ~~U3~~ — resolved: bypass bp-wallet's `PsbtConstructor` via `Psbt::from_tx`
 
-`pay.rs` always calls `self.construct_psbt(prev_outpoints, beneficiaries,
-params.tx)` which is bp-wallet's `PsbtConstructor` trait. That trait does
-coin-selection internally. We want to skip coin-selection entirely (caller
-supplied every input). Need to find the bp-std `Psbt::new` / `add_input`
-path that bypasses `PsbtConstructor`. Same on both sides now.
+Two layers of "selection" — keep one, skip the other:
+
+- **App-layer (kept)**: `GreedyLargestFirstSelector` in
+  [`crates/rfq-store/src/btc.rs`](../crates/rfq-store/src/btc.rs) picks
+  which UTXOs we want to spend (from `bitcoin_client.list_unspent(addr)`
+  on buy side, from the maker's BTC inventory on sell side).
+- **PSBT-layer (skipped)**: bp-wallet's `PsbtConstructor::construct_psbt`
+  takes prev_outpoints + a fee target and *adds more funding inputs from
+  the calling wallet's UTXO set*. Useful for unilateral transfers; wrong
+  for atomic swap (either over-funds from the maker or panics trying to
+  derive non-maker outpoints from the maker's descriptor).
+
+The `psbt` crate's `Psbt.inputs` is `pub(crate)`, so we can't push inputs
+into a `Psbt::create()` from outside. The public constructor that
+*does* take a caller-specified input set is **`Psbt::from_tx(unsigned_tx)`**.
+The pattern:
+
+```rust
+// 1. Build the bp-std UnsignedTx with every input + every output up front.
+let unsigned_tx = UnsignedTx {
+    version: TxVer::V2,
+    inputs:  /* maker inputs + taker inputs as UnsignedTxIn */,
+    outputs: /* every TxOut: RGB seal, BTC payout, change, commitment */,
+    lock_time: LockTime::ZERO,
+};
+
+// 2. Bare Psbt — every Input has `previous_outpoint` set, nothing else.
+let mut psbt = Psbt::from_tx(unsigned_tx);
+
+// 3. Enrich each input via psbt.input_mut(i). Fields are pub:
+//    witness_utxo, sighash_type, bip32_derivation, witness_script,
+//    tap_internal_key, tap_bip32_derivation. For maker-controlled inputs
+//    derive descriptor data; for taker-controlled inputs leave bip32
+//    empty and only set witness_utxo + sighash_type (the taker's signer
+//    scans its own keys against witness_utxo.script_pubkey).
+```
+
+One detail to verify in B1: `pay.rs:499` calls `psbt.complete_construction()`
+before `psbt.rgb_embed(batch)`. `Psbt::from_tx` skips that call. Probably
+required (it flips `tx_modifiable` flags); easy to add and test.
+
+#### Deps — no `bitcoin` / `rust-bitcoin`
+
+All the types we need (`UnsignedTx`, `UnsignedTxIn`, `Tx`, `TxOut`,
+`Outpoint`, `Sats`, `TxVer`, `SeqNo`, `LockTime`, `VarIntArray`,
+`ScriptPubkey`, `Psbt`, `Input`, `Output`, `SighashType`) are accessible
+through `bp-std`, which we already pin. **Do not** pull in the
+`bitcoin`/`rust-bitcoin` crate — its types look the same but are
+incompatible with rgb-api's `bp-*` flavor.
 
 ### U4 — `psbt.rgb_commit()` shape with multi-signer inputs
 
@@ -431,8 +496,11 @@ seeds a map; the trait method returns from it.
 When we pick this up:
 
 - **Phase B1 — Plumbing** (expanded by the declared-funding redesign):
-  - Locate bp-std's `Psbt::new` / `add_input` / `add_output` path that
-    bypasses `PsbtConstructor` (resolves U3).
+  - PSBT construction via `Psbt::from_tx(unsigned_tx)` + per-input
+    enrichment through `psbt.input_mut(i)` (resolved by U3 — see that
+    section for the recipe). Single small wrapper helper in
+    `LibRgbBackend` probably worth extracting since both create_swap_psbt
+    methods use the same pattern.
   - `LibRgbBackend::load_signer()` reading `RGB_SIGNER_ACCOUNT_FILE` +
     `RGB_SIGNER_PASSWORD`; add both env vars to `RgbConfig` (resolves U6).
   - Add `BitcoinClient::list_unspent(addr)` to the `rfq-btc` trait, with
