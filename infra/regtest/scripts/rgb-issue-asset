@@ -41,7 +41,12 @@ fi
 # same across stashes once the same schema file is imported — we read it back
 # rather than hard-coding so the template survives schema-file updates.
 echo "looking up imported schema id..."
-schema_id="$(rgb_issuer schemata 2>/dev/null | awk '/^[A-Za-z0-9+\/=_~-]+#/{print $1; exit}')"
+# `rgb schemata` prints rows like:
+#   NonInflatableAsset    rgb:sch:RWhw...#remote-digital-pegasus
+# The contract YAML wants the bare `<base64>#<label>` form (no `rgb:sch:`
+# scheme), which is the longest token containing `#`. Match anything that
+# isn't whitespace or `:` (the scheme separator), then `#`, then a label.
+schema_id="$(rgb_issuer schemata 2>/dev/null | grep -oE '[^[:space:]:]+#[^[:space:]]+' | head -n1)"
 if [[ -z "$schema_id" ]]; then
   echo "could not parse schema id from \`rgb_issuer schemata\`. Raw output:" >&2
   rgb_issuer schemata >&2 || true
