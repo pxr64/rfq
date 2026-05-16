@@ -20,20 +20,20 @@ sequenceDiagram
     participant M as Maker
 
     T->>T: generate RGB invoice<br/>(blinded seal where RGB lands)
-    T->>M: ACCEPT { rgb_invoice }
-    M->>M: select RGB inventory, build RGB transition,<br/>construct PSBT (maker RGB inputs + outputs:<br/>taker RGB seal, maker RGB change?, rgb commitment),<br/>sign maker RGB inputs, build consignment
+    T->>M: ACCEPT { rgb_invoice, btc_funding_addr }
+    M->>M: list_unspent(btc_funding_addr) via electrum,<br/>select RGB inventory + taker BTC inputs,<br/>build PSBT (maker RGB + taker BTC inputs +<br/>outputs: taker RGB seal, maker BTC payout,<br/>taker BTC change → btc_funding_addr,<br/>maker RGB change?, rgb commitment),<br/>sign maker RGB inputs (SIGHASH_ALL),<br/>emit consignment with stable witness_id
     M->>T: PSBT (maker-signed half) + consignment
-    T->>T: validate consignment against own Stock,<br/>add own BTC inputs + change, sign BTC inputs
+    T->>T: validate consignment, verify PSBT shape,<br/>sign BTC inputs (SIGHASH_ALL) — no restructuring
     T->>M: SIGN_PSBT { signed_psbt }
-    M->>M: finalize PSBT, broadcast witness tx
+    M->>M: extract witness tx, broadcast
     M->>T: FINAL_STATE { witness_txid,<br/>witness_extended_consignment }
 ```
 
 ### Key properties
 
-- **Maker never touches taker BTC source.** No `btc_funding_addr` on the wire. The maker's PSBT in step 3 contains only its RGB inputs and the three outputs (taker RGB seal, maker BTC payout, maker change). The taker adds its own BTC inputs + change output during signing in step 5. This is standard BIP 174 PSBT incremental construction.
-- **Taker pays the fee, by construction.** Maker's outputs are exactly `quote.price` to itself. The fee is whatever the taker contributes in BTC inputs minus their own change minus the maker's payout. No fee field needs to leave the taker side.
-- **Witness txid is pre-computable after step 6.** Once all inputs are present and segwit-only, the txid is fixed. The maker uses this to stamp `PendingBitcoinConfirm` on its RGB reservation before the actual broadcast in step 7.
+- **Declared funding, not declared inputs.** The taker sends a single `btc_funding_addr` in `ACCEPT`. The maker calls `BitcoinClient::list_unspent(addr)` to discover that address's UTXOs and runs `GreedyLargestFirstSelector` to pick enough to cover `quote.price + actual_fee_sats`. Taker BTC change goes back to the same `btc_funding_addr`. This trades a small privacy concession (maker sees the funding address) for substantially simpler wallet integration: the taker's signer only ever sees "sign these inputs," never "compose a new input set + change output."
+- **Input set is final at step 3.** All inputs (maker RGB + taker BTC) are present when the maker signs at PSBT-build time, so SIGHASH_ALL works for every input. Witness txid is stable from step 3 — the maker stamps `PendingBitcoinConfirm` on its RGB reservation and ships a real consignment (with the correct witness_id) at step 4.
+- **Taker pays the fee, by construction.** Maker BTC payout output = `quote.price`. Taker BTC change output = `sum(selected_taker_btc_inputs) − quote.price − actual_fee_sats`. The maker computes the exact fee at PSBT-build (no taker-side fee math).
 
 ### Inventory transitions (maker side)
 

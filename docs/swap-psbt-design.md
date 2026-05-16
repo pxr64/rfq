@@ -26,12 +26,12 @@ sequenceDiagram
     participant N as MakerNode<br/>(LibRgbBackend)
 
     Note over T,N: Buy side
-    T->>N: ACCEPT { rgb_invoice }
-    N->>N: create_swap_psbt_buy(...)<br/>→ partial PSBT (maker RGB inputs,<br/>SIGHASH_ALL\|ANYONECANPAY) + consignment
-    N->>T: SwapTransfer { partial_psbt, consignment,<br/>expected_witness_txid=None }
-    T->>T: add BTC inputs, sign everything
+    T->>N: ACCEPT { rgb_invoice, btc_funding_addr }
+    N->>N: create_swap_psbt_buy(...)<br/>→ list_unspent(btc_funding_addr),<br/>build complete PSBT (maker RGB + taker BTC,<br/>SIGHASH_ALL), sign maker RGB inputs,<br/>rgb_commit + stock.transfer (witness_id stable)
+    N->>T: SwapTransfer { partial_psbt, consignment,<br/>expected_witness_txid=Some }
+    T->>T: sign taker BTC inputs (no restructuring)
     T->>N: SIGN_PSBT { signed_psbt }
-    N->>N: finalize_after_taker_sign(...)<br/>→ rgb_commit + extract witness tx +<br/>witness-extended consignment
+    N->>N: finalize_after_taker_sign(...)<br/>→ extract witness tx (consignment + witness_id<br/>already shipped at step 4)
     N->>T: FinalizedSwap { raw_tx, witness_txid, final_consignment }
 
     Note over T,N: Sell side
@@ -81,15 +81,21 @@ The shape each side's PSBT must have at every stage of the protocol.
 
 ```
 PSBT after create_swap_psbt_buy (returned to taker):
-  inputs:   [ maker_rgb_in_1, …, maker_rgb_in_N ]   ← maker-signed, SIGHASH_ANYONECANPAY|SINGLE
-  outputs:  [ taker_rgb_seal, maker_rgb_change?, rgb_commitment ]
-  sighashes: maker inputs use ANYONECANPAY so taker-added inputs don't invalidate
-  witness_txid: deferred (taker still adds BTC inputs)
+  inputs:   [ maker_rgb_in_1, …, maker_rgb_in_N,   ← maker-signed, SIGHASH_ALL
+              taker_btc_in_1, …, taker_btc_in_M ]  ← unsigned (taker signs at /sign)
+  outputs:  [ taker_rgb_seal,
+              maker_btc_payout (= quote.price),
+              taker_btc_change (→ btc_funding_addr),
+              maker_rgb_change?,
+              rgb_commitment ]
+  sighashes: every input SIGHASH_ALL — full input set known at build time
+  witness_txid: STABLE — emitted as expected_witness_txid + baked into the
+                consignment shipped at step 4
 
 PSBT after taker /sign (handed back to maker):
-  inputs:   [ maker_rgb_in_*, taker_btc_in_1, …, taker_btc_in_M ]
-  outputs:  [ taker_rgb_seal, maker_rgb_change?, rgb_commitment, taker_btc_change? ]
-  sighashes: all inputs fully signed; witness_txid now fixed
+  inputs:   same set, taker BTC inputs now signed
+  outputs:  unchanged
+  witness_txid: unchanged (witness data isn't in segwit txid)
 ```
 
 ### Sell side
@@ -108,16 +114,21 @@ PSBT after taker /sign (handed back to maker):
   witness_txid: must equal expected_witness_txid (the maker rejects if it drifts)
 ```
 
-The asymmetry is real: buy side needs `ANYONECANPAY` because the input set
-grows after the maker signs; sell side can use `SIGHASH_ALL` everywhere
-because both parties' inputs are present at PSBT-build time.
+Both sides converge on **`SIGHASH_ALL` everywhere** because the input set
+is final at PSBT-build time on both — buy side discovers taker BTC inputs
+via `BitcoinClient::list_unspent(btc_funding_addr)`, sell side has them from
+the consignment. The taker only signs the inputs the maker built in for it;
+it never restructures the PSBT.
 
 ## The PSBT lifecycle per method
 
 ### `create_swap_psbt_buy`
 
-The intent of this method is to produce **a maker-signed half-PSBT** the
-taker can extend.
+Produces a **fully-input-committed PSBT** with the maker's RGB inputs
+already signed; the taker only needs to add its signatures to the BTC
+inputs the maker built in for it. Near-mirror of `create_swap_psbt_sell`.
+Trait signature picks up a new `btc_funding_addr` parameter (lives on
+`SwapLeg::Buy`).
 
 ```
 1. invoice    = RgbInvoice::from_str(rgb_invoice)
@@ -125,43 +136,49 @@ taker can extend.
 3. wallet     = self.load_wallet()                                // maker side
 4. stock      = wallet.stock_mut()
 5. // Resolve maker_rgb_utxos to bp-std prevout data (script_pubkey + value_sats)
-   //   — walk wallet.coins() / wallet.utxos() for each Outpoint;
-   //   — error if any isn't in the wallet (the inventory store + the wallet
-   //     should agree, but defensively check).
-6. // Build the RGB Batch
+   //   — walk wallet.coins() for each Outpoint; error if any isn't in the
+   //     wallet (the inventory store + the wallet should agree).
+6. // Discover the taker's BTC UTXOs by funding address
+   taker_utxos = bitcoin_client.list_unspent(btc_funding_addr)?
+   actual_fee  = estimate_swap_fee()
+   needed      = quote.price + actual_fee
+   selection   = GreedyLargestFirstSelector.select(needed, &taker_utxos)?
+   // Error → no taker UTXOs cover quote.price + fee
+7. // Build the RGB Batch
    builder = stock.transition_builder_raw(contract_id, default_transition_type)
    for each (maker_rgb_outpoint, allocation_state) in resolved_inputs:
        builder = builder.add_input(opout, state)
    builder = builder.add_fungible_state_raw(assignment_type,
                                             BuilderSeal::Concealed(invoice_seal),
                                             amount)
-   // RGB change goes back to a fresh maker-controlled seal if maker over-selected
    if sum_inputs > amount:
        maker_change_seal = GraphSeal::with_blinded_vout(change_vout, rand::random())
        builder = builder.add_fungible_state_raw(..., maker_change_seal, sum_inputs - amount)
    main = builder.complete_transition()
    batch = Batch { main, extras: empty }
-7. // Build the bp-std PSBT manually
+8. // Build the bp-std PSBT manually
    psbt = Psbt::new(version)
-   for each (outpoint, txout) in resolved_inputs:
-       psbt.add_input(outpoint, txout, sighash_type = ANYONECANPAY | SINGLE_or_NONE_or_ALL)
-   psbt.add_output(taker_rgb_seal_script, 0)         // RGB-only output, dust
-   if change > 0:
+   for each (outpoint, txout) in maker_rgb_inputs ++ selection.chosen:
+       psbt.add_input(outpoint, txout, sighash_type = SIGHASH_ALL)
+   psbt.add_output(taker_rgb_seal_script, 0)                    // RGB seal, dust
+   psbt.add_output(maker_btc_payout_script, quote.price)        // maker BTC receive
+   psbt.add_output(btc_funding_addr_script, taker_change_sats)  // taker BTC change → same addr
+   if maker_rgb_change > 0:
        psbt.add_output(maker_rgb_change_seal_script, 0)
-   psbt.add_output(rgb_commitment_output)            // opret or tapret
-8. psbt.set_rgb_close_method(close_method)
-9. psbt.rgb_embed(batch)?
-10. // Sign maker RGB inputs with the chosen SIGHASH
-    wallet.sign_psbt_inputs(&mut psbt, maker_input_indices, sighash_flag)
-11. // DON'T call psbt.rgb_commit() yet — that produces the fascia + witness txid,
-    //   which is only stable after the taker's inputs are present.
-12. Emit consignment = stock.transfer(contract_id, ..., witness_id = None)?
-    // Open question: rgb-api's transfer requires a witness_id (see pay.rs:563).
-    // For buy side we don't have one yet. See "design decision: deferred witness id" below.
-13. Return SwapTransfer {
-        partial_psbt: base64(psbt.serialize()),
-        consignment: Some(base64(transfer.save())),
-        expected_witness_txid: None,
+   psbt.add_output(rgb_commitment_output)                       // opret or tapret
+9. psbt.set_rgb_close_method(close_method); psbt.rgb_embed(batch)?
+10. // Sign ONLY the maker's RGB inputs (psbt.sign skips inputs the
+    //   signer's keys don't cover — taker BTC inputs are left unsigned)
+    psbt.sign(&maker_signer)?
+11. // Commit + emit consignment. Input set is final → witness_id is stable.
+    fascia      = psbt.rgb_commit()?
+    witness_id  = psbt.txid()
+    stock.consume_fascia(fascia, witness_id)
+    transfer    = stock.transfer(contract_id, [invoice_seal], [], [], Some(witness_id))
+12. Return SwapTransfer {
+        partial_psbt:           base64(psbt.serialize()),
+        consignment:            Some(base64(transfer.save())),
+        expected_witness_txid:  Some(witness_id.to_string()),
     }
 ```
 
@@ -229,49 +246,52 @@ inputs left to sign.
 
 ### `finalize_after_taker_sign`
 
-Both sides converge here. The taker has signed; the maker turns the
-fully-signed PSBT into a broadcastable witness tx and emits the
-witness-extended consignment.
+Both sides converge here. The taker has signed all of *its* inputs; the
+maker turns the fully-signed PSBT into a broadcastable witness tx. On both
+sides, `rgb_commit` + `stock.transfer` already ran at PSBT-build time (D3),
+so finalize is mostly just extraction.
 
 ```
-1. psbt    = Psbt::deserialize(base64::decode(signed_psbt_base64))
-2. consig  = Transfer::load(base64::decode(original_consignment_base64))
-   // (consig is `None` on sell side — maker built the PSBT from the taker's
-   //  consignment but never produced one of its own. Same parameter; on sell
-   //  side it's the taker-supplied original. See "design decision: which
-   //  consignment finalizes" below.)
-3. fascia  = psbt.rgb_commit()
-4. witness_id = psbt.txid()
-5. // Update the maker's Stock with the new state
-   stock.consume_fascia(fascia, witness_id)
-6. // Generate the witness-extended consignment to hand to the receiver
-   final_transfer = stock.transfer(contract_id, beneficiary_seals, [], [], Some(witness_id))
-7. // Extract the broadcastable witness tx
+1. psbt = Psbt::deserialize(base64::decode(signed_psbt_base64))
+2. // The PSBT carries the same RGB embed as the one we shipped at step 4;
+   //   the taker only added signatures. witness_id is unchanged.
+3. witness_id = psbt.txid()
+4. // Extract the broadcastable witness tx (psbt.sign + psbt.finalize semantics)
    tx_bytes = psbt.extract_tx().serialize()
-8. Return FinalizedSwap {
+5. // The witness-extended consignment was created at PSBT-build via
+   //   stock.transfer(...). For finalize we just hand it back to the caller,
+   //   sourced from `original_consignment_base64` (the consignment we shipped
+   //   at step 4, returned to us alongside the signed PSBT). Re-emitting via
+   //   stock.transfer here would be a no-op duplicate.
+6. Return FinalizedSwap {
        raw_tx: tx_bytes,
        witness_txid: witness_id.to_string(),
-       final_consignment_base64: base64(final_transfer.save()),
+       final_consignment_base64: original_consignment_base64.to_owned(),
    }
 ```
+
+On sell side the `original_consignment_base64` is the taker's incoming
+consignment we already validated; on buy side it's the consignment we
+emitted to the taker at step 4. In both cases it's already witness-extended
+because the witness_id was stable from the moment we ran `rgb_commit`.
 
 ## Design decisions
 
 These are choices the implementation must make explicitly. Pick them here, not
 in commit messages.
 
-### D1 — Buy-side maker SIGHASH
+### D1 — Buy-side SIGHASH (resolved via declared-funding protocol)
 
-The maker signs its RGB inputs before the taker adds BTC inputs. The signature
-must commit to *its own input* but **not** to the rest of the input set. That's
-`SIGHASH_ANYONECANPAY` flagged on each maker input. The output set is fixed at
-PSBT-build time (taker adds inputs + change but the maker's outputs are
-final), so the output-side flag is **`SIGHASH_ALL`** — the maker is happy to
-commit to the full output structure it built. Combined flag per maker input:
-**`SIGHASH_ALL | SIGHASH_ANYONECANPAY`**.
+Both buy and sell use **`SIGHASH_ALL` on every input**. The input set is
+final at PSBT-build time on both sides — buy side learns the taker's BTC
+inputs via `BitcoinClient::list_unspent(btc_funding_addr)` (from the
+`SwapLeg::Buy` field); sell side has them from the consignment. No
+`ANYONECANPAY` needed because no party adds inputs after the maker signs.
 
-Open: does bp-std's `psbt::Input` let us set `sighash_type` per input? See
-*Known unknowns* below.
+`psbt.sign(&signer)` naturally signs only inputs whose keys the signer
+holds, so partial signing falls out without per-input filtering on our
+side. The taker's signer holds keys for the taker's BTC inputs; the maker's
+holds keys for the maker's BTC / RGB inputs.
 
 ### D2 — Sell-side SIGHASH
 
@@ -287,40 +307,34 @@ appear in the signed PSBT.
 ### D3 — When `rgb_commit` is called
 
 `Psbt::rgb_commit` produces a `Fascia` (the anchor commitment data) and
-requires the PSBT's txid to be stable (i.e., all inputs / outputs final).
+requires the PSBT's txid to be stable (all inputs / outputs final).
 
-- **Buy side `create_swap_psbt_buy`**: txid is NOT stable (taker will add
-  inputs). Do **not** call `rgb_commit`. Pass the embedded-but-uncommitted
-  PSBT to the taker. The commit happens in `finalize_after_taker_sign`.
-- **Sell side `create_swap_psbt_sell`**: txid IS stable. We *could* commit
-  here. For symmetry with buy side and to keep `finalize_after_taker_sign`
-  the single point that materializes the fascia + consignment, we **defer**:
-  embed in create_swap_psbt_sell, commit in finalize_after_taker_sign.
+With declared-funding, the input set is final at PSBT-build on **both
+sides**. So `rgb_commit` + `stock.consume_fascia` + `stock.transfer` all
+run in `create_swap_psbt_buy` / `create_swap_psbt_sell` — at PSBT-build
+time, with the real (stable) witness_id. `finalize_after_taker_sign`
+becomes the lighter half: deserialize the signed PSBT, extract the witness
+tx, return.
 
-### D4 — Consignment lifecycle
+### D4 — Consignment lifecycle (resolved — single emission, at PSBT-build)
 
-Buy side: the maker builds its own consignment in `create_swap_psbt_buy`
-(via `stock.transfer(..., witness_id = None)` — but see unknown U1) and
-hands it to the taker. The taker validates it locally before signing.
-At `finalize_after_taker_sign`, the witness-extended consignment is the
-same one with the now-known witness tx attached.
+Buy side: the maker emits the consignment in `create_swap_psbt_buy` via
+`stock.transfer(contract_id, ..., Some(witness_id))` with the real
+witness_id. Shipped to the taker at step 4 already witness-extended; the
+taker can validate it pre-sign (`consignment.validate(&resolver, ...)`)
+before submitting the signed PSBT.
 
 Sell side: the taker built the consignment and sent it in `/consignment`.
-`create_swap_psbt_sell` doesn't produce one (`SwapTransfer.consignment =
-None`). At `finalize_after_taker_sign` the **maker** produces the
-witness-extended consignment for *its own* future use (the maker is the
-RGB receiver). The taker doesn't need a final consignment back — they
-sourced the RGB.
+The maker *also* runs `stock.transfer(...)` in `create_swap_psbt_sell` to
+materialize its own witness-extended form (the maker is the RGB receiver
+on sell side; this is what it accepts into its stash on confirmation).
+The `SwapTransfer.consignment` returned to the taker stays `None` — the
+taker already has theirs.
 
-The `original_consignment_base64` parameter on `finalize_after_taker_sign`:
-
-- Buy side: the consignment the maker emitted earlier (used to identify
-  which transfer to extend).
-- Sell side: the taker's original consignment (used to identify the same).
-
-So both sides pass *something* meaningful into this parameter; the
-implementation treats them symmetrically (replay through Stock to get the
-witness-extended form out).
+`finalize_after_taker_sign` does **not** re-emit on either side; it returns
+whatever was passed in as `original_consignment_base64` (the consignment
+that was shipped at step 4 on buy, or the taker's incoming consignment on
+sell). Single emission, at the moment witness_id is stable.
 
 ### D5 — `Beneficiary` shape on the invoice
 
@@ -337,11 +351,11 @@ WitnessVout case. Documented constraint.
 ### D6 — RGB change handling
 
 - **Buy side**: maker may over-select RGB inputs. The surplus goes to a
-  fresh `GraphSeal::with_blinded_vout(maker_change_vout, rand::random())`
-  (mirrors `pay.rs:356`). The change vout is the maker's BTC change vout
-  *if the maker had one*, but on buy side the maker has no BTC change vout
-  (taker funds BTC). So we add a dedicated RGB-change output and pin the
-  seal to its vout. Adds one more output to the buy PSBT.
+  fresh `GraphSeal::with_blinded_vout(maker_rgb_change_vout, rand::random())`
+  (mirrors `pay.rs:356`). The PSBT now carries a `maker_btc_payout` output
+  so we *could* pin the seal to it, but a dedicated RGB-only change output
+  is cleaner — keeps the maker's BTC payout output a plain pay-to-address
+  with no RGB encumbrance.
 - **Sell side**: surplus only happens if the taker over-consigns. The
   taker's `rgb_change_invoice` (optional, on `SwapLeg::Sell`) tells us
   where to send it; if absent and over-consign happens, reject the
@@ -353,30 +367,17 @@ Things we don't know from reading source alone — they need a build-iterate
 cycle to resolve, ideally with the regtest stack up so we can verify behavior
 end-to-end.
 
-### U1 — `stock.transfer(..., witness_id = None)` viability on buy side
+### ~~U1~~ — resolved by declared-funding redesign
 
-`pay.rs:563` calls `stock.transfer(contract_id, ..., Some(witness_id))` with
-the witness id always known. For buy side we don't have one until taker
-signs. The Stash's `transfer()` API probably requires it. Possible answers:
+`stock.transfer(..., Some(witness_id))` now runs at `create_swap_psbt_buy`
+time, with the real witness_id, because the input set is final at PSBT-build.
+No placeholder, no re-issue, no deferral.
 
-- **(a)** Pass a placeholder `witness_id` (e.g., a zero-Txid or the PSBT's
-  current-state txid even though it'll change), then re-issue the consignment
-  in `finalize_after_taker_sign` once the real witness_id is known.
-- **(b)** Defer the consignment entirely to `finalize_after_taker_sign` and
-  hand the taker only the half-signed PSBT (taker validates the RGB
-  transition off the embedded fascia after `rgb_commit` happens at finalize
-  — but then the taker can't pre-validate before signing).
-- **(c)** Reach for a different rgb-api primitive that emits a consignment
-  for a not-yet-final tx. Need to grep the stash provider for one.
+### ~~U2~~ — resolved (no per-input SIGHASH needed)
 
-Decide via experiment in implementation.
-
-### U2 — bp-std PSBT per-input SIGHASH flag
-
-D1 needs `SIGHASH_ALL | ANYONECANPAY` on the maker's RGB inputs in buy side.
-bp-std's `psbt::Input` likely has a `sighash_type: Option<SighashType>` field
-(it's standard PSBT BIP 174). Need to confirm the exact API + that
-`rgb_embed` / `rgb_commit` respect it.
+With declared-funding both sides use plain `SIGHASH_ALL` on every input.
+bp-std's per-input `sighash_type` field is still there if we ever need it,
+but we don't.
 
 ### U3 — Manual PSBT input construction without coin-selection
 
@@ -384,49 +385,90 @@ bp-std's `psbt::Input` likely has a `sighash_type: Option<SighashType>` field
 params.tx)` which is bp-wallet's `PsbtConstructor` trait. That trait does
 coin-selection internally. We want to skip coin-selection entirely (caller
 supplied every input). Need to find the bp-std `Psbt::new` / `add_input`
-path that bypasses `PsbtConstructor`.
+path that bypasses `PsbtConstructor`. Same on both sides now.
 
-### U4 — `psbt.rgb_commit()` shape with mixed-party inputs
+### U4 — `psbt.rgb_commit()` shape with multi-signer inputs
 
-Does `rgb_commit` care whether all inputs are signed? It produces a
-`Fascia` with the witness id (psbt.txid()) — so it needs the txid stable
-(all inputs and outputs present). Per-input *signatures* shouldn't affect
-the txid in segwit (witness data isn't in the txid). So `rgb_commit` at
-finalize time should work whether or not the taker's RGB inputs (sell
-side) were signed at PSBT-build time. Confirm by experiment.
+`rgb_commit` produces a `Fascia` keyed on `psbt.txid()`. Per-input
+signatures don't affect the segwit txid, so commit-at-PSBT-build (before
+the taker signs) should be valid: the fascia produced there will still
+match the broadcast tx. Confirm by experiment that `rgb_commit` doesn't
+require signed inputs.
 
-### U5 — `stock.consume_fascia` post-finalize state mutation
+### U5 — `stock.consume_fascia` immediately after `rgb_commit`
 
-`pay.rs:559` calls `stock.consume_fascia(fascia, FasciaResolver)` to advance
-the stash with the new transition before broadcast confirms. For atomic
-swap finalize, we do the same — but at *finalize* time, not at PSBT-build
-time. Need to check that calling consume_fascia *after* a separate
-embed-only step (`rgb_embed` without `rgb_commit`) at PSBT-build is valid.
+`pay.rs:559` calls `stock.consume_fascia` immediately after the implicit
+`rgb_commit` inside its `transfer()` method. We do the same in
+`create_swap_psbt_*`. Confirm that the fascia from a not-yet-broadcast tx
+is accepted (via `FasciaResolver` returning `WitnessOrd::Tentative` — same
+trick pay.rs uses; see pay.rs:551-557).
+
+### U6 — Cold/hot signer wiring
+
+`load_wallet()` returns a `Wallet<XpubDerivable, ...>` — xpub-only, can't
+sign. Signing needs an `XprivAccount` loaded separately
+(`XprivAccount::read(account_file, password)`). Plumbing to add in B1:
+
+- `RgbConfig` gains `RGB_SIGNER_ACCOUNT_FILE` + `RGB_SIGNER_PASSWORD`
+  (regtest defaults to empty password, mainnet operators set it).
+- `LibRgbBackend::load_signer()` helper parallel to `load_wallet()`.
+
+### U7 — `BitcoinClient::list_unspent`
+
+New trait method introduced by the declared-funding redesign:
+
+```rust
+async fn list_unspent(&self, address: &str) -> Result<Vec<(Outpoint, TxOut)>, BtcError>;
+```
+
+For `ElectrumClient`: maps to `blockchain.scripthash.listunspent` then a
+`get_outpoint` per result to surface the prevout shape we already use.
+For `MockBitcoinClient`: a builder method `.with_address_unspent(addr, [...])`
+seeds a map; the trait method returns from it.
 
 ## Implementation phases
 
 When we pick this up:
 
-- **Phase B1 — Plumbing**. Locate bp-std's `Psbt::new`/`add_input` /
-  per-input sighash; resolve U2, U3. Add any missing rfq-rgb deps (likely
-  none — bp-std is direct, psrgbt is transitive).
+- **Phase B1 — Plumbing** (expanded by the declared-funding redesign):
+  - Locate bp-std's `Psbt::new` / `add_input` / `add_output` path that
+    bypasses `PsbtConstructor` (resolves U3).
+  - `LibRgbBackend::load_signer()` reading `RGB_SIGNER_ACCOUNT_FILE` +
+    `RGB_SIGNER_PASSWORD`; add both env vars to `RgbConfig` (resolves U6).
+  - Add `BitcoinClient::list_unspent(addr)` to the `rfq-btc` trait, with
+    `ElectrumClient` impl (electrum protocol `blockchain.scripthash.listunspent`
+    + `get_outpoint` to surface the prevout shape) and `MockBitcoinClient`
+    builder (resolves U7).
+  - Add `btc_funding_addr: String` to `SwapLeg::Buy` in `rfq-types`. Update
+    every `SwapLeg::Buy { rgb_invoice }` constructor across the workspace —
+    `MockMaker::accept_quote_buy`, all rfq-maker buy tests, rfq-api e2e,
+    rfq-client integration tests. Big mechanical fan-out; bounded.
 - **Phase B2 — `create_swap_psbt_buy`**. Implement against decisions D1, D3,
-  D4, D5, D6; resolve U1 via experiment. End state: returns a SwapTransfer
-  with a partial PSBT + buy-side consignment.
+  D4, D5, D6. End state: returns a SwapTransfer with a fully-input-committed
+  PSBT + the maker-emitted witness-extended consignment + a stable
+  expected_witness_txid.
 - **Phase B3 — `create_swap_psbt_sell`**. Implement against D2, D3, D4, D5,
-  D6. End state: returns a SwapTransfer with a fully-input-committed PSBT +
-  pre-computed witness txid + no consignment of its own.
-- **Phase B4 — `finalize_after_taker_sign`**. Implement against the spec
-  above; resolve U4, U5 by running. End state: returns FinalizedSwap with
-  broadcastable bytes + witness-extended consignment.
-- **Phase B5 — Tests**. Flip the two `#[ignore]`d stub-assertion tests in
-  [`tests/cli.rs`](../crates/rfq-rgb/tests/cli.rs) (currently asserting
-  `Err(TransferBuild)` / `Err(FinalizeFailed)`) to assert `Ok` + structural
-  shape. Add a third test for `create_swap_psbt_sell`. Add a small
-  end-to-end test that drives the whole buy or sell round trip with two
-  cooperating `LibRgbBackend`s (maker + taker) on the regtest stack.
+  D6. End state: same SwapTransfer shape as buy (the asymmetry shrinks under
+  declared-funding) — fully-input-committed PSBT, stable expected_witness_txid,
+  `consignment = None` (the taker has its own, supplied at `/consignment`).
+- **Phase B4 — `finalize_after_taker_sign`**. Now mostly extraction:
+  deserialize the signed PSBT, extract the witness tx bytes via bp-std,
+  return `FinalizedSwap` with the consignment that was emitted at PSBT-build
+  echoed back as `final_consignment_base64`. Resolves U4, U5 by running.
+- **Phase B5 — Tests**.
+  - Flip the two `#[ignore]`d stub-assertion tests in
+    [`tests/cli.rs`](../crates/rfq-rgb/tests/cli.rs) from asserting
+    `Err(stub)` to asserting `Ok` + structural shape.
+  - Add a third `#[ignore]`d test for `create_swap_psbt_sell`.
+  - Add an end-to-end `#[ignore]`d test driving a buy or sell round trip
+    with two cooperating `LibRgbBackend`s (maker + taker) on the regtest
+    stack — exercises PSBT serialization round-trip, signing, finalize.
 
-Each phase is its own session-sized commit. B1 unblocks everything else.
+Each phase is a session-sized commit. **B1 is bigger than originally
+scoped** because of the workspace-wide `SwapLeg::Buy` field addition and
+the new `BitcoinClient::list_unspent` method; might split into B1a (types
++ trait surface) and B1b (test-call-site fan-out + `RgbConfig` signer
+plumbing) if the diff balloons.
 
 ## What it doesn't cover
 
