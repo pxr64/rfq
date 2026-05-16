@@ -14,28 +14,28 @@ implement to un-mock the swap path.
 - `create_swap_psbt_sell(&consignment_info, &taker_rgb_prevouts, &maker_btc_inputs, …) -> SwapTransfer`
 - `finalize_after_taker_sign(signed_psbt_base64, original_consignment_base64) -> FinalizedSwap`
 
-## Why this is a custom build, not a port
+## Why this is composition, not a port
 
 `rgb-cmd 0.11.1-rc.6` is the canonical example we've mirrored everywhere
 else (`create_invoice`, `validate_incoming_consignment`). It does **not** have
-an atomic-swap command. Its `Transfer` command calls `wallet.pay(invoice,
-params)` which is a *unilateral wallet-funded transfer*: the calling wallet
-supplies every input, pays every output, signs SIGHASH_ALL across the whole
-PSBT.
+an atomic-swap command — that's literally what we're building. Its `Transfer`
+command calls `wallet.pay(invoice, params)`: a single-call **unilateral**
+transfer where one wallet supplies every input, pays every output, and signs
+SIGHASH_ALL across the whole PSBT.
 
-Atomic swap PSBTs are two-party. Neither `wallet.pay()` nor
-`wallet.construct_psbt_rgb()` exposes:
-
-- Construction from caller-supplied input lists (no wallet coin-selection).
-- "Leave room for the other party to add inputs later."
-- Per-input SIGHASH flags (the implicit default in the pay flow is
-  SIGHASH_ALL across all inputs).
-- A way to defer the witness-txid commitment.
-
-So Group B reaches **below** `pay()` to bp-std `Psbt` primitives + the RGB
+Atomic swap PSBTs are two-party. There's no convenience wrapper for that
+shape; `pay()` covers the unilateral case and stops. But every primitive we
+need *is* publicly available — bp-std exposes `Psbt::new` + manual
+input/output construction + per-input `sighash_type`, bp-wallet's `psbt.sign(&signer)`
+naturally signs only inputs whose keys the signer holds (so partial signing
+falls out for free), and rgb-api exposes the RGB transition builder + the
 commitment APIs (`stock.transition_builder_raw`, `psbt.rgb_embed`,
-`psbt.rgb_commit`, `stock.consume_fascia`, `stock.transfer`) and assembles the
-two-party shape by hand. That is what this doc designs.
+`psbt.rgb_commit`, `stock.consume_fascia`, `stock.transfer`).
+
+So Group B is **glue code** that reaches below `pay()` and composes those
+primitives into the two-party shape. The work is wiring + design decisions
+(SIGHASH model, when to commit the fascia, when to emit the consignment),
+not extending the library.
 
 ## Inputs / outputs / signing matrix
 

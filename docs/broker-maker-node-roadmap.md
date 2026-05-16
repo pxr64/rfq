@@ -76,7 +76,7 @@ Define how the mock-only scaffolding becomes a real regtest MVP without leaking 
 
 ## Library-Backed `rfq-rgb` Adapter (Issue #13)
 
-**Status: foundation + `create_invoice` landed; remaining real methods still parked pending a regtest-verifiable session.**
+**Status: foundation + `create_invoice` + `validate_incoming_consignment` landed and live-verified; the atomic-swap trio is composition work the next session picks up.**
 
 Wrap the proven manual regtest RGB flow behind the `RgbBackend` trait, using
 `rgb-api` + `bp-std` + `bp-wallet` directly (the same libraries `rgb-cmd` builds
@@ -109,14 +109,17 @@ either way.
   Mirrors `rgb-cmd`'s `Validate`/`Accept`. Live-verified by
   `tests/cli.rs::validate_incoming_consignment_accepts_a_real_consignment`.
 
-**Still parked — Group B**: `create_swap_psbt_buy`, `create_swap_psbt_sell`,
-`finalize_after_taker_sign`. Unlike everything above, these have **no
-`rgb-cmd` analog** — rgb-cmd only does unilateral transfers. The atomic-swap
-PSBT shape (partial PSBT, taker adds inputs later for buy / both parties'
-inputs present at build for sell, per-input SIGHASH model, deferred witness
-txid on buy) needs custom assembly below `wallet.pay()` using bp-std `Psbt`
-primitives + the RGB commitment APIs (`stock.transition_builder_raw`,
-`psbt.rgb_embed`, `psbt.rgb_commit`, `stock.consume_fascia`, `stock.transfer`).
+**Group B — composition work next**: `create_swap_psbt_buy`,
+`create_swap_psbt_sell`, `finalize_after_taker_sign`. Unlike the methods
+above, these don't have an `rgb-cmd` analog to mirror — rgb-cmd only does
+unilateral transfers; an atomic swap is what *this project* is building.
+Every primitive we need is already public (bp-std `Psbt::new` + per-input
+`sighash_type`, `psbt.sign(&signer)` naturally signs only what the signer's
+keys cover, rgb-api's `stock.transition_builder_raw`, `psbt.rgb_embed`,
+`psbt.rgb_commit`, `stock.consume_fascia`, `stock.transfer`). The work is
+**composing them below `pay()`** into the two-party shape the swap protocol
+needs (partial PSBT, taker adds inputs later for buy / both parties' inputs
+present at build for sell, per-input SIGHASH, deferred witness txid on buy).
 
 **Design landed**: [`docs/swap-psbt-design.md`](swap-psbt-design.md) — the
 implementation-level companion to `docs/swap-flows.md`. Defines the
