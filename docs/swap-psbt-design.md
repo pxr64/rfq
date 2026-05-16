@@ -555,15 +555,71 @@ Lifecycle blocks above updated from the earlier placeholder
 `stock.transfer(...)` call on the next line then runs against a stash
 already containing the tentative bundle for this witness_id.
 
-### U6 — Cold/hot signer wiring
+### ~~U6~~ — resolved: `XprivAccount::read` + `TestnetRefSigner`, with a mainnet caveat
 
 `load_wallet()` returns a `Wallet<XpubDerivable, ...>` — xpub-only, can't
-sign. Signing needs an `XprivAccount` loaded separately
-(`XprivAccount::read(account_file, password)`). Plumbing to add in B1:
+sign. Signing needs an `XprivAccount` loaded separately via the
+`bpwallet::hot::SecureIo::read(path, password)` trait method (bp-wallet
+hot/seed.rs:117). Plumbing for B1:
 
-- `RgbConfig` gains `RGB_SIGNER_ACCOUNT_FILE` + `RGB_SIGNER_PASSWORD`
-  (regtest defaults to empty password, mainnet operators set it).
-- `LibRgbBackend::load_signer()` helper parallel to `load_wallet()`.
+- `RgbConfig` gains `signer_account_file: PathBuf` (env
+  `RGB_SIGNER_ACCOUNT_FILE`) + `signer_password: String` (env
+  `RGB_SIGNER_PASSWORD`, default `""` for regtest).
+- `LibRgbBackend::load_signer() -> Result<XprivAccount, RgbError>`
+  parallel to `load_wallet()`; calls `XprivAccount::read(...)`.
+
+#### Signer choice — `TestnetRefSigner` (with a documented mainnet gap)
+
+Surveying the publicly-constructible `Signer` impls in
+`bp-std 0.11.1-alpha.2` / `bp-wallet 0.11.1-alpha.2`:
+
+| Signer | Network | Publicly constructible? |
+|---|---|---|
+| `TestnetRefSigner<'a>` | testnet only — **panics on mainnet at construction** (`signers.rs:68-75`) | `::new(&account)` |
+| `TestnetSigner` (owned) | testnet only (same panic) | `::new(account)` |
+| `XprivSigner<'xpriv>` | network-agnostic | **No** — inner field is `account: &'xpriv XprivAccount` and **private** (`hot/signer.rs:48-51`); no public constructor |
+| `ConsoleSigner<'descr, 'me, D>` | network-agnostic | **No** — holds a `signer: XprivSigner<'me>` field, can't be constructed because of XprivSigner above |
+
+The network-agnostic signers (`XprivSigner`, `ConsoleSigner`) are
+effectively private API in this release. That leaves us
+`TestnetRefSigner` / `TestnetSigner`, both of which panic if handed a
+mainnet xpriv.
+
+**Decision for B2/B3**: use `TestnetRefSigner::new(&account)` — fine for
+regtest (our entire target right now). Guard the entry with
+`if !account.xpriv().is_testnet() { return Err(RgbError::MainnetSignerUnsupported) }`
+so we fail loud instead of panic.
+
+**Mainnet follow-up** (out of scope for Group B but flag it now): two
+paths — upstream a `pub fn XprivSigner::new(account: &XprivAccount)` to
+bp-wallet, or write our own ~30-line `Signer + Sign` impl mirroring
+`XprivSigner`. Both unblock mainnet without further protocol changes.
+
+#### Call-site shape
+
+After `rgb_commit` + `consume_fascia` + `stock.transfer`:
+
+```rust
+let account = self.load_signer()?;
+if !account.xpriv().is_testnet() {
+    return Err(RgbError::MainnetSignerUnsupported);
+}
+let signer = TestnetRefSigner::new(&account);
+let sig_count = psbt.sign(&signer)
+    .map_err(|e| RgbError::SignFailed(e.to_string()))?;
+if sig_count == 0 {
+    // Maker's signer should hold at least one input key.
+    // Zero means RGB_SIGNER_ACCOUNT_FILE points at the wrong account.
+    return Err(RgbError::SignerHoldsNoKeysForInputs);
+}
+```
+
+`psbt.sign(&signer)` naturally skips inputs whose `bip32_derivation` /
+`tap_internal_key` the signer doesn't recognize, so on buy side only the
+maker's RGB inputs get signed (taker BTC inputs left unsigned for the
+taker's `/sign`); on sell side only the maker's BTC inputs get signed
+(taker RGB inputs left unsigned). No per-input filtering needed on our
+side.
 
 ### U7 — `BitcoinClient::list_unspent`
 
