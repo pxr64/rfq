@@ -102,26 +102,34 @@ either way.
   binds a fresh `GraphSeal`, stores the secret seal, emits an `RgbInvoice` via
   `RgbInvoiceBuilder`. Mirrors `rgb-cmd`'s `Invoice` command.
 
-**Still parked** — `validate_incoming_consignment`, `create_swap_psbt_buy`,
-`create_swap_psbt_sell`, `finalize_after_taker_sign` remain stubbed with
-`TODO(#13)`. Reasons they still need a regtest-verifiable session:
+- Real `LibRgbBackend::validate_incoming_consignment`: base64-decode →
+  `Transfer::load` → contract-id cross-check → `validate(&resolver, &config)`
+  against electrs + the maker's trusted typesystem → introspect
+  `bundled_witnesses` for `(outpoint, amount)` tuples into `ConsignmentInfo`.
+  Mirrors `rgb-cmd`'s `Validate`/`Accept`. Live-verified by
+  `tests/cli.rs::validate_incoming_consignment_accepts_a_real_consignment`.
 
-- The original issue text predates the atomic-swap design (#15–#22): it
-  describes `create_transfer` / `finalize_and_broadcast` / `list_allocations`,
-  all since replaced or deleted. The trait the stubs must satisfy is the
-  atomic-swap trait, not the unilateral-transfer one the issue assumes.
-- The real work is atomic-swap PSBT construction: a *partial* PSBT the maker
-  contributes only RGB inputs to, which the taker later funds with BTC inputs,
-  with the witness txid deferred. `rgb-api` 0.11.1-rc.6 exposes only
-  whole-transaction `wallet.pay()` / `construct_psbt()`; the two-party
-  partial-PSBT shape needs custom assembly on top of those primitives.
-- Acceptance is gated on live regtest Docker tests (`cargo test -p rfq-rgb --
-  --ignored`), so the work needs an infra session to verify — it can't be
-  signed off offline.
+**Still parked — Group B**: `create_swap_psbt_buy`, `create_swap_psbt_sell`,
+`finalize_after_taker_sign`. Unlike everything above, these have **no
+`rgb-cmd` analog** — rgb-cmd only does unilateral transfers. The atomic-swap
+PSBT shape (partial PSBT, taker adds inputs later for buy / both parties'
+inputs present at build for sell, per-input SIGHASH model, deferred witness
+txid on buy) needs custom assembly below `wallet.pay()` using bp-std `Psbt`
+primitives + the RGB commitment APIs (`stock.transition_builder_raw`,
+`psbt.rgb_embed`, `psbt.rgb_commit`, `stock.consume_fascia`, `stock.transfer`).
 
-**Next step:** rewrite the #13 issue against the current atomic-swap
-`RgbBackend` trait, then implement against a running regtest stack. Until then
-the mock backend stack (`MockRgbBackend`) carries the buy/sell flows end-to-end.
+**Design landed**: [`docs/swap-psbt-design.md`](swap-psbt-design.md) — the
+implementation-level companion to `docs/swap-flows.md`. Defines the
+inputs/outputs/signing matrix per side, the lifecycle per trait method, six
+explicit design decisions (SIGHASH model, when `rgb_commit` is called,
+consignment lifecycle, beneficiary shape, change handling), the five known
+unknowns that need a build-iterate cycle to resolve, and a five-phase
+implementation plan (B1 plumbing → B2 buy → B3 sell → B4 finalize → B5 tests).
+
+**Next step:** start phase B1 (resolve U2/U3 — locate bp-std's
+per-input SIGHASH + manual-input `Psbt::new`/`add_input` path). The regtest
+stack is now one command (`make -C infra/regtest regtest-bootstrap`) so each
+phase can compile-iterate with live verification.
 
 ## RGB Maker UTXO Inventory Management (Issue #14)
 

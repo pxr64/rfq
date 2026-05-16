@@ -91,9 +91,11 @@ impl LibRgbBackend {
         let network = self.parse_network()?;
         let resolver = AnyResolver::electrum_blocking(&self.electrum_url, None)
             .map_err(|e| RgbError::StashLoad(format!("resolver: {e}")))?;
+       
         resolver
             .check_chain_net(chain_net_for(network))
             .map_err(|e| RgbError::StashLoad(format!("resolver chain check: {e}")))?;
+      
         Ok(resolver)
     }
 
@@ -276,15 +278,18 @@ impl RgbBackend for LibRgbBackend {
             .map_err(|e| {
                 RgbError::TransferBuild(format!("consignment is not valid base64: {e}"))
             })?;
+      
         let consignment = Transfer::load(bytes.as_slice())
             .map_err(|e| RgbError::TransferBuild(format!("consignment decode: {e}")))?;
 
         // Cross-check the consignment is for the contract the invoice names.
         let invoice = RgbInvoice::from_str(expected_invoice)
             .map_err(|_| RgbError::InvalidInvoice)?;
+      
         let invoice_contract = invoice.contract.ok_or_else(|| {
             RgbError::TransferBuild("expected_invoice carries no contract id".to_owned())
         })?;
+       
         if consignment.contract_id() != invoice_contract {
             return Err(RgbError::TransferBuild(format!(
                 "consignment contract {} does not match invoice contract {}",
@@ -296,8 +301,10 @@ impl RgbBackend for LibRgbBackend {
         // Cryptographic validation: resolver fetches witness txes; the typed
         // system from the maker's stash anchors the validator's trust root.
         let stock = self.load_stock()?;
+     
         let mut resolver = self.resolver()?;
         resolver.add_consignment_txes(&consignment);
+       
         let validation_config = ValidationConfig {
             chain_net: chain_net_for(self.parse_network()?),
             trusted_typesystem: stock
@@ -307,9 +314,11 @@ impl RgbBackend for LibRgbBackend {
                 .clone(),
             ..Default::default()
         };
+       
         let validated = consignment
             .validate(&resolver, &validation_config)
             .map_err(|e| RgbError::TransferBuild(format!("consignment validation: {e:?}")))?;
+       
         if validated.validation_status().validity() != Validity::Valid {
             return Err(RgbError::TransferBuild(format!(
                 "consignment invalid: {}",
