@@ -621,7 +621,7 @@ taker's `/sign`); on sell side only the maker's BTC inputs get signed
 (taker RGB inputs left unsigned). No per-input filtering needed on our
 side.
 
-### U7 — `BitcoinClient::list_unspent`
+### ~~U7~~ — resolved: `list_unspent(addr)` on `BitcoinClient`, electrum reuse
 
 New trait method introduced by the declared-funding redesign:
 
@@ -629,10 +629,115 @@ New trait method introduced by the declared-funding redesign:
 async fn list_unspent(&self, address: &str) -> Result<Vec<(Outpoint, TxOut)>, BtcError>;
 ```
 
-For `ElectrumClient`: maps to `blockchain.scripthash.listunspent` then a
-`get_outpoint` per result to surface the prevout shape we already use.
-For `MockBitcoinClient`: a builder method `.with_address_unspent(addr, [...])`
-seeds a map; the trait method returns from it.
+Returns the same `TxOut { value_sats, script_pubkey: Vec<u8> }` shape as
+`get_outpoint`, with `script_pubkey` derived once from the input address
+and shared across all results (electrum's response only carries
+height/txid/vout/value — see below). The maker can feed `(Outpoint, TxOut)`
+pairs straight into `GreedyLargestFirstSelector` and PSBT input enrichment
+without a second-pass `get_outpoint` round-trip per UTXO.
+
+#### Electrum impl
+
+`electrum-client 0.21` exposes the right call directly
+(`raw_client.rs:994` / `api.rs:156`):
+
+```rust
+fn script_list_unspent(&self, script: &Script) -> Result<Vec<ListUnspentRes>, Error>;
+
+pub struct ListUnspentRes {
+    pub height:  usize,
+    pub tx_hash: Txid,
+    pub tx_pos:  usize,
+    pub value:   u64,
+}
+```
+
+Skeleton for `crates/rfq-btc/src/electrum.rs`:
+
+```rust
+async fn list_unspent(&self, address: &str) -> Result<Vec<(Outpoint, TxOut)>, BtcError> {
+    let addr = bitcoin::Address::from_str(address)
+        .map_err(|e| BtcError::Backend(format!("invalid address: {e}")))?
+        .assume_checked();                              // see "Address network handling" below
+    let script = addr.script_pubkey();
+    let script_bytes: Vec<u8> = script.to_bytes();
+
+    let client = Arc::clone(&self.client);
+    let utxos = tokio::task::spawn_blocking(move || client.script_list_unspent(&script))
+        .await
+        .map_err(|e| BtcError::Backend(format!("blocking task join: {e}")))?
+        .map_err(|e| BtcError::Backend(format!("electrum script_list_unspent: {e}")))?;
+
+    Ok(utxos
+        .into_iter()
+        .map(|u| (
+            Outpoint::new(u.tx_hash.to_string(), u.tx_pos as u32),
+            TxOut { value_sats: u.value, script_pubkey: script_bytes.clone() },
+        ))
+        .collect())
+}
+```
+
+#### Address network handling
+
+`bitcoin 0.32` uses the typestate pattern — `Address<NetworkUnchecked>`
+vs `Address<NetworkChecked>`, and `script_pubkey()` is only on the
+checked variant. We use `assume_checked()` because the maker validates
+the taker's `btc_funding_addr` network at the protocol layer (in
+`accept_quote_buy`) *before* reaching `list_unspent`. Keeping the
+`BitcoinClient` trait network-naive avoids leaking network into every
+method signature.
+
+#### Mock impl
+
+Mirror the existing `with_prevout` pattern:
+
+```rust
+// MockState gains one field:
+address_unspent: HashMap<String, Vec<(Outpoint, TxOut)>>,
+
+impl MockBitcoinClient {
+    pub fn with_address_unspent(
+        self,
+        address: impl Into<String>,
+        utxos: Vec<(Outpoint, TxOut)>,
+    ) -> Self {
+        self.state.lock().unwrap()
+            .address_unspent
+            .insert(address.into(), utxos);
+        self
+    }
+}
+
+#[async_trait]
+impl BitcoinClient for MockBitcoinClient {
+    async fn list_unspent(&self, address: &str) -> Result<Vec<(Outpoint, TxOut)>, BtcError> {
+        Ok(self.state.lock().unwrap()
+            .address_unspent
+            .get(address)
+            .cloned()
+            .unwrap_or_default())
+    }
+    // ...
+}
+```
+
+Empty result → `Ok(vec![])`. The "no UTXOs cover quote.price + fee" error
+surfaces at the `GreedyLargestFirstSelector` layer, not here.
+
+The mock's `with_prevout` (indexes by outpoint, used by `get_outpoint`)
+and `with_address_unspent` (indexes by address, used by `list_unspent`)
+stay independent — they're different lookups and tests rarely need both
+wired together.
+
+#### Deps
+
+The `electrum-client` feature in `rfq-btc` already pulls `bitcoin`
+transitively. If `bitcoin::Address::from_str` doesn't resolve through
+the re-export, add `bitcoin = { version = "0.32", optional = true }` to
+`crates/rfq-btc/Cargo.toml` under `[dependencies]` and include it in the
+`electrum` feature's deps list. No change to the base (non-electrum)
+build graph.
 
 ## Implementation phases
 
