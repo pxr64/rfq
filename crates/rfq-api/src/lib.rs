@@ -9,7 +9,7 @@ use axum::{
 };
 use rfq_btc::MockBitcoinClient;
 use rfq_core::is_quote_expired;
-use rfq_maker::MockMaker;
+use rfq_maker::Maker;
 use rfq_rgb::MockRgbBackend;
 use rfq_router::{fanout_quote, MakerConnector};
 use rfq_store::{InMemoryQuoteStore, QuoteStore};
@@ -63,7 +63,7 @@ pub fn app() -> Router {
     let bitcoin_client = Arc::new(MockBitcoinClient::new());
     // Seed BTC inventory so the maker can also quote the sell side.
     let maker = Arc::new(
-        MockMaker::new(maker_id, vec![utxo], rgb_backend, bitcoin_client)
+        Maker::new(maker_id, vec![utxo], rgb_backend, bitcoin_client)
             .with_btc_inventory(mock_btc_inventory()),
     );
 
@@ -340,7 +340,7 @@ mod tests {
             );
         }
         let maker = Arc::new(
-            MockMaker::new(
+            Maker::new(
                 MakerId("mock-maker-1".to_owned()),
                 vec![],
                 rgb_backend,

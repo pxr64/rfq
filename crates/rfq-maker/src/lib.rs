@@ -148,7 +148,7 @@ enum PendingSettlement {
 }
 
 #[derive(Clone)]
-pub struct MockMaker {
+pub struct Maker {
     maker_id: MakerId,
     store: Arc<dyn InventoryStore>,
     selector: Arc<dyn CoinSelector>,
@@ -160,7 +160,7 @@ pub struct MockMaker {
     pending: Arc<RwLock<HashMap<QuoteId, PendingSettlement>>>,
 }
 
-impl MockMaker {
+impl Maker {
     /// Seed the inventory store from a per-UTXO chain view. All entries start
     /// `Available`; tests needing pre-existing Reserved / Spent state should
     /// build their own `InMemoryInventoryStore` and use `with_components`.
@@ -196,7 +196,7 @@ impl MockMaker {
     /// Full-control constructor: caller supplies its own inventory store and
     /// coin selector. Forward path for #9 (settlement state machine) once the
     /// store needs to be shared across components. The BTC inventory starts
-    /// empty — seed it for sell-side quoting with [`MockMaker::with_btc_inventory`].
+    /// empty — seed it for sell-side quoting with [`Maker::with_btc_inventory`].
     pub fn with_components(
         maker_id: MakerId,
         store: Arc<dyn InventoryStore>,
@@ -732,7 +732,7 @@ impl MockMaker {
 }
 
 #[async_trait]
-impl MakerConnector for MockMaker {
+impl MakerConnector for Maker {
     fn maker_id(&self) -> MakerId {
         self.maker_id.clone()
     }
@@ -1143,11 +1143,11 @@ mod tests {
         }
     }
 
-    fn maker() -> MockMaker {
+    fn maker() -> Maker {
         maker_with_utxos(vec![utxo()])
     }
 
-    fn maker_with_utxos(utxos: Vec<RgbInventoryUtxo>) -> MockMaker {
+    fn maker_with_utxos(utxos: Vec<RgbInventoryUtxo>) -> Maker {
         maker_with_btc(utxos, Arc::new(MockBitcoinClient::new()))
     }
 
@@ -1156,15 +1156,15 @@ mod tests {
     fn maker_with_btc(
         utxos: Vec<RgbInventoryUtxo>,
         bitcoin_client: Arc<MockBitcoinClient>,
-    ) -> MockMaker {
+    ) -> Maker {
         let rgb_backend = Arc::new(MockRgbBackend::new(utxos.clone()));
-        MockMaker::new(maker_id(), utxos, rgb_backend, bitcoin_client)
+        Maker::new(maker_id(), utxos, rgb_backend, bitcoin_client)
     }
 
     /// Seed the store directly so tests can pre-set Reserved / Spent statuses.
-    fn maker_with_store(rows: Vec<InventoryUtxo>) -> MockMaker {
+    fn maker_with_store(rows: Vec<InventoryUtxo>) -> Maker {
         let rgb_backend = Arc::new(MockRgbBackend::new(vec![utxo()]));
-        MockMaker::with_components(
+        Maker::with_components(
             maker_id(),
             Arc::new(InMemoryInventoryStore::with_seed(rows)),
             Arc::new(GreedyExactFitSelector),
@@ -1243,13 +1243,13 @@ mod tests {
         client
     }
 
-    fn sell_maker_with_btc(client: Arc<MockBitcoinClient>) -> MockMaker {
+    fn sell_maker_with_btc(client: Arc<MockBitcoinClient>) -> Maker {
         let rgb_backend = Arc::new(MockRgbBackend::new(vec![]));
-        MockMaker::new(maker_id(), vec![], rgb_backend, client)
+        Maker::new(maker_id(), vec![], rgb_backend, client)
             .with_btc_inventory((0..3).map(|i| btc_inv(i, 1_000_000)).collect())
     }
 
-    fn sell_maker() -> MockMaker {
+    fn sell_maker() -> Maker {
         sell_maker_with_btc(Arc::new(sell_bitcoin_client()))
     }
 

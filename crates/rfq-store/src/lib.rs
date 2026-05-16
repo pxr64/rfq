@@ -84,7 +84,7 @@ pub trait InventoryStore: Send + Sync {
 
     /// Locate the active reservation for `quote_id` if one exists. Returns
     /// `None` for unknown / released / already-spent quote ids. Used by
-    /// `MockMaker::accept_quote` to bridge the public `Quote` to the internal
+    /// `Maker::accept_quote` to bridge the public `Quote` to the internal
     /// `ReservationId`.
     async fn find_reservation_for_quote(&self, quote_id: &QuoteId) -> Option<ReservationId>;
 
@@ -126,7 +126,7 @@ pub trait InventoryStore: Send + Sync {
 
     /// Mark every UTXO in `reservation_id` as `Spent`. Accepts UTXOs currently
     /// in `Reserved` or `PendingRgbAcceptance` (the settlement state machine
-    /// will drive the latter; today's MockMaker uses the former directly).
+    /// will drive the latter; today's Maker uses the former directly).
     /// Idempotent: a repeat call with the same `reservation_id` succeeds
     /// (no-op) if the UTXOs are already `Spent` under the same witness_txid.
     async fn mark_spent(
@@ -210,7 +210,7 @@ impl InMemoryInventoryStore {
     }
 
     /// Synchronous seeding helper. Useful in sync constructors (e.g.
-    /// `MockMaker::new`) where awaiting `replace_for_asset` would force the
+    /// `Maker::new`) where awaiting `replace_for_asset` would force the
     /// whole constructor to become async.
     pub fn with_seed(utxos: Vec<InventoryUtxo>) -> Self {
         let map: HashMap<Outpoint, InventoryUtxo> =

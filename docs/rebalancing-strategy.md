@@ -88,7 +88,7 @@ This fallback is **spec'd here but not implemented in 14e.** The trigger metrics
 - `fragmentation_score` and the related metrics (`average_input_count`, `average_change_ratio`, `pending_settlements`) in [ExtendedInventorySnapshot](../crates/rfq-types/src/lib.rs).
 - `RebalancePolicy` configuration struct in [crates/maker-node/src/main.rs](../crates/maker-node/src/main.rs).
 - `RebalancePlan` data type representing proposed merges / splits.
-- `MockMaker::rebalance(policy) -> RebalancePlan` — pure planner, no broadcast.
+- `Maker::rebalance(policy) -> RebalancePlan` — pure planner, no broadcast.
 - `spawn_rebalance_loop` running on `REBALANCE_INTERVAL_MS` (default 60s) that calls `rebalance()` and logs the plan when triggers fire.
 
 **Deferred to follow-up issue (rebalance execution via settlement-tx piggybacking):**
@@ -102,6 +102,6 @@ The follow-up depends on [#13](broker-maker-node-roadmap.md)'s `create_transfer`
 
 - [ExtendedInventorySnapshot::from_utxos](../crates/rfq-types/src/lib.rs) — the metric computation
 - [InventoryStore](../crates/rfq-store/src/lib.rs) — per-UTXO state the planner reads
-- [MockMaker::rebalance](../crates/rfq-maker/src/lib.rs) — the planner itself
+- [Maker::rebalance](../crates/rfq-maker/src/lib.rs) — the planner itself
 - [spawn_rebalance_loop](../crates/maker-node/src/main.rs) — the periodic trigger
 - [broker-maker-node-roadmap.md](broker-maker-node-roadmap.md) — #14 issue + sub-PR breakdown

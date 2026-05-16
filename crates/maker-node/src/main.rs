@@ -10,7 +10,7 @@ use axum::{
 use clap::{Parser, Subcommand};
 use rfq_btc::MockBitcoinClient;
 use rfq_client::{RfqClient, Url};
-use rfq_maker::{MockMaker, RebalancePolicy};
+use rfq_maker::{Maker, RebalancePolicy};
 use rfq_rgb::{LibRgbBackend, MockRgbBackend, RgbBackend};
 use rfq_router::MakerConnector;
 use rfq_store::{InMemoryQuoteStore, QuoteStore};
@@ -176,7 +176,7 @@ async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> 
     let app = maker_app(maker.clone());
     let listener = TcpListener::bind(&config.maker_listen_addr).await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let maker_type = std::any::type_name::<MockMaker>();
+    let maker_type = std::any::type_name::<Maker>();
     let sample_invoice = wallet.create_rgb_invoice("mock-contract", 1)?;
 
     println!("maker-node starting");
@@ -234,7 +234,7 @@ async fn health(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error
     println!("wallet=mock-ready");
     println!(
         "maker_runtime={}",
-        std::any::type_name::<rfq_maker::MockMaker>()
+        std::any::type_name::<rfq_maker::Maker>()
     );
 
     Ok(())
@@ -261,7 +261,7 @@ async fn inventory(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-async fn build_maker(config: &MakerNodeConfig) -> Result<MockMaker, Box<dyn std::error::Error>> {
+async fn build_maker(config: &MakerNodeConfig) -> Result<Maker, Box<dyn std::error::Error>> {
     let maker_id = MakerId(config.maker_id.clone());
     let asset = AssetId {
         network: BitcoinNetwork::Regtest,
@@ -303,7 +303,7 @@ async fn build_maker(config: &MakerNodeConfig) -> Result<MockMaker, Box<dyn std:
     // 16c: seed mock BTC inventory so the node can also serve the sell side.
     // A real maker resolves these from a wallet bootstrap; the demo round
     // trip in docs/swap-flows.md uses these deterministic outpoints.
-    Ok(MockMaker::new(maker_id, utxos, rgb_backend, bitcoin_client)
+    Ok(Maker::new(maker_id, utxos, rgb_backend, bitcoin_client)
         .with_btc_inventory(mock_btc_inventory()))
 }
 
@@ -329,11 +329,11 @@ fn mock_btc_inventory() -> Vec<BtcInventoryUtxo> {
 
 #[derive(Clone)]
 struct MakerNodeState {
-    maker: MockMaker,
+    maker: Maker,
     store: InMemoryQuoteStore,
 }
 
-fn maker_app(maker: MockMaker) -> Router {
+fn maker_app(maker: Maker) -> Router {
     Router::new()
         .route("/health", get(maker_health))
         .route("/inventory", get(maker_inventory))
@@ -469,7 +469,7 @@ fn print_inventory_snapshot(snapshot: &InventorySnapshot) {
     println!("spent_allocations={}", snapshot.spent_allocations);
 }
 
-fn spawn_cleanup_loop(maker: MockMaker, cleanup_interval_ms: u64) -> JoinHandle<()> {
+fn spawn_cleanup_loop(maker: Maker, cleanup_interval_ms: u64) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_millis(cleanup_interval_ms));
 
@@ -489,7 +489,7 @@ fn spawn_cleanup_loop(maker: MockMaker, cleanup_interval_ms: u64) -> JoinHandle<
 /// the executor (settlement-tx piggyback) is a follow-up issue. See
 /// docs/rebalancing-strategy.md.
 fn spawn_rebalance_loop(
-    maker: MockMaker,
+    maker: Maker,
     rebalance_interval_ms: u64,
     policy: RebalancePolicy,
 ) -> JoinHandle<()> {

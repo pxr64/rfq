@@ -29,7 +29,7 @@ Add inventory observability so maker-node and broker health/debug flows can repo
 
 - Add `InventorySnapshot` for amount totals and allocation counts.
 - Track total, available, reserved, and spent inventory.
-- Add `MockMaker::inventory_summary()` that releases expired reservations first.
+- Add `Maker::inventory_summary()` that releases expired reservations first.
 - Test initial, reserved-after-quote, available-after-expiry, and spent-after-accept states.
 
 ## Issue #3: Expiry Cleanup Loop
@@ -58,7 +58,7 @@ Define the network boundary between broker and external maker nodes.
   - `GET /inventory`
   - `POST /quotes`
   - `POST /quotes/{quote_id}/accept`
-- Add an HTTP `MakerConnector` implementation while keeping in-process `MockMaker` for tests.
+- Add an HTTP `MakerConnector` implementation while keeping in-process `Maker` for tests.
 - Add integration coverage for broker talking to a test maker-node app.
 
 ## Regtest RGB20 Integration Plan
@@ -130,7 +130,7 @@ Track RGB-colored UTXOs as denomination units so the maker can fulfill RFQs safe
 Per-UTXO data model: `InventoryUtxo { outpoint, asset_id, amount, btc_sats, status, created_at, updated_at, pending_txid }` with an `InventoryStatus` enum covering `Available`, `Reserved { rfq_id, expires_at }`, `PendingBitcoinConfirm`, `PendingRgbAcceptance`, `Spent`, `Invalid`.
 
 - Surface seal/outpoint per allocation in `rfq-rgb` (the data is already there in `LibRgbBackend`; just stop discarding it).
-- Replace `MockMaker`'s whole-allocation reservation with per-UTXO reservation; atomic + concurrency-safe.
+- Replace `Maker`'s whole-allocation reservation with per-UTXO reservation; atomic + concurrency-safe.
 - Denomination-aware coin selection — start greedy-exact-fit (minimize input count, minimize change, prefer exact matches), iterate to fee-aware scoring later.
 - Change management: re-ingest change UTXOs from successful transfers back into inventory; optionally normalize into target denomination buckets.
 - Persistence behind an `rfq-store` adapter trait (SQLite or RocksDB): atomic reservation updates, durable settlement tracking, crash-safe recovery.
@@ -145,10 +145,10 @@ Shipped as six sequenced sub-PRs (see `.claude/plans/yes-lets-do-ti-lovely-grove
 
 - [x] **14a** — Surface per-UTXO outpoints in `rfq-rgb`. `Outpoint` + `RgbInventoryUtxo` in `rfq-types`; `RgbBackend::list_inventory_utxos`; `LibRgbBackend` stops discarding `seal.to_outpoint()`. (commit `2643517`)
 - [x] **14b** — `InventoryStore` trait + `InMemoryInventoryStore`; remaining types (`InventoryStatus`, `InventoryUtxo`, `ReservationId`, `ExtendedInventorySnapshot`, `InventoryError`); legacy `InventorySnapshot` retained as `From<&ExtendedInventorySnapshot>` view.
-- [x] **14c** — Per-UTXO reservation in `MockMaker` behind `InventoryStore`. `CoinSelector` trait + `WholeUtxoSelector` placeholder (14d swaps in `GreedyExactFitSelector`). Atomic reservation under contention verified by 10-task concurrent test. Legacy `inventory_snapshot` / `inventory_summary` preserved as derived views.
+- [x] **14c** — Per-UTXO reservation in `Maker` behind `InventoryStore`. `CoinSelector` trait + `WholeUtxoSelector` placeholder (14d swaps in `GreedyExactFitSelector`). Atomic reservation under contention verified by 10-task concurrent test. Legacy `inventory_snapshot` / `inventory_summary` preserved as derived views.
 - [x] **14d** — `GreedyExactFitSelector` (exact-single → bounded 2-of-N exact up to N=2000 → bounded 3-of-N exact up to N=16 → smallest-change single → multi-UTXO greedy). Exclusion-based retry in `request_quote` so a fully deterministic selector still gets healthy concurrency. Fragmentation hot path verified: 100 dust UTXOs + 1 fat 10000 UTXO, request 20, picks `{10, 10}` not the fat one.
-- [x] **14e** — `spawn_rebalance_loop` planner stub in maker-node + `RebalancePolicy` + `RebalancePlan`. Failure-handling `InventoryStore` methods (`mark_pending_bitcoin_confirm`, `mark_pending_rgb_acceptance`, `mark_broadcast_failed`, `mark_rgb_acceptance_failed`, `mark_reorged`, `mark_invalid`) + transition tests. Change re-ingestion in `MockMaker::accept_quote` when `expected_change > 0` (PendingBitcoinConfirm change UTXO). `docs/rebalancing-strategy.md` design doc.
-- [x] **14f** — Deleted legacy `Allocation` / `AllocationState` / `ManagedAllocation` types and the `RgbBackend::list_allocations` trait method. `MockMaker::new` now takes `Vec<RgbInventoryUtxo>`; tests needing pre-Reserved / pre-Spent state use `with_components` + a hand-seeded `InMemoryInventoryStore`. `maker-node::build_maker` and `rfq-api::app` rewired to consume `list_inventory_utxos`. `LibRgbBackend::new` dropped its now-unused `maker_id` parameter.
+- [x] **14e** — `spawn_rebalance_loop` planner stub in maker-node + `RebalancePolicy` + `RebalancePlan`. Failure-handling `InventoryStore` methods (`mark_pending_bitcoin_confirm`, `mark_pending_rgb_acceptance`, `mark_broadcast_failed`, `mark_rgb_acceptance_failed`, `mark_reorged`, `mark_invalid`) + transition tests. Change re-ingestion in `Maker::accept_quote` when `expected_change > 0` (PendingBitcoinConfirm change UTXO). `docs/rebalancing-strategy.md` design doc.
+- [x] **14f** — Deleted legacy `Allocation` / `AllocationState` / `ManagedAllocation` types and the `RgbBackend::list_allocations` trait method. `Maker::new` now takes `Vec<RgbInventoryUtxo>`; tests needing pre-Reserved / pre-Spent state use `with_components` + a hand-seeded `InMemoryInventoryStore`. `maker-node::build_maker` and `rfq-api::app` rewired to consume `list_inventory_utxos`. `LibRgbBackend::new` dropped its now-unused `maker_id` parameter.
 
 ### Follow-up issues
 
@@ -172,7 +172,7 @@ Two parent issues split by direction. Each parent has three lettered sub-issues 
   - [x] **16c** (#22) — Sell-side flow wiring (mock end-to-end): three round trips after accept (invoice → consignment → PSBT → sign → broadcast).
 
 Buy and sell both settle end-to-end against the mock backend stack
-(`MockMaker` + `MockRgbBackend` + `MockBitcoinClient`). The remaining gap is
+(`Maker` + `MockRgbBackend` + `MockBitcoinClient`). The remaining gap is
 the real RGB backend — `LibRgbBackend`'s swap methods are stubbed pending #13.
 
 Protocol invariant:
