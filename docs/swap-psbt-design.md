@@ -195,8 +195,8 @@ Trait signature picks up a new `btc_funding_addr` parameter (lives on
     //   taker, who signs the post-commit PSBT next, does the same.
     let fascia      = psbt.rgb_commit()?
     let witness_id  = psbt.txid();             // stable from here
-    stock.consume_fascia(fascia, witness_id)
-    let transfer    = stock.transfer(contract_id, [invoice_seal], [], [], Some(witness_id))
+    stock.consume_fascia(fascia, FasciaResolver { witness_id })?
+    let transfer    = stock.transfer(contract_id, [invoice_seal], [], [], Some(witness_id))?
 11. // Sign ONLY the maker's RGB inputs. `psbt.sign(&signer)` skips inputs
     //   whose keys the signer doesn't hold — taker BTC inputs left unsigned.
     psbt.sign(&maker_signer)?
@@ -269,8 +269,8 @@ inputs left to sign.
    //   post-commit output set.
    let fascia      = psbt.rgb_commit()?
    let witness_id  = psbt.txid();             // stable from here
-   stock.consume_fascia(fascia, witness_id)
-   let _own_transfer = stock.transfer(contract_id, [maker_seal], [], [], Some(witness_id))
+   stock.consume_fascia(fascia, FasciaResolver { witness_id })?
+   let _own_transfer = stock.transfer(contract_id, [maker_seal], [], [], Some(witness_id))?
    // maker-side transfer captures the new state in the maker's stash; the
    // taker already has its own consignment (the one they submitted in /consignment).
 10. // Sign ONLY the maker's BTC inputs (taker RGB inputs left for taker /sign).
@@ -505,13 +505,55 @@ keeps the `Fascia` from `rgb_commit` in memory and hands it directly to
 `consume_fascia` + `stock.transfer` in the same call. `finalize_after_taker_sign`
 just calls `psbt.extract_tx()`; it never re-extracts the fascia.
 
-### U5 — `stock.consume_fascia` immediately after `rgb_commit`
+### ~~U5~~ — resolved: `consume_fascia` is built for not-yet-broadcast txs
 
-`pay.rs:559` calls `stock.consume_fascia` immediately after the implicit
-`rgb_commit` inside its `transfer()` method. We do the same in
-`create_swap_psbt_*`. Confirm that the fascia from a not-yet-broadcast tx
-is accepted (via `FasciaResolver` returning `WitnessOrd::Tentative` — same
-trick pay.rs uses; see pay.rs:551-557).
+The signature in `rgb-ops/persistence/stock.rs:999` is explicit:
+
+```rust
+/// Imports fascia into the stash, index and inventory.
+///
+/// Must be called before the consignment is created, when witness
+/// transaction is not yet mined.
+pub fn consume_fascia<WP: WitnessOrdProvider>(
+    &mut self,
+    fascia: Fascia,
+    witness_ord_provider: WP,
+) -> Result<(), StockError<S, H, P, FasciaError>>
+```
+
+The doc comment says it: not-yet-mined is the *expected* state, not a workaround.
+
+`WitnessOrdProvider` (`rgb-consensus/validation/validator.rs:83`) is a
+one-method trait — `witness_ord(txid) -> WitnessOrd`. `consume_fascia`
+calls it during `state.update_from_bundle(...)` to tag the bundle's
+ordering. For pre-broadcast swap txs the right answer is
+`WitnessOrd::Tentative`, whose docstring explicitly lists *"transaction is
+an RBF replacement prepared to be broadcast"* as a valid case
+(rgb-consensus/vm/contract.rs:265-306).
+
+We mirror `pay.rs:549-561` verbatim. Single private helper in
+`lib_backend.rs` (instead of inlined twice like pay.rs does, since both
+`create_swap_psbt_*` need it):
+
+```rust
+struct FasciaResolver { witness_id: Txid }
+impl WitnessOrdProvider for FasciaResolver {
+    fn witness_ord(&self, witness_id: Txid) -> Result<WitnessOrd, WitnessResolverError> {
+        assert_eq!(witness_id, self.witness_id); // consume_fascia only queries our own id
+        Ok(WitnessOrd::Tentative)
+    }
+}
+```
+
+The `assert_eq!` matches pay.rs and is load-bearing — `consume_fascia`
+should *only* query the resolver for the witness_id of the fascia we just
+produced. Any other id is a protocol violation worth a panic.
+
+Lifecycle blocks above updated from the earlier placeholder
+`stock.consume_fascia(fascia, witness_id)` to
+`stock.consume_fascia(fascia, FasciaResolver { witness_id })?`. The
+`stock.transfer(...)` call on the next line then runs against a stash
+already containing the tentative bundle for this witness_id.
 
 ### U6 — Cold/hot signer wiring
 
@@ -546,6 +588,8 @@ When we pick this up:
     section for the recipe). Single small wrapper helper in
     `LibRgbBackend` probably worth extracting since both create_swap_psbt
     methods use the same pattern.
+  - Private `FasciaResolver` helper in `lib_backend.rs` (resolves U5 —
+    see that section for the recipe).
   - `LibRgbBackend::load_signer()` reading `RGB_SIGNER_ACCOUNT_FILE` +
     `RGB_SIGNER_PASSWORD`; add both env vars to `RgbConfig` (resolves U6).
   - Add `BitcoinClient::list_unspent(addr)` to the `rfq-btc` trait, with
