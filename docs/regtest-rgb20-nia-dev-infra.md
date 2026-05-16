@@ -4,6 +4,33 @@ This document tracks the first reproducible infrastructure path for an on-chain 
 
 The product language can keep saying RGB20, but the current RGB tooling names the fungible non-inflatable asset schema `NonInflatableAsset` / NIA.
 
+## Quick start
+
+For verifying `LibRgbBackend` against a live stack (the offline-vs-live half
+of issue #13), the entire setup is one command:
+
+```bash
+make -C infra/regtest regtest-bootstrap
+```
+
+This runs, in order: `regtest-up`, `rgb-tools-install`, `rgb-schemas-fetch`,
+initial-mine (only if the chain is below height 103), `rgb-wallets-init`,
+`rgb-create-wallets`, `rgb-fund-wallets`, `rgb-issue-asset`,
+`rgb-transfer-maker`. Each step is idempotent, so a partial / failed run
+can be retried by re-running the same command. When it finishes it prints
+the env block you need to paste before running:
+
+```bash
+cargo test -p rfq-rgb -- --ignored
+```
+
+Pass `SKIP_TRANSFER=1 make -C infra/regtest regtest-bootstrap` to stop after
+issuing the contract (skipping the issuer → maker transfer) — enough to
+verify `create_invoice`, not enough for `list_inventory_utxos`.
+
+If a step needs hand-holding, drop down to the manual checklist below — each
+script there matches a section here.
+
 ## Local Stack
 
 The Docker stack lives in `infra/regtest` and starts:

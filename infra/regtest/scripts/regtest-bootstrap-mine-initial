@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Idempotent first-time mining for `make regtest-bootstrap`. Creates the miner
+# Bitcoin wallet if absent and mines up to 103 blocks (coinbase maturity)
+# only when the chain is below that height. Safe to re-run.
+set -euo pipefail
+
+source "$(dirname "$0")/common.sh"
+
+require_docker_services
+
+# Ensure the miner wallet exists. `createwallet` errors if it's already loaded;
+# `listwalletdir` shows on-disk wallets but doesn't load them. Try in that order.
+if ! bcli -rpcwallet="$BITCOIN_WALLET" getwalletinfo >/dev/null 2>&1; then
+  if bcli listwalletdir | grep -q "\"$BITCOIN_WALLET\""; then
+    bcli loadwallet "$BITCOIN_WALLET" >/dev/null
+  else
+    bcli createwallet "$BITCOIN_WALLET" >/dev/null
+  fi
+fi
+
+height="$(bcli getblockcount)"
+target=103
+if (( height < target )); then
+  to_mine=$(( target - height ))
+  echo "chain at height $height; mining $to_mine more blocks to reach $target"
+  bcli -rpcwallet="$BITCOIN_WALLET" generatetoaddress "$to_mine" \
+    "$(bcli -rpcwallet="$BITCOIN_WALLET" getnewaddress "" bech32)" >/dev/null
+  echo "now at height $(bcli getblockcount)"
+else
+  echo "chain at height $height (>= $target), skipping initial mine"
+fi

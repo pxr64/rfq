@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Move RGB inventory from the issuer to the maker. Generates a maker invoice,
+# runs `rgb_issuer transfer` against it, copies the consignment into the
+# maker's data dir, mines a confirmation block, syncs both stashes, and lets
+# the maker accept the consignment. Amount defaults to 1000 and can be
+# overridden via RGB_TRANSFER_AMOUNT.
 set -euo pipefail
 
 source "$(dirname "$0")/common.sh"
@@ -7,5 +12,58 @@ require_docker_services
 require_rgb_tools
 ensure_dirs
 
-manual_step "rgb-transfer-maker" \
-  "Use the maker RGB invoice as the recipient, create an issuer transfer, copy the consignment to maker state, mine one block, and accept the transfer in the maker stash."
+amount="${RGB_TRANSFER_AMOUNT:-1000}"
+contract_id="${RGB_CONTRACT_ID:-}"
+
+# Default to the contract id `rgb-issue-asset` wrote.
+if [[ -z "$contract_id" && -f "$ARTIFACTS_DIR/contract-id" ]]; then
+  contract_id="$(cat "$ARTIFACTS_DIR/contract-id")"
+fi
+if [[ -z "$contract_id" ]]; then
+  echo "contract id not found; either run rgb-issue-asset first or set RGB_CONTRACT_ID." >&2
+  exit 1
+fi
+echo "contract: $contract_id"
+echo "amount  : $amount"
+
+consignment="$DATA_DIR/issuer/maker.consignment.rgb"
+psbt="$DATA_DIR/issuer/maker.tx.psbt"
+maker_consignment="$DATA_DIR/maker/consignment.rgb"
+
+echo
+echo "[maker] generating receive invoice..."
+invoice_out="$(rgb_maker invoice --amount "$amount" "$contract_id" 2>&1)"
+printf '%s\n' "$invoice_out" | sed 's/^/  /'
+maker_invoice="$(printf '%s\n' "$invoice_out" | grep -oE 'rgb:[A-Za-z0-9+\/=_~$-]+' | tail -n1)"
+if [[ -z "$maker_invoice" ]]; then
+  echo "could not parse maker invoice from output above." >&2
+  exit 1
+fi
+echo "  invoice: $maker_invoice"
+
+echo
+echo "[issuer] transferring to maker..."
+rgb_issuer transfer "$maker_invoice" "$consignment" "$psbt"
+
+if [[ ! -f "$consignment" ]]; then
+  echo "transfer did not produce $consignment" >&2
+  exit 1
+fi
+cp "$consignment" "$maker_consignment"
+
+echo
+echo "mining 1 confirmation block..."
+bcli -rpcwallet="$BITCOIN_WALLET" generatetoaddress 1 \
+  "$(bcli -rpcwallet="$BITCOIN_WALLET" getnewaddress "" bech32)" >/dev/null
+
+echo "syncing utxos..."
+rgb_issuer utxos --sync >/dev/null
+rgb_maker  utxos --sync >/dev/null
+
+echo
+echo "[maker] accepting consignment..."
+rgb_maker accept "$maker_consignment"
+
+echo
+echo "[maker] state after accept:"
+rgb_maker state "$contract_id" | sed 's/^/  /'

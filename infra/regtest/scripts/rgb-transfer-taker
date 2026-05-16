@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Move RGB inventory from the maker to the taker. Mirrors rgb-transfer-maker
+# with the roles shifted: the taker generates a receive invoice, the maker
+# transfers against it, both stashes sync, and the taker accepts. Amount
+# defaults to 100 and can be overridden via RGB_TRANSFER_AMOUNT.
 set -euo pipefail
 
 source "$(dirname "$0")/common.sh"
@@ -7,5 +11,60 @@ require_docker_services
 require_rgb_tools
 ensure_dirs
 
-manual_step "rgb-transfer-taker" \
-  "Use the taker RGB invoice as the recipient, create a maker transfer, copy the consignment to taker state, mine one block, and accept the transfer in the taker stash."
+amount="${RGB_TRANSFER_AMOUNT:-100}"
+contract_id="${RGB_CONTRACT_ID:-}"
+
+if [[ -z "$contract_id" && -f "$ARTIFACTS_DIR/contract-id" ]]; then
+  contract_id="$(cat "$ARTIFACTS_DIR/contract-id")"
+fi
+if [[ -z "$contract_id" ]]; then
+  echo "contract id not found; either run rgb-issue-asset first or set RGB_CONTRACT_ID." >&2
+  exit 1
+fi
+echo "contract: $contract_id"
+echo "amount  : $amount"
+
+consignment="$DATA_DIR/maker/taker.consignment.rgb"
+psbt="$DATA_DIR/maker/taker.tx.psbt"
+taker_consignment="$DATA_DIR/taker/consignment.rgb"
+
+echo
+echo "[taker] generating receive invoice..."
+invoice_out="$(rgb_taker invoice --amount "$amount" "$contract_id" 2>&1)"
+printf '%s\n' "$invoice_out" | sed 's/^/  /'
+taker_invoice="$(printf '%s\n' "$invoice_out" | grep -oE 'rgb:[A-Za-z0-9+\/=_~$-]+' | tail -n1)"
+if [[ -z "$taker_invoice" ]]; then
+  echo "could not parse taker invoice from output above." >&2
+  exit 1
+fi
+echo "  invoice: $taker_invoice"
+
+echo
+echo "[maker] transferring to taker..."
+rgb_maker transfer "$taker_invoice" "$consignment" "$psbt"
+
+if [[ ! -f "$consignment" ]]; then
+  echo "transfer did not produce $consignment" >&2
+  exit 1
+fi
+cp "$consignment" "$taker_consignment"
+
+echo
+echo "mining 1 confirmation block..."
+bcli -rpcwallet="$BITCOIN_WALLET" generatetoaddress 1 \
+  "$(bcli -rpcwallet="$BITCOIN_WALLET" getnewaddress "" bech32)" >/dev/null
+
+echo "syncing utxos..."
+rgb_maker utxos --sync >/dev/null
+rgb_taker utxos --sync >/dev/null
+
+echo
+echo "[taker] accepting consignment..."
+rgb_taker accept "$taker_consignment"
+
+echo
+echo "[taker] state after accept:"
+rgb_taker state "$contract_id" | sed 's/^/  /'
+echo
+echo "[maker] state after change:"
+rgb_maker state "$contract_id" | sed 's/^/  /'

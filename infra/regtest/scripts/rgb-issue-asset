@@ -1,11 +1,106 @@
 #!/usr/bin/env bash
+# Issue the regtest NIA test asset from the issuer wallet. Renders the contract
+# YAML from `artifacts/rfq-nia.yaml` (template) by substituting the issuer's
+# current keychain-9 outpoint and the imported NIA schema id, runs `rgb issue`,
+# and captures the resulting contract id to `artifacts/contract-id`.
+#
+# Idempotent: if a previous run wrote `artifacts/contract-id` and the contract
+# is still in the issuer's stash, this script reuses it. Delete that file to
+# force a re-issue (genesis bakes a timestamp, so successive issues produce
+# different contract ids — see the docs gotcha on stable contract ids).
 set -euo pipefail
 
 source "$(dirname "$0")/common.sh"
 
 require_docker_services
 require_rgb_tools
+require_rgb_schemas
 ensure_dirs
 
-manual_step "rgb-issue-asset" \
-  "Import the NonInflatableAsset schema, fund the issuer outpoint, render a contract definition, and run rgb issue. Save the resulting contract_id for RFQ asset config."
+CONTRACT_ID_FILE="$ARTIFACTS_DIR/contract-id"
+YAML_TEMPLATE="$ARTIFACTS_DIR/rfq-nia.yaml"
+YAML_RENDERED="$ARTIFACTS_DIR/rfq-nia.rendered.yaml"
+
+if [[ ! -f "$YAML_TEMPLATE" ]]; then
+  echo "missing template: $YAML_TEMPLATE" >&2
+  exit 1
+fi
+
+# Early-out: if we've already issued and the contract is still in the stash,
+# print the cached id and exit.
+if [[ -f "$CONTRACT_ID_FILE" ]]; then
+  cached_id="$(cat "$CONTRACT_ID_FILE")"
+  if rgb_issuer contracts 2>/dev/null | grep -qF "$cached_id"; then
+    echo "asset already issued: $cached_id"
+    echo "(delete $CONTRACT_ID_FILE to force a re-issue)"
+    exit 0
+  fi
+fi
+
+# Locate the issuer's NIA schema id. The id is content-addressed so it's the
+# same across stashes once the same schema file is imported — we read it back
+# rather than hard-coding so the template survives schema-file updates.
+echo "looking up imported schema id..."
+schema_id="$(rgb_issuer schemata 2>/dev/null | awk '/^[A-Za-z0-9+\/=_~-]+#/{print $1; exit}')"
+if [[ -z "$schema_id" ]]; then
+  echo "could not parse schema id from \`rgb_issuer schemata\`. Raw output:" >&2
+  rgb_issuer schemata >&2 || true
+  echo "Have you run: make -C infra/regtest rgb-create-wallets ?" >&2
+  exit 1
+fi
+echo "  schema_id=$schema_id"
+
+# Pick a keychain-9 outpoint from the issuer's wallet to bind the genesis seal.
+# `rgb utxos` prints a table; we look for a row whose keychain column is 9.
+echo "picking issuer keychain-9 outpoint..."
+utxos_raw="$(rgb_issuer utxos 2>/dev/null || true)"
+outpoint="$(printf '%s\n' "$utxos_raw" \
+  | awk '/keychain=9|^9[[:space:]]/{ for(i=1;i<=NF;i++) if($i ~ /^[0-9a-f]{64}:[0-9]+$/){print $i; exit} }')"
+
+if [[ -z "$outpoint" ]]; then
+  # Fall back to any txid:vout in the output and let the user verify.
+  outpoint="$(printf '%s\n' "$utxos_raw" \
+    | grep -oE '[0-9a-f]{64}:[0-9]+' \
+    | head -n1)"
+fi
+
+if [[ -z "$outpoint" ]]; then
+  echo "could not find a keychain-9 outpoint in \`rgb_issuer utxos\`." >&2
+  echo "Raw output:" >&2
+  printf '%s\n' "$utxos_raw" >&2
+  echo "Have you run: make -C infra/regtest rgb-fund-wallets ?" >&2
+  exit 1
+fi
+echo "  outpoint=$outpoint"
+
+# Render the YAML by substituting the two dynamic lines. The template's seal
+# and schema fields are matched by leading whitespace + key.
+sed \
+  -e "s|^schema:.*$|schema: $schema_id|" \
+  -e "s|^    seal:.*$|    seal: $outpoint|" \
+  "$YAML_TEMPLATE" > "$YAML_RENDERED"
+
+echo
+echo "rendered contract:"
+sed 's/^/  /' "$YAML_RENDERED"
+echo
+
+echo "issuing..."
+issue_out="$(rgb_issuer issue "ssi:issuer" "$YAML_RENDERED" 2>&1)"
+printf '%s\n' "$issue_out" | sed 's/^/  /'
+
+# rgb-cmd prints `Contract <id>` on success. Belt-and-braces: also scan
+# `rgb contracts` for a fresh id we didn't see before.
+contract_id="$(printf '%s\n' "$issue_out" | grep -oE 'rgb:[A-Za-z0-9+\/=_~$-]+' | tail -n1)"
+if [[ -z "$contract_id" ]]; then
+  contract_id="$(rgb_issuer contracts 2>/dev/null | grep -oE 'rgb:[A-Za-z0-9+\/=_~$-]+' | tail -n1)"
+fi
+if [[ -z "$contract_id" ]]; then
+  echo "could not extract a contract id; inspect the output above." >&2
+  exit 1
+fi
+
+printf '%s' "$contract_id" > "$CONTRACT_ID_FILE"
+echo
+echo "contract issued: $contract_id"
+echo "saved to $CONTRACT_ID_FILE"

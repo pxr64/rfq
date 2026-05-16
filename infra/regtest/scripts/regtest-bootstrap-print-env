@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Print the env block a developer needs after `make regtest-bootstrap`
+# completes, so they can immediately run:
+#   cargo test -p rfq-rgb -- --ignored
+set -euo pipefail
+
+source "$(dirname "$0")/common.sh"
+
+contract_id=""
+if [[ -f "$ARTIFACTS_DIR/contract-id" ]]; then
+  contract_id="$(cat "$ARTIFACTS_DIR/contract-id")"
+fi
+
+cat <<EOF
+
+══════════════════════════════════════════════════════════════════════
+  Regtest stack is bootstrapped. Paste this into your shell:
+
+  export RGB_DATA_DIR="$DATA_DIR/maker"
+  export RGB_WALLET="maker"
+  export RGB_NETWORK="regtest"
+  export ELECTRUM_URL="$ELECTRUM_URL"
+EOF
+
+if [[ -n "$contract_id" ]]; then
+  echo "  export RGB_CONTRACT_ID=\"$contract_id\""
+else
+  echo "  # RGB_CONTRACT_ID not set — run \`make rgb-issue-asset\` to create one"
+fi
+
+cat <<EOF
+
+  Then verify LibRgbBackend against the live stack:
+
+  cargo test -p rfq-rgb -- --ignored
+
+══════════════════════════════════════════════════════════════════════
+EOF

@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Create the issuer / maker / taker RGB wallets from the descriptors written by
+# `rgb-wallets-init`, and import the NIA schema into each stash. Idempotent —
+# safe to re-run after a partial bootstrap.
+set -euo pipefail
+
+source "$(dirname "$0")/common.sh"
+
+require_docker_services
+require_rgb_tools
+require_rgb_schemas
+ensure_dirs
+
+create_one_wallet() {
+  local role="$1"
+  local rgb_alias="$2" # name of the rgb_<role> function in common.sh
+  local descriptor_file="$WALLETS_DIR/${role}.descriptor"
+
+  if [[ ! -f "$descriptor_file" ]]; then
+    echo "missing $descriptor_file; run: make -C infra/regtest rgb-wallets-init" >&2
+    exit 1
+  fi
+
+  # rgb-cmd populates $DATA_DIR/<role>/regtest/ when the wallet exists. Treat
+  # that as the creation marker — running `create` again on a populated stash
+  # fails noisily.
+  if [[ -d "$DATA_DIR/$role/regtest" ]] && "$rgb_alias" schemata >/dev/null 2>&1; then
+    echo "[$role] wallet already exists, skipping create"
+  else
+    echo "[$role] creating wallet from $descriptor_file"
+    "$rgb_alias" create --wpkh "$(cat "$descriptor_file")" "$role"
+  fi
+}
+
+import_schema_once() {
+  local role="$1"
+  local rgb_alias="$2"
+  # `rgb schemata` lists imported schema ids; if the NIA marker appears, skip.
+  # The substring is the NIA schema's human-readable label tail — stable across
+  # imports because the schema id is content-addressed.
+  if "$rgb_alias" schemata 2>/dev/null | grep -qi 'NonInflatableAsset\|remote-digital-pegasus'; then
+    echo "[$role] NIA schema already imported"
+  else
+    echo "[$role] importing NIA schema from $NIA_SCHEMA_FILE"
+    "$rgb_alias" import "$NIA_SCHEMA_FILE"
+  fi
+}
+
+for role in issuer maker taker; do
+  create_one_wallet "$role" "rgb_$role"
+done
+
+for role in issuer maker taker; do
+  import_schema_once "$role" "rgb_$role"
+done
+
+echo
+echo "wallets ready. Next: make rgb-fund-wallets"
