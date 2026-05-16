@@ -96,9 +96,9 @@ printf '%s\n' "$issue_out" | sed 's/^/  /'
 
 # rgb-cmd prints `Contract <id>` on success. Belt-and-braces: also scan
 # `rgb contracts` for a fresh id we didn't see before.
-contract_id="$(printf '%s\n' "$issue_out" | grep -oE 'rgb:[A-Za-z0-9+\/=_~$-]+' | tail -n1)"
+contract_id="$(printf '%s\n' "$issue_out" | grep -oE 'rgb:[^[:space:]]+' | tail -n1)"
 if [[ -z "$contract_id" ]]; then
-  contract_id="$(rgb_issuer contracts 2>/dev/null | grep -oE 'rgb:[A-Za-z0-9+\/=_~$-]+' | tail -n1)"
+  contract_id="$(rgb_issuer contracts 2>/dev/null | grep -oE 'rgb:[^[:space:]]+' | tail -n1)"
 fi
 if [[ -z "$contract_id" ]]; then
   echo "could not extract a contract id; inspect the output above." >&2

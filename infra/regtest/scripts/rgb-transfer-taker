@@ -32,7 +32,9 @@ echo
 echo "[taker] generating receive invoice..."
 invoice_out="$(rgb_taker invoice --amount "$amount" "$contract_id" 2>&1)"
 printf '%s\n' "$invoice_out" | sed 's/^/  /'
-taker_invoice="$(printf '%s\n' "$invoice_out" | grep -oE 'rgb:[A-Za-z0-9+\/=_~$-]+' | tail -n1)"
+# The full invoice form is `rgb:<contract>/<path>/bcrt:utxob:<seal>`, so it
+# contains inner colons — match through to the next whitespace boundary.
+taker_invoice="$(printf '%s\n' "$invoice_out" | grep -oE 'rgb:[^[:space:]]+' | tail -n1)"
 if [[ -z "$taker_invoice" ]]; then
   echo "could not parse taker invoice from output above." >&2
   exit 1
