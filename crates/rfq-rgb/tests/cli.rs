@@ -136,6 +136,42 @@ async fn create_invoice_returns_rgb_invoice_referencing_the_contract() {
 }
 
 #[tokio::test]
+#[ignore = "requires the regtest stack post-`make rgb-transfer-maker` (consignment + invoice on disk)"]
+async fn validate_incoming_consignment_accepts_a_real_consignment() {
+    use base64::Engine as _;
+
+    let Some((backend, _asset)) = lib_backend() else {
+        return;
+    };
+
+    // `rgb-transfer-maker` drops both files into the maker's data dir; the
+    // consignment is strict-encoded binary, the invoice is the plain rgb: URI.
+    let data_dir = PathBuf::from(std::env::var("RGB_DATA_DIR").expect("RGB_DATA_DIR"));
+    let consignment_bytes = std::fs::read(data_dir.join("consignment.rgb"))
+        .expect("run `make rgb-transfer-maker` first to produce consignment.rgb");
+    let consignment_b64 =
+        base64::engine::general_purpose::STANDARD.encode(consignment_bytes);
+    let invoice = std::fs::read_to_string(data_dir.join("invoice.txt"))
+        .expect("run `make rgb-transfer-maker` first to produce invoice.txt");
+    let invoice = invoice.trim();
+
+    let info = backend
+        .validate_incoming_consignment(&consignment_b64, invoice)
+        .await
+        .expect("validate_incoming_consignment should accept a real consignment");
+
+    assert!(
+        info.total_amount > 0,
+        "expected positive total_amount; got {}",
+        info.total_amount,
+    );
+    assert!(
+        !info.outpoints.is_empty(),
+        "expected at least one outpoint extracted from the validated transfer",
+    );
+}
+
+#[tokio::test]
 #[ignore = "blocked on LibRgbBackend::create_swap_psbt_buy (issue #13); flip when impl lands"]
 async fn create_swap_psbt_buy_produces_psbt_and_consignment() {
     let Some((backend, _asset)) = lib_backend() else {

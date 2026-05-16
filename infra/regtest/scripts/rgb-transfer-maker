@@ -29,6 +29,9 @@ echo "amount  : $amount"
 consignment="$DATA_DIR/issuer/maker.consignment.rgb"
 psbt="$DATA_DIR/issuer/maker.tx.psbt"
 maker_consignment="$DATA_DIR/maker/consignment.rgb"
+# Persist the invoice next to the consignment so `cargo test -p rfq-rgb --
+# --ignored` can validate against the same (consignment, invoice) pair.
+maker_invoice_file="$DATA_DIR/maker/invoice.txt"
 
 echo
 echo "[maker] generating receive invoice..."
@@ -42,6 +45,7 @@ if [[ -z "$maker_invoice" ]]; then
   exit 1
 fi
 echo "  invoice: $maker_invoice"
+printf '%s' "$maker_invoice" > "$maker_invoice_file"
 
 echo
 echo "[issuer] transferring to maker..."

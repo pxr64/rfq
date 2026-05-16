@@ -1846,6 +1846,7 @@ version = "0.1.0"
 dependencies = [
  "amplify",
  "async-trait",
+ "base64",
  "bp-std",
  "bp-wallet",
  "rfq-btc",
