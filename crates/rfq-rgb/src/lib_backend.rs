@@ -4,7 +4,7 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, SwapTransfer};
 
-use bpstd::{Network, Sats, Txid, XprivAccount, XpubDerivable};
+use bpstd::{Network, Sats, XprivAccount, XpubDerivable};
 use bpwallet::fs::FsTextStore;
 use bpwallet::hot::SecureIo;
 use bpwallet::Wallet;
@@ -16,13 +16,12 @@ use rgb::invoice::{Beneficiary, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgb::persistence::fs::FsBinStore;
 use rgb::persistence::{StashReadProvider, Stock};
 use rgb::resolvers::AnyResolver;
-use rgb::validation::{
-    ResolveWitness, ValidationConfig, Validity, WitnessOrdProvider, WitnessResolverError,
-};
-use rgb::vm::WitnessOrd;
+use rgb::validation::{ResolveWitness, ValidationConfig, Validity};
 use rgb::{
     ChainNet, ContractId, GraphSeal, RgbDescr, RgbKeychain, RgbWallet, StateType, TxoSeal,
 };
+
+use crate::swap;
 
 use crate::{ConsignmentInfo, FinalizedSwap, RgbBackend, RgbError, TxOut};
 
@@ -136,24 +135,6 @@ impl LibRgbBackend {
     }
 }
 
-/// Witness-ordering provider for `stock.consume_fascia` on a not-yet-broadcast
-/// swap tx. Mirrors the inline resolver in rgb-api's `pay.rs:549-561`: the
-/// fascia we just produced via `rgb_commit` is committed but not yet on-chain,
-/// so it gets `WitnessOrd::Tentative`. The `assert_eq!` is load-bearing —
-/// `consume_fascia` should only ever query our own witness_id. See
-/// docs/swap-psbt-design.md U5.
-#[allow(dead_code)]
-struct FasciaResolver {
-    witness_id: Txid,
-}
-
-impl WitnessOrdProvider for FasciaResolver {
-    fn witness_ord(&self, witness_id: Txid) -> Result<WitnessOrd, WitnessResolverError> {
-        assert_eq!(witness_id, self.witness_id);
-        Ok(WitnessOrd::Tentative)
-    }
-}
-
 #[allow(dead_code)]
 fn chain_net_for(network: Network) -> ChainNet {
     match network {
@@ -171,12 +152,23 @@ impl RgbBackend for LibRgbBackend {
         &self,
         asset: &AssetId,
     ) -> Result<Vec<RgbInventoryUtxo>, RgbError> {
-        let stock = self.load_stock()?;
+        let wallet = self.load_wallet()?;
         let contract_id = ContractId::from_str(&asset.id)
             .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
-        let contract = stock
+        let contract = wallet
+            .stock()
             .contract_data(contract_id)
             .map_err(|e| RgbError::ContractNotFound(e.to_string()))?;
+
+        // The contract state carries every allocation the stash has seen —
+        // including the issuer's and counterparties'. Inventory is only what
+        // *this* maker can spend, so keep allocations whose outpoint is one of
+        // the wallet's own UTXOs.
+        let owned: std::collections::HashSet<(String, u32)> = wallet
+            .wallet()
+            .utxos()
+            .map(|u| (u.outpoint.txid.to_string(), u.outpoint.vout.into_u32()))
+            .collect();
 
         let mut utxos = Vec::new();
         let filter = FilterIncludeAll;
@@ -184,10 +176,14 @@ impl RgbBackend for LibRgbBackend {
             if let Ok(rgb_allocations) = contract.fungible(details.name.clone(), &filter) {
                 for alloc in rgb_allocations {
                     let op = alloc.seal.to_outpoint();
+                    let key = (op.txid.to_string(), op.vout.into_u32());
+                    if !owned.contains(&key) {
+                        continue;
+                    }
                     utxos.push(RgbInventoryUtxo {
                         outpoint: Outpoint {
-                            txid: op.txid.to_string(),
-                            vout: op.vout.into_u32(),
+                            txid: key.0,
+                            vout: key.1,
                         },
                         asset_id: asset.clone(),
                         amount: alloc.state.value(),
@@ -208,23 +204,38 @@ impl RgbBackend for LibRgbBackend {
     #[allow(clippy::too_many_arguments)]
     async fn create_swap_psbt_buy(
         &self,
-        _rgb_invoice: &str,
-        _amount: u64,
-        _maker_rgb_utxos: &[Outpoint],
-        _taker_btc_inputs: &[(Outpoint, TxOut)],
+        rgb_invoice: &str,
+        amount: u64,
+        maker_rgb_utxos: &[Outpoint],
+        taker_btc_inputs: &[(Outpoint, TxOut)],
         _btc_funding_addr: &str,
-        _gross_btc_sats: u64,
-        _actual_fee_sats: u64,
+        gross_btc_sats: u64,
+        actual_fee_sats: u64,
     ) -> Result<SwapTransfer, RgbError> {
-        // TODO(#13): build the swap PSBT via rgb-api's TransferBuilder +
-        // bp-std PSBT construction (mirrors Command::Transfer in rgb-cmd
-        // 0.11.1-rc.6 command.rs). For now, callers should use MockRgbBackend
-        // or the manual rgb-cmd flow in docs/regtest-rgb20-nia-dev-infra.md.
-        Err(RgbError::TransferBuild(
-            "LibRgbBackend::create_swap_psbt_buy is not implemented yet (issue #13); \
-             use MockRgbBackend for now"
-                .to_owned(),
-        ))
+        let account = self.load_signer()?;
+        let mut wallet = self.load_wallet()?;
+
+        // 1. Parse the taker's invoice and resolve the maker's payout address +
+        //    reserved RGB inputs.
+        let inputs = swap::prepare_buy_inputs(&mut wallet, rgb_invoice, maker_rgb_utxos)?;
+       
+        // 2. Assemble the unsigned swap tx (maker RGB + taker BTC inputs) with the
+        //    commitment host; from here the witness txid is final.
+        let mut psbt =
+            swap::assemble_unsigned_psbt(&inputs, taker_btc_inputs, gross_btc_sats, actual_fee_sats)?;
+       
+        // 3. Build the RGB transition: pay the taker's seal, change back to the maker.
+        let batch = swap::build_buy_transition(&wallet, &inputs, &psbt, amount)?;
+       
+        // 4. Embed + commit the transition and emit the witness-extended consignment.
+        let (transfer, witness_id) =
+            swap::commit_and_consign(&mut wallet, &mut psbt, batch, &inputs)?;
+       
+        // 5. Sign the maker's inputs (after commit — U4); taker BTC inputs stay open.
+        swap::sign_maker_inputs(&mut psbt, &account)?;
+       
+        // 6. Encode the partial PSBT + consignment for the wire.
+        swap::encode_swap_transfer(&psbt, &transfer, witness_id)
     }
 
     async fn finalize_after_taker_sign(

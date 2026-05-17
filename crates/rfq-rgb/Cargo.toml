@@ -14,12 +14,11 @@ base64 = "0.22"
 # Library-backed RGB adapter. Pinned to the same versions rgb-cmd 0.11.1-rc.6 uses;
 # see docs/regtest-rgb20-nia-dev-infra.md "Known Constraints & Version Pins".
 rgb-api = { version = "=0.11.1-rc.6", features = ["electrum_blocking", "fs", "serde"] }
-# `signers` exposes bp-std's `TestnetRefSigner` and bp-wallet's `hot` module
-# (`SecureIo` / `XprivAccount::read`) for the cold/hot signer split the swap
-# PSBT methods need — see docs/swap-psbt-design.md U6.
 bp-std = { version = "=0.11.1-alpha.2", features = ["client-side-validation", "serde", "signers"] }
-bp-wallet = { version = "=0.11.1-alpha.2", features = ["fs", "signers"] }
+bp-wallet = { version = "=0.11.1-alpha.2", features = ["fs", "signers", "electrum"] }
+rgb-psbt-utils = "=0.11.1-rc.6"
 amplify = "=4.8.0"
+rand = "0.9"
 
 [dev-dependencies]
 tokio = { workspace = true }

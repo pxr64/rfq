@@ -8,6 +8,7 @@ use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, SwapTransfer};
 use thiserror::Error;
 
 mod lib_backend;
+mod swap;
 pub use lib_backend::LibRgbBackend;
 
 /// Re-export of the bitcoin prevout type — a sell-side swap PSBT pins each RGB

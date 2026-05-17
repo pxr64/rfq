@@ -184,31 +184,49 @@ async fn validate_incoming_consignment_accepts_a_real_consignment() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on LibRgbBackend::create_swap_psbt_buy (issue #13); flip when impl lands"]
+#[ignore = "requires the regtest stack with a NIA contract + a funded maker; see file header"]
 async fn create_swap_psbt_buy_produces_psbt_and_consignment() {
-    let Some((backend, _asset)) = lib_backend() else {
+    let Some((backend, asset)) = lib_backend() else {
         return;
     };
 
-    // TODO(#13): generate a fresh taker invoice via the rgb-api directly so we
-    // have a real beneficiary to transfer to. For now this test just documents
-    // the intended shape and is skipped via #[ignore].
-    let result = backend
-        .create_swap_psbt_buy(
-            "rgb:dummy/~/XabF/bcrt:utxob:dummy",
-            1000,
-            &[],
-            &[],
-            "bcrt1qtaker",
-            10_000,
-            500,
-        )
-        .await;
+    // Smoke test of the full RGB composition path: use a maker-minted invoice as
+    // the (stand-in) beneficiary and the maker's own inventory as the RGB
+    // inputs. taker_btc_inputs is empty here — the BTC side is exercised
+    // end-to-end at the rfq-maker layer; this asserts the RGB transition build +
+    // embed + commit + transfer + maker-sign all succeed and yield a stable
+    // witness txid.
+    let invoice = backend
+        .create_invoice(&asset, 100)
+        .await
+        .expect("create_invoice should succeed against a live wallet");
+    let utxos = backend
+        .list_inventory_utxos(&asset)
+        .await
+        .expect("list_inventory_utxos should succeed");
+    let maker_outpoints: Vec<_> = utxos.iter().map(|u| u.outpoint.clone()).collect();
+    assert!(
+        !maker_outpoints.is_empty(),
+        "maker needs at least one RGB allocation to spend"
+    );
+
+    let transfer = backend
+        .create_swap_psbt_buy(&invoice, 100, &maker_outpoints, &[], "bcrt1qtaker", 1_000, 100)
+        .await
+        .expect("create_swap_psbt_buy should compose a swap PSBT");
 
     assert!(
-        matches!(result, Err(RgbError::TransferBuild(_))),
-        "stub should return TransferBuild error until issue #13 lands"
+        !transfer.partial_psbt.is_empty(),
+        "expected a non-empty base64 PSBT"
     );
+    assert!(
+        transfer.consignment.is_some(),
+        "buy side emits the maker's consignment"
+    );
+    let wt = transfer
+        .expected_witness_txid
+        .expect("declared-funding buy commits a stable witness txid");
+    assert_eq!(wt.len(), 64, "witness txid should be 64 hex chars, got {wt:?}");
 }
 
 #[tokio::test]
