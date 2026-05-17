@@ -61,6 +61,9 @@ pub fn app() -> Router {
     };
     let rgb_backend = Arc::new(MockRgbBackend::new(vec![utxo.clone()]));
     let bitcoin_client = Arc::new(MockBitcoinClient::new());
+    // Demo buy side: seed the taker's declared funding address so the maker's
+    // `list_unspent` returns spendable UTXOs.
+    bitcoin_client.seed_address_unspent("bcrt1qtaker", mock_taker_funding());
     // Seed BTC inventory so the maker can also quote the sell side.
     let maker = Arc::new(
         Maker::new(maker_id, vec![utxo], rgb_backend, bitcoin_client)
@@ -92,6 +95,20 @@ fn mock_btc_inventory() -> Vec<BtcInventoryUtxo> {
             pending_txid: None,
         })
         .collect()
+}
+
+/// Demo buy side: one large UTXO at the taker's declared funding address,
+/// returned by the mock `list_unspent`.
+fn mock_taker_funding() -> Vec<(Outpoint, rfq_btc::TxOut)> {
+    let mut p2wpkh = vec![0x00, 0x14];
+    p2wpkh.extend(std::iter::repeat_n(0x22, 20));
+    vec![(
+        Outpoint::new(format!("{:064x}", 0xfeedu64), 0),
+        rfq_btc::TxOut {
+            value_sats: 100_000_000,
+            script_pubkey: p2wpkh,
+        },
+    )]
 }
 
 pub fn app_with_state(state: AppState) -> Router {

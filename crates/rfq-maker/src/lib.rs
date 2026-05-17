@@ -830,7 +830,7 @@ impl MakerConnector for Maker {
         // Buy and sell diverge entirely at accept: buy finalizes the maker's
         // RGB-side PSBT now, sell only parks the BTC reservation and waits for
         // the taker's consignment. Dispatch and let each path run on its own.
-        let (rgb_invoice, _btc_funding_addr) = match &request.leg {
+        let (rgb_invoice, btc_funding_addr) = match &request.leg {
             SwapLeg::Buy {
                 rgb_invoice,
                 btc_funding_addr,
@@ -878,11 +878,56 @@ impl MakerConnector for Maker {
             reserved.iter().map(|u| u.outpoint.clone()).collect();
         let expected_change = reserved_total.saturating_sub(quote.amount);
 
+        // Declared-funding: discover the taker's BTC UTXOs from the address it
+        // put on the ACCEPT, then select enough to cover the price + fee. The
+        // taker only signs these inputs at `/sign`; it never adds its own.
+        let actual_fee = self.estimate_swap_fee().await;
+        if quote.estimated_fee_sats > 0 {
+            let cap = quote
+                .estimated_fee_sats
+                .saturating_mul(10_000 + u64::from(quote.fee_slippage_bps))
+                / 10_000;
+            if actual_fee > cap {
+                let _ = self.store.release_reservation(&reservation_id, now_ms()).await;
+                return Err(RouterError::FeeSlippageExceeded {
+                    estimated: quote.estimated_fee_sats,
+                    actual: actual_fee,
+                });
+            }
+        }
+        let taker_btc_inputs = match self.bitcoin_client.list_unspent(&btc_funding_addr).await {
+            Ok(utxos) => match select_btc_inputs(&utxos, quote.price.saturating_add(actual_fee)) {
+                Some(selected) => selected,
+                None => {
+                    let _ = self.store.release_reservation(&reservation_id, now_ms()).await;
+                    return Err(RouterError::Maker(format!(
+                        "taker funding address {btc_funding_addr} has insufficient BTC for \
+                         price {} + fee {actual_fee}",
+                        quote.price,
+                    )));
+                }
+            },
+            Err(e) => {
+                let _ = self.store.release_reservation(&reservation_id, now_ms()).await;
+                return Err(RouterError::Maker(format!(
+                    "list_unspent({btc_funding_addr}) failed: {e}"
+                )));
+            }
+        };
+
         // Build the maker-RGB-side PSBT + consignment. On failure the
         // reservation goes back to Available.
         let transfer = match self
             .rgb_backend
-            .create_swap_psbt_buy(&rgb_invoice, quote.amount, &reserved_outpoints)
+            .create_swap_psbt_buy(
+                &rgb_invoice,
+                quote.amount,
+                &reserved_outpoints,
+                &taker_btc_inputs,
+                &btc_funding_addr,
+                quote.price,
+                actual_fee,
+            )
             .await
         {
             Ok(t) => t,
@@ -971,31 +1016,10 @@ impl MakerConnector for Maker {
         let reservation_id = pending.reservation_id.clone();
         let quote = &pending.quote;
 
-        // Fee-slippage guard. Skipped when the quote-time estimate was 0 (the
-        // feerate estimate failed at quote time — no baseline to compare).
-        if quote.estimated_fee_sats > 0 {
-            let feerate = self
-                .bitcoin_client
-                .estimate_feerate(3)
-                .await
-                .map_err(|e| RouterError::Maker(format!("feerate estimate failed: {e}")))?;
-            let actual_fee = feerate.saturating_mul(ESTIMATED_SWAP_VBYTES);
-            let cap = quote
-                .estimated_fee_sats
-                .saturating_mul(10_000 + u64::from(quote.fee_slippage_bps))
-                / 10_000;
-            if actual_fee > cap {
-                let _ = self
-                    .store
-                    .mark_broadcast_failed(&reservation_id, now_ms())
-                    .await;
-                self.pending.write().await.remove(&quote_id);
-                return Err(RouterError::FeeSlippageExceeded {
-                    estimated: quote.estimated_fee_sats,
-                    actual: actual_fee,
-                });
-            }
-        }
+        // No fee-slippage guard here: under declared-funding the buy PSBT is
+        // fully committed at accept time (every input is known then), so the
+        // fee was locked and slippage-checked in `accept_quote`. The taker only
+        // adds signatures at `/sign` — it can't change the fee.
 
         // Finalize the taker-signed PSBT into a broadcastable tx.
         let finalized = match self
@@ -1088,6 +1112,36 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Greedy largest-first selection over the taker's declared-funding UTXOs.
+/// Returns the chosen `(outpoint, prevout)` pairs once their values cover
+/// `target_sats`, or `None` if the address can't. Mirrors
+/// `GreedyLargestFirstSelector`, but operates on the `(Outpoint, TxOut)` shape
+/// `BitcoinClient::list_unspent` returns (taker UTXOs aren't maker inventory,
+/// so they don't pass through `BtcInventoryStore`).
+fn select_btc_inputs(
+    available: &[(Outpoint, TxOut)],
+    target_sats: u64,
+) -> Option<Vec<(Outpoint, TxOut)>> {
+    let mut sorted: Vec<&(Outpoint, TxOut)> = available.iter().collect();
+    // Largest first; tie-break on outpoint for determinism.
+    sorted.sort_by(|a, b| {
+        b.1.value_sats
+            .cmp(&a.1.value_sats)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut chosen = Vec::new();
+    let mut total = 0u64;
+    for pair in sorted {
+        if total >= target_sats {
+            break;
+        }
+        total = total.saturating_add(pair.1.value_sats);
+        chosen.push(pair.clone());
+    }
+    (total >= target_sats).then_some(chosen)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1160,6 +1214,9 @@ mod tests {
         utxos: Vec<RgbInventoryUtxo>,
         bitcoin_client: Arc<MockBitcoinClient>,
     ) -> Maker {
+        // Declared-funding buy tests resolve the taker's BTC inputs from this
+        // address; seed it generously so selection always covers price + fee.
+        bitcoin_client.seed_address_unspent(BUY_FUNDING_ADDR, taker_funding());
         let rgb_backend = Arc::new(MockRgbBackend::new(utxos.clone()));
         Maker::new(maker_id(), utxos, rgb_backend, bitcoin_client)
     }
@@ -1167,13 +1224,30 @@ mod tests {
     /// Seed the store directly so tests can pre-set Reserved / Spent statuses.
     fn maker_with_store(rows: Vec<InventoryUtxo>) -> Maker {
         let rgb_backend = Arc::new(MockRgbBackend::new(vec![utxo()]));
+        let bitcoin_client = Arc::new(MockBitcoinClient::new());
+        bitcoin_client.seed_address_unspent(BUY_FUNDING_ADDR, taker_funding());
         Maker::with_components(
             maker_id(),
             Arc::new(InMemoryInventoryStore::with_seed(rows)),
             Arc::new(GreedyExactFitSelector),
             rgb_backend,
-            Arc::new(MockBitcoinClient::new()),
+            bitcoin_client,
         )
+    }
+
+    /// The BTC address buy-side tests declare as the taker's funding source.
+    const BUY_FUNDING_ADDR: &str = "bcrt1qtaker";
+
+    /// One large taker UTXO at `BUY_FUNDING_ADDR`, enough to cover any test
+    /// quote's price + fee.
+    fn taker_funding() -> Vec<(Outpoint, TxOut)> {
+        vec![(
+            Outpoint::new(format!("{:064x}", 0xfeedu64), 0),
+            TxOut {
+                value_sats: 100_000_000,
+                script_pubkey: vec![0x00, 0x14],
+            },
+        )]
     }
 
     /// Build a `SwapLeg::Buy` accept request for `quote`.
@@ -1182,7 +1256,7 @@ mod tests {
             quote_id: quote.quote_id.clone(),
             leg: SwapLeg::Buy {
                 rgb_invoice: invoice.to_owned(),
-                btc_funding_addr: "bcrt1qtaker".to_owned(),
+                btc_funding_addr: BUY_FUNDING_ADDR.to_owned(),
             },
         }
     }
@@ -2042,10 +2116,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_signed_psbt_fee_slippage_releases_reservation() {
+    async fn buy_accept_fee_slippage_releases_reservation() {
         // Default mock feerate (5 sat/vB) × 200 vB = 1000 sat actual. Crafting
-        // the accepted quote with a tiny baseline + zero slippage tolerance
-        // makes the submit-time re-estimate blow the cap.
+        // the quote with a tiny baseline + zero slippage tolerance makes the
+        // accept-time estimate blow the cap. Under declared-funding the buy
+        // PSBT is fully committed at accept, so slippage is checked there (not
+        // at /sign).
         let maker = maker();
         let mut quote = maker
             .request_quote(quote_request("rfq-1"))
@@ -2055,19 +2131,14 @@ mod tests {
         quote.estimated_fee_sats = 1;
         quote.fee_slippage_bps = 0;
 
-        let intent = maker
-            .accept_quote(quote.clone(), buy_request(&quote, "rgb:invoice"))
-            .await
-            .unwrap();
-        let psbt = intent.transfer.expect("transfer").partial_psbt;
-
         let result = maker
-            .submit_signed_psbt(quote.quote_id.clone(), format!("{psbt}|signed"))
+            .accept_quote(quote.clone(), buy_request(&quote, "rgb:invoice"))
             .await;
         assert!(matches!(
             result,
             Err(RouterError::FeeSlippageExceeded { .. })
         ));
+        // Reservation released back to Available.
         let utxos = maker.utxo_snapshot().await;
         assert!(matches!(utxos[0].status, InventoryStatus::Available));
     }

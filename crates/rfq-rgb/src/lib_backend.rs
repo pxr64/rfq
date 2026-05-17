@@ -205,11 +205,16 @@ impl RgbBackend for LibRgbBackend {
             .map_err(|_| RgbError::InvalidInvoice)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn create_swap_psbt_buy(
         &self,
         _rgb_invoice: &str,
         _amount: u64,
         _maker_rgb_utxos: &[Outpoint],
+        _taker_btc_inputs: &[(Outpoint, TxOut)],
+        _btc_funding_addr: &str,
+        _gross_btc_sats: u64,
+        _actual_fee_sats: u64,
     ) -> Result<SwapTransfer, RgbError> {
         // TODO(#13): build the swap PSBT via rgb-api's TransferBuilder +
         // bp-std PSBT construction (mirrors Command::Transfer in rgb-cmd

@@ -94,6 +94,17 @@ impl MockBitcoinClient {
     pub fn fail_next_broadcast(&self, reason: impl Into<String>) {
         self.state.lock().expect("mock state lock").next_broadcast_error = Some(reason.into());
     }
+
+    /// Seed the `list_unspent(address)` result on an already-shared client.
+    /// `&self` counterpart to the consuming `with_address_unspent` builder, for
+    /// callers holding an `Arc<MockBitcoinClient>`.
+    pub fn seed_address_unspent(&self, address: impl Into<String>, utxos: Vec<(Outpoint, TxOut)>) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .address_unspent
+            .insert(address.into(), utxos);
+    }
 }
 
 #[async_trait]

@@ -61,19 +61,30 @@ pub trait RgbBackend: Send + Sync {
 
     async fn validate_invoice(&self, invoice: &str) -> Result<(), RgbError>;
 
-    /// Buy-side swap PSBT construction. The maker contributes its RGB-bearing
-    /// inputs (`maker_rgb_utxos`, the outpoints the inventory store reserved)
-    /// and the RGB transition to `rgb_invoice`; the taker fills in BTC funding
-    /// inputs at `/sign` time. Returns a `SwapTransfer` whose `partial_psbt` is
-    /// maker-RGB-side-signed and whose `consignment` is `Some`.
+    /// Buy-side swap PSBT construction (declared-funding model). The maker
+    /// contributes its RGB-bearing inputs (`maker_rgb_utxos`, the outpoints the
+    /// inventory store reserved) and the RGB transition to `rgb_invoice`. The
+    /// taker's BTC funding inputs are discovered up front from its declared
+    /// `btc_funding_addr` (resolved to `taker_btc_inputs` by the caller via
+    /// `BitcoinClient::list_unspent` + coin selection) and built into the PSBT
+    /// here, so the taker only signs — it never restructures the tx. Outputs:
+    /// the maker's BTC payout (`gross_btc_sats`), the taker's BTC change (back
+    /// to `btc_funding_addr`), and the RGB commitment. `actual_fee_sats` is the
+    /// taker-paid network fee deducted from the change.
     ///
-    /// `expected_witness_txid` is `None` on buy side here — the witness txid
-    /// isn't committed until the taker adds inputs and signs.
+    /// Because the full input set is final at build time, the witness txid is
+    /// stable: `partial_psbt` is maker-RGB-side-signed, `consignment` is
+    /// `Some`, and `expected_witness_txid` is `Some`.
+    #[allow(clippy::too_many_arguments)]
     async fn create_swap_psbt_buy(
         &self,
         rgb_invoice: &str,
         amount: u64,
         maker_rgb_utxos: &[Outpoint],
+        taker_btc_inputs: &[(Outpoint, TxOut)],
+        btc_funding_addr: &str,
+        gross_btc_sats: u64,
+        actual_fee_sats: u64,
     ) -> Result<SwapTransfer, RgbError>;
 
     /// Finalize a fully-signed swap PSBT: extract the witness tx ready to
@@ -172,23 +183,34 @@ impl RgbBackend for MockRgbBackend {
         rgb_invoice: &str,
         amount: u64,
         maker_rgb_utxos: &[Outpoint],
+        taker_btc_inputs: &[(Outpoint, TxOut)],
+        btc_funding_addr: &str,
+        gross_btc_sats: u64,
+        actual_fee_sats: u64,
     ) -> Result<SwapTransfer, RgbError> {
         self.validate_invoice(rgb_invoice).await?;
 
-        // Deterministic mock PSBT: encodes the maker's RGB inputs + the
-        // transition target so finalize_after_taker_sign can hash it into a
-        // stable witness txid. Real bytes land with #13's LibRgbBackend.
-        let inputs: Vec<String> = maker_rgb_utxos.iter().map(|o| o.to_string()).collect();
-        let partial_psbt = format!(
-            "mock-psbt:buy:invoice={rgb_invoice}:amount={amount}:rgb_in=[{}]",
-            inputs.join(",")
+        // Deterministic mock PSBT. Declared-funding: the taker's BTC inputs are
+        // present at build time, so the witness txid is stable (committed via
+        // `:wt=`). `rgb_in`/`btc_in` list every input verbatim; `maker-signed`
+        // stands in for the maker's signatures over its own RGB inputs. Real
+        // bytes land with #13's LibRgbBackend.
+        let rgb_in = join_outpoints(maker_rgb_utxos.iter());
+        let btc_in = join_outpoints(taker_btc_inputs.iter().map(|(o, _)| o));
+        let taker_btc_total: u64 = taker_btc_inputs.iter().map(|(_, t)| t.value_sats).sum();
+        let taker_change = taker_btc_total
+            .saturating_sub(gross_btc_sats)
+            .saturating_sub(actual_fee_sats);
+        let body = format!(
+            "mock-psbt:buy:invoice={rgb_invoice}:amount={amount}:funding_addr={btc_funding_addr}\
+             :gross={gross_btc_sats}:fee={actual_fee_sats}:taker_change={taker_change}\
+             :rgb_in=[{rgb_in}]:btc_in=[{btc_in}]:maker-signed",
         );
+        let partial_psbt = format!("{body}:wt={}", mock_witness_txid(&body));
         Ok(SwapTransfer {
+            expected_witness_txid: Some(extract_witness_txid(&partial_psbt)),
             partial_psbt,
             consignment: Some(format!("mock-consignment:buy:amount={amount}")),
-            // Buy side: the taker still has to add BTC inputs, so the witness
-            // txid isn't committed yet.
-            expected_witness_txid: None,
         })
     }
 

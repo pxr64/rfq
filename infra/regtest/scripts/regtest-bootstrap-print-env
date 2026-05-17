@@ -20,6 +20,8 @@ cat <<EOF
   export RGB_WALLET="maker"
   export RGB_NETWORK="regtest"
   export ELECTRUM_URL="$ELECTRUM_URL"
+  export RGB_SIGNER_ACCOUNT_FILE="$WALLETS_DIR/maker.account"
+  export RGB_SIGNER_PASSWORD=""
 EOF
 
 if [[ -n "$contract_id" ]]; then

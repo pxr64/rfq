@@ -194,7 +194,15 @@ async fn create_swap_psbt_buy_produces_psbt_and_consignment() {
     // have a real beneficiary to transfer to. For now this test just documents
     // the intended shape and is skipped via #[ignore].
     let result = backend
-        .create_swap_psbt_buy("rgb:dummy/~/XabF/bcrt:utxob:dummy", 1000, &[])
+        .create_swap_psbt_buy(
+            "rgb:dummy/~/XabF/bcrt:utxob:dummy",
+            1000,
+            &[],
+            &[],
+            "bcrt1qtaker",
+            10_000,
+            500,
+        )
         .await;
 
     assert!(

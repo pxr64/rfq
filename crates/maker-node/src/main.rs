@@ -310,11 +310,29 @@ async fn build_maker(config: &MakerNodeConfig) -> Result<Maker, Box<dyn std::err
     // estimation. maker-node runs against a mock until the electrum-backed
     // client is wired through config (#15b follow-up).
     let bitcoin_client = Arc::new(MockBitcoinClient::new());
+    // Demo buy side: seed the taker's declared funding address so
+    // `list_unspent` returns spendable UTXOs. A real deployment uses an
+    // electrum-backed client that queries the chain instead.
+    bitcoin_client.seed_address_unspent("bcrt1qtaker", mock_taker_funding());
     // 16c: seed mock BTC inventory so the node can also serve the sell side.
     // A real maker resolves these from a wallet bootstrap; the demo round
     // trip in docs/swap-flows.md uses these deterministic outpoints.
     Ok(Maker::new(maker_id, utxos, rgb_backend, bitcoin_client)
         .with_btc_inventory(mock_btc_inventory()))
+}
+
+/// Demo buy side: a single large UTXO at the taker's declared funding address,
+/// returned by the mock `list_unspent`. Real deployments query electrum.
+fn mock_taker_funding() -> Vec<(Outpoint, rfq_btc::TxOut)> {
+    let mut p2wpkh = vec![0x00, 0x14];
+    p2wpkh.extend(std::iter::repeat_n(0x22, 20));
+    vec![(
+        Outpoint::new(format!("{:064x}", 0xfeedu64), 0),
+        rfq_btc::TxOut {
+            value_sats: 100_000_000,
+            script_pubkey: p2wpkh,
+        },
+    )]
 }
 
 /// Deterministic segwit BTC UTXOs the mock maker pays sell-side takers from.
