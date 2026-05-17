@@ -38,6 +38,14 @@ pub trait BitcoinClient: Send + Sync {
     /// once all inputs are present — see `docs/swap-flows.md`).
     async fn get_outpoint(&self, outpoint: &Outpoint) -> Result<TxOut, BtcError>;
 
+    /// Unspent outputs at `address`. Used on the declared-funding buy side: the
+    /// taker declares its BTC funding address in the ACCEPT, and the maker
+    /// discovers the spendable UTXOs here. Each returned `TxOut` carries the
+    /// address's `script_pubkey` (shared across results) plus the per-UTXO
+    /// `value_sats`, so the pairs feed directly into coin selection + PSBT
+    /// input enrichment. An address with no UTXOs returns `Ok(vec![])`.
+    async fn list_unspent(&self, address: &str) -> Result<Vec<(Outpoint, TxOut)>, BtcError>;
+
     /// Broadcast a finalized (witness) transaction. Returns the witness txid
     /// as lowercase hex.
     async fn broadcast(&self, raw_tx: &[u8]) -> Result<String, BtcError>;

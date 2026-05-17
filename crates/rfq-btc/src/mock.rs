@@ -20,6 +20,9 @@ pub struct MockBitcoinClient {
 #[derive(Default)]
 struct MockState {
     prevouts: HashMap<Outpoint, TxOut>,
+    /// UTXOs seeded per address, surfaced by `list_unspent`. Independent of
+    /// `prevouts` — a different lookup (by address, not outpoint).
+    address_unspent: HashMap<String, Vec<(Outpoint, TxOut)>>,
     broadcasts: Vec<Vec<u8>>,
     /// Feerate in sat/vbyte returned for any `target_blocks`. Single-knob mock;
     /// fine for v0 since the slippage check in 15c just needs a feerate to
@@ -53,6 +56,21 @@ impl MockBitcoinClient {
     /// in 16a once `BtcInventoryStore` is populated against a mock.
     pub fn with_prevout(self, outpoint: Outpoint, txout: TxOut) -> Self {
         self.state.lock().expect("mock state lock").prevouts.insert(outpoint, txout);
+        self
+    }
+
+    /// Seed the UTXO set `list_unspent(address)` returns. Mirrors
+    /// `with_prevout` but keyed by address.
+    pub fn with_address_unspent(
+        self,
+        address: impl Into<String>,
+        utxos: Vec<(Outpoint, TxOut)>,
+    ) -> Self {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .address_unspent
+            .insert(address.into(), utxos);
         self
     }
 
@@ -91,6 +109,17 @@ impl BitcoinClient for MockBitcoinClient {
             return Err(BtcError::NonSegwitOutpoint(outpoint.to_string()));
         }
         Ok(txout)
+    }
+
+    async fn list_unspent(&self, address: &str) -> Result<Vec<(Outpoint, TxOut)>, BtcError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("mock state lock")
+            .address_unspent
+            .get(address)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn broadcast(&self, raw_tx: &[u8]) -> Result<String, BtcError> {
@@ -210,5 +239,23 @@ mod tests {
     async fn block_height_returns_configured_value() {
         let client = MockBitcoinClient::new().with_block_height(123_456);
         assert_eq!(client.block_height().await.unwrap(), 123_456);
+    }
+
+    #[tokio::test]
+    async fn list_unspent_returns_seeded_utxos() {
+        let utxos = vec![
+            (op(1), TxOut { value_sats: 50_000, script_pubkey: p2wpkh() }),
+            (op(2), TxOut { value_sats: 30_000, script_pubkey: p2wpkh() }),
+        ];
+        let client =
+            MockBitcoinClient::new().with_address_unspent("bcrt1qfunding", utxos.clone());
+
+        assert_eq!(client.list_unspent("bcrt1qfunding").await.unwrap(), utxos);
+    }
+
+    #[tokio::test]
+    async fn list_unspent_returns_empty_for_unseeded_address() {
+        let client = MockBitcoinClient::new();
+        assert_eq!(client.list_unspent("bcrt1qnope").await.unwrap(), vec![]);
     }
 }

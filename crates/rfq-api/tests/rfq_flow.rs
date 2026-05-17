@@ -73,6 +73,7 @@ async fn rfq_quote_accept_flow_succeeds() {
     let accept_body = AcceptQuoteBody {
         leg: SwapLeg::Buy {
             rgb_invoice: "rgb:test_invoice".to_owned(),
+            btc_funding_addr: "bcrt1qtaker".to_owned(),
         },
     };
 

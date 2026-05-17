@@ -13,9 +13,11 @@
 //! `tokio::task::spawn_blocking` so the trait's `async fn` contract is honored
 //! without holding a tokio worker thread on socket I/O.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use electrum_client::bitcoin::address::{Address, NetworkUnchecked};
 use electrum_client::{Client, ConfigBuilder, ElectrumApi};
 use rfq_types::Outpoint;
 
@@ -48,6 +50,36 @@ impl BitcoinClient for ElectrumClient {
         Err(BtcError::Backend(
             "ElectrumClient::get_outpoint not yet wired (#15c follow-up)".to_owned(),
         ))
+    }
+
+    async fn list_unspent(&self, address: &str) -> Result<Vec<(Outpoint, TxOut)>, BtcError> {
+        // The taker's declared funding address is checked for the maker's
+        // network at the protocol layer (accept_quote_buy), so the trait stays
+        // network-naive and we assume_checked here.
+        let addr = Address::<NetworkUnchecked>::from_str(address)
+            .map_err(|e| BtcError::Backend(format!("invalid address: {e}")))?
+            .assume_checked();
+        let script = addr.script_pubkey();
+        let script_bytes = script.to_bytes();
+
+        let client = Arc::clone(&self.client);
+        let utxos = tokio::task::spawn_blocking(move || client.script_list_unspent(&script))
+            .await
+            .map_err(|e| BtcError::Backend(format!("blocking task join: {e}")))?
+            .map_err(|e| BtcError::Backend(format!("electrum script_list_unspent: {e}")))?;
+
+        Ok(utxos
+            .into_iter()
+            .map(|u| {
+                (
+                    Outpoint::new(u.tx_hash.to_string(), u.tx_pos as u32),
+                    TxOut {
+                        value_sats: u.value,
+                        script_pubkey: script_bytes.clone(),
+                    },
+                )
+            })
+            .collect())
     }
 
     async fn broadcast(&self, raw_tx: &[u8]) -> Result<String, BtcError> {

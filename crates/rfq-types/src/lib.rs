@@ -148,9 +148,16 @@ pub struct AcceptQuoteRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "side", rename_all = "snake_case")]
 pub enum SwapLeg {
-    /// Taker is buying RGB and paying BTC. Taker contributes BTC funding
-    /// inputs at `/sign` time — the maker never touches a taker BTC address.
-    Buy { rgb_invoice: String },
+    /// Taker is buying RGB and paying BTC. The taker declares the BTC address
+    /// holding its funding UTXOs (`btc_funding_addr`); the maker discovers those
+    /// UTXOs via `BitcoinClient::list_unspent`, builds them into the PSBT as
+    /// inputs, and routes the taker's BTC change back to the same address. The
+    /// taker only signs the inputs the maker built — it never restructures the
+    /// PSBT. See `docs/swap-flows.md` (declared-funding buy side).
+    Buy {
+        rgb_invoice: String,
+        btc_funding_addr: String,
+    },
     /// Taker is selling RGB and receiving BTC. Maker publishes its own RGB
     /// invoice on the `Quote` (`maker_rgb_invoice`); taker delivers a
     /// consignment to that invoice via `/consignment`.

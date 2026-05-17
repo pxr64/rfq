@@ -830,8 +830,11 @@ impl MakerConnector for Maker {
         // Buy and sell diverge entirely at accept: buy finalizes the maker's
         // RGB-side PSBT now, sell only parks the BTC reservation and waits for
         // the taker's consignment. Dispatch and let each path run on its own.
-        let rgb_invoice = match &request.leg {
-            SwapLeg::Buy { rgb_invoice } => rgb_invoice.clone(),
+        let (rgb_invoice, _btc_funding_addr) = match &request.leg {
+            SwapLeg::Buy {
+                rgb_invoice,
+                btc_funding_addr,
+            } => (rgb_invoice.clone(), btc_funding_addr.clone()),
             SwapLeg::Sell {
                 btc_payout_addr,
                 rgb_change_invoice,
@@ -1179,6 +1182,7 @@ mod tests {
             quote_id: quote.quote_id.clone(),
             leg: SwapLeg::Buy {
                 rgb_invoice: invoice.to_owned(),
+                btc_funding_addr: "bcrt1qtaker".to_owned(),
             },
         }
     }
@@ -1764,6 +1768,7 @@ mod tests {
                     quote_id: quote.quote_id.clone(),
                     leg: SwapLeg::Buy {
                         rgb_invoice: "rgb:test_invoice".to_owned(),
+                        btc_funding_addr: "bcrt1qtaker".to_owned(),
                     },
                 },
             )
@@ -2146,6 +2151,7 @@ mod tests {
                     quote_id: quote.quote_id,
                     leg: SwapLeg::Buy {
                         rgb_invoice: "not-an-invoice".into(),
+                        btc_funding_addr: "bcrt1qtaker".to_owned(),
                     },
                 },
             )

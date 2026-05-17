@@ -658,6 +658,7 @@ mod tests {
             quote_id: quote.quote_id.clone(),
             leg: SwapLeg::Buy {
                 rgb_invoice: "rgb:test_invoice".to_owned(),
+                btc_funding_addr: "bcrt1qtaker".to_owned(),
             },
         };
 
@@ -683,6 +684,7 @@ mod tests {
             quote_id: QuoteId("missing".to_owned()),
             leg: SwapLeg::Buy {
                 rgb_invoice: "rgb:test_invoice".to_owned(),
+                btc_funding_addr: "bcrt1qtaker".to_owned(),
             },
         };
 

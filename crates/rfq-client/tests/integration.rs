@@ -67,6 +67,7 @@ async fn buy_flow_settles_through_the_client() {
             quote_id: quote_id.clone(),
             leg: SwapLeg::Buy {
                 rgb_invoice: "rgb:taker-invoice".to_owned(),
+                btc_funding_addr: "bcrt1qtaker".to_owned(),
             },
         })
         .await
@@ -124,6 +125,7 @@ async fn accept_unknown_quote_surfaces_an_http_error() {
             quote_id: QuoteId("no-such-quote".to_owned()),
             leg: SwapLeg::Buy {
                 rgb_invoice: "rgb:x".to_owned(),
+                btc_funding_addr: "bcrt1qtaker".to_owned(),
             },
         })
         .await;
