@@ -152,6 +152,9 @@ impl RgbBackend for LibRgbBackend {
         &self,
         asset: &AssetId,
     ) -> Result<Vec<RgbInventoryUtxo>, RgbError> {
+        // NB: the wallet UTXO set here is the on-disk cache — `load_wallet` does
+        // no network sync. A long-running maker-node must refresh it in its
+        // lifecycle (see "Wallet UTXO-cache sync" in docs/broker-maker-node-roadmap.md).
         let wallet = self.load_wallet()?;
         let contract_id = ContractId::from_str(&asset.id)
             .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
@@ -163,11 +166,17 @@ impl RgbBackend for LibRgbBackend {
         // The contract state carries every allocation the stash has seen —
         // including the issuer's and counterparties'. Inventory is only what
         // *this* maker can spend, so keep allocations whose outpoint is one of
-        // the wallet's own UTXOs.
-        let owned: std::collections::HashSet<(String, u32)> = wallet
+        // the wallet's own UTXOs. The map also carries each UTXO's bitcoin value
+        // so we can surface `btc_sats` (the seal-anchor sats spent on the swap).
+        let owned: std::collections::HashMap<(String, u32), u64> = wallet
             .wallet()
             .utxos()
-            .map(|u| (u.outpoint.txid.to_string(), u.outpoint.vout.into_u32()))
+            .map(|u| {
+                (
+                    (u.outpoint.txid.to_string(), u.outpoint.vout.into_u32()),
+                    u.value.sats(),
+                )
+            })
             .collect();
 
         let mut utxos = Vec::new();
@@ -177,9 +186,9 @@ impl RgbBackend for LibRgbBackend {
                 for alloc in rgb_allocations {
                     let op = alloc.seal.to_outpoint();
                     let key = (op.txid.to_string(), op.vout.into_u32());
-                    if !owned.contains(&key) {
+                    let Some(&btc_sats) = owned.get(&key) else {
                         continue;
-                    }
+                    };
                     utxos.push(RgbInventoryUtxo {
                         outpoint: Outpoint {
                             txid: key.0,
@@ -187,7 +196,7 @@ impl RgbBackend for LibRgbBackend {
                         },
                         asset_id: asset.clone(),
                         amount: alloc.state.value(),
-                        btc_sats: 0,
+                        btc_sats,
                     });
                 }
             }
