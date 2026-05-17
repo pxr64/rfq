@@ -40,8 +40,18 @@ fn lib_backend() -> Option<(LibRgbBackend, AssetId)> {
         std::env::var("ELECTRUM_URL").unwrap_or_else(|_| "localhost:50001".to_owned());
     let wallet_name = std::env::var("RGB_WALLET").unwrap_or_else(|_| "maker".to_owned());
     let network = std::env::var("RGB_NETWORK").unwrap_or_else(|_| "regtest".to_owned());
+    let signer_account_file =
+        PathBuf::from(std::env::var("RGB_SIGNER_ACCOUNT_FILE").unwrap_or_default());
+    let signer_password = std::env::var("RGB_SIGNER_PASSWORD").unwrap_or_default();
 
-    let backend = LibRgbBackend::new(data_dir, wallet_name, network, electrum_url);
+    let backend = LibRgbBackend::new(
+        data_dir,
+        wallet_name,
+        network,
+        electrum_url,
+        signer_account_file,
+        signer_password,
+    );
     let asset = AssetId {
         network: BitcoinNetwork::Regtest,
         kind: AssetKind::Rgb20,
@@ -59,6 +69,8 @@ async fn validate_invoice_rejects_garbage() {
         "irrelevant".to_owned(),
         "regtest".to_owned(),
         "localhost:50001".to_owned(),
+        PathBuf::from("/tmp/nonexistent-signer"),
+        String::new(),
     );
 
     assert!(matches!(

@@ -87,6 +87,8 @@ struct RgbConfig {
     network: String,
     electrum_url: String,
     contract_id: String,
+    signer_account_file: PathBuf,
+    signer_password: String,
 }
 
 impl MakerNodeConfig {
@@ -140,12 +142,18 @@ impl RgbConfig {
             env::var("ELECTRUM_URL").unwrap_or_else(|_| "localhost:50001".to_owned());
         let wallet_name = env::var("RGB_WALLET").unwrap_or_else(|_| "maker".to_owned());
         let network = env::var("RGB_NETWORK").unwrap_or_else(|_| "regtest".to_owned());
+        let signer_account_file = env::var("RGB_SIGNER_ACCOUNT_FILE").ok()?;
+        // Regtest accounts are typically written with an empty password; mainnet
+        // operators set RGB_SIGNER_PASSWORD.
+        let signer_password = env::var("RGB_SIGNER_PASSWORD").unwrap_or_default();
         Some(Self {
             data_dir: PathBuf::from(data_dir),
             wallet_name,
             network,
             electrum_url,
             contract_id,
+            signer_account_file: PathBuf::from(signer_account_file),
+            signer_password,
         })
     }
 }
@@ -280,6 +288,8 @@ async fn build_maker(config: &MakerNodeConfig) -> Result<Maker, Box<dyn std::err
                 rgb_cfg.wallet_name.clone(),
                 rgb_cfg.network.clone(),
                 rgb_cfg.electrum_url.clone(),
+                rgb_cfg.signer_account_file.clone(),
+                rgb_cfg.signer_password.clone(),
             );
             let utxos = backend.list_inventory_utxos(&asset).await?;
             (utxos, Arc::new(backend))

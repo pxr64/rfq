@@ -4,8 +4,9 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, SwapTransfer};
 
-use bpstd::{Network, Sats, XpubDerivable};
+use bpstd::{Network, Sats, Txid, XprivAccount, XpubDerivable};
 use bpwallet::fs::FsTextStore;
+use bpwallet::hot::SecureIo;
 use bpwallet::Wallet;
 use amplify::Wrapper as _;
 use base64::Engine as _;
@@ -15,7 +16,10 @@ use rgb::invoice::{Beneficiary, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgb::persistence::fs::FsBinStore;
 use rgb::persistence::{StashReadProvider, Stock};
 use rgb::resolvers::AnyResolver;
-use rgb::validation::{ResolveWitness, ValidationConfig, Validity};
+use rgb::validation::{
+    ResolveWitness, ValidationConfig, Validity, WitnessOrdProvider, WitnessResolverError,
+};
+use rgb::vm::WitnessOrd;
 use rgb::{
     ChainNet, ContractId, GraphSeal, RgbDescr, RgbKeychain, RgbWallet, StateType, TxoSeal,
 };
@@ -36,6 +40,13 @@ pub struct LibRgbBackend {
     // + the swap-PSBT methods (next #13 session).
     #[allow(dead_code)]
     electrum_url: String,
+    // Cold/hot signer split: `load_wallet()` is xpub-only (can't sign); the
+    // swap-PSBT methods load this encrypted account file to sign the maker's
+    // own inputs. See docs/swap-psbt-design.md U6.
+    #[allow(dead_code)]
+    signer_account_file: PathBuf,
+    #[allow(dead_code)]
+    signer_password: String,
 }
 
 impl LibRgbBackend {
@@ -44,12 +55,16 @@ impl LibRgbBackend {
         wallet_name: String,
         network: String,
         electrum_url: String,
+        signer_account_file: PathBuf,
+        signer_password: String,
     ) -> Self {
         Self {
             data_dir,
             wallet_name,
             network,
             electrum_url,
+            signer_account_file,
+            signer_password,
         }
     }
 
@@ -99,6 +114,15 @@ impl LibRgbBackend {
         Ok(resolver)
     }
 
+    /// Load the maker's signing account (xpriv) from the configured encrypted
+    /// file. Parallel to `load_wallet()` but for the hot side of the cold/hot
+    /// split. Consumed by the swap-PSBT methods to sign the maker's own inputs.
+    #[allow(dead_code)]
+    fn load_signer(&self) -> Result<XprivAccount, RgbError> {
+        XprivAccount::read(&self.signer_account_file, &self.signer_password)
+            .map_err(|e| RgbError::TransferBuild(format!("load signer account: {e}")))
+    }
+
     #[allow(dead_code)]
     fn parse_network(&self) -> Result<Network, RgbError> {
         match self.network.as_str() {
@@ -109,6 +133,24 @@ impl LibRgbBackend {
             "testnet4" => Ok(Network::Testnet4),
             other => Err(RgbError::StashLoad(format!("unknown network `{other}`"))),
         }
+    }
+}
+
+/// Witness-ordering provider for `stock.consume_fascia` on a not-yet-broadcast
+/// swap tx. Mirrors the inline resolver in rgb-api's `pay.rs:549-561`: the
+/// fascia we just produced via `rgb_commit` is committed but not yet on-chain,
+/// so it gets `WitnessOrd::Tentative`. The `assert_eq!` is load-bearing —
+/// `consume_fascia` should only ever query our own witness_id. See
+/// docs/swap-psbt-design.md U5.
+#[allow(dead_code)]
+struct FasciaResolver {
+    witness_id: Txid,
+}
+
+impl WitnessOrdProvider for FasciaResolver {
+    fn witness_ord(&self, witness_id: Txid) -> Result<WitnessOrd, WitnessResolverError> {
+        assert_eq!(witness_id, self.witness_id);
+        Ok(WitnessOrd::Tentative)
     }
 }
 
