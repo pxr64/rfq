@@ -18,7 +18,11 @@ use std::path::PathBuf;
 use rfq_rgb::{ConsignmentInfo, LibRgbBackend, RgbBackend, RgbError, TxOut};
 use rfq_types::Outpoint;
 
-mod common;
+// Reuses the regtest harness now living in the lib (gated by
+// `cfg(any(test, feature = "test-helpers"))`). The `common` alias keeps
+// every existing call site below stable after the tests/common → lib
+// move.
+use rfq_rgb::test_helpers as common;
 
 /// Pure parse test — no live stack required. NOT `#[ignore]`; runs as part of
 /// the default test suite.

@@ -4,6 +4,18 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 
+[features]
+# Default-on so rfq-rgb's own integration tests and dependent crates'
+# tests can both reach `rfq_rgb::test_helpers::RegtestStack` without
+# extra feature flagging. Production consumers can opt out with
+# `default-features = false` to skip the tempfile + tokio pull-ins.
+default = ["test-helpers"]
+# Exposes `rfq_rgb::test_helpers::RegtestStack` (the e2e harness) as a
+# library module so downstream crates' integration tests can reuse it
+# without duplicating the bootstrap. Brings in `tempfile` + `tokio` as
+# runtime deps when enabled.
+test-helpers = ["dep:tempfile", "dep:tokio"]
+
 [dependencies]
 async-trait.workspace = true
 rfq-btc = { path = "../rfq-btc" }
@@ -20,6 +32,10 @@ bp-electrum = "=0.11.1-alpha.2"
 rgb-psbt-utils = "=0.11.1-rc.6"
 amplify = "=4.8.0"
 rand = "0.9"
+
+# Optional deps only pulled in when the `test-helpers` feature is on.
+tempfile = { version = "3", optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

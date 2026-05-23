@@ -12,6 +12,15 @@ mod swap;
 pub use lib_backend::LibRgbBackend;
 pub use swap::enrich_psbt_input;
 
+/// Self-bootstrapping regtest harness shared across rfq-rgb's own e2e
+/// tests and dependent crates' tests (e.g. maker-node's HTTP-layer
+/// integration test). Gated behind the `test-helpers` feature
+/// (default-on for workspace use; production consumers opt out via
+/// `default-features = false`) so docker / subprocess machinery is
+/// excluded from minimal builds.
+#[cfg(feature = "test-helpers")]
+pub mod test_helpers;
+
 /// Re-export of the bitcoin prevout type — a sell-side swap PSBT pins each RGB
 /// input's `scriptPubKey` + `value_sats`, which the consignment doesn't carry.
 pub use rfq_btc::TxOut;

@@ -1515,7 +1515,10 @@ name = "maker-node"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bp-std",
+ "bp-wallet",
  "clap",
+ "reqwest",
  "rfq-btc",
  "rfq-client",
  "rfq-maker",

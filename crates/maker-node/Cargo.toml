@@ -21,3 +21,10 @@ tokio.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tower.workspace = true
+# Pull in rfq-rgb's e2e harness for the regtest HTTP integration test.
+rfq-rgb = { path = "../rfq-rgb", features = ["test-helpers"] }
+# Lib-side PSBT primitives the HTTP test uses to drive taker signing.
+bp-std = { version = "=0.11.1-alpha.2", features = ["client-side-validation", "serde", "signers"] }
+bp-wallet = { version = "=0.11.1-alpha.2", features = ["fs", "signers", "electrum"] }
+# Reach into the maker_app via HTTP in the regtest integration test.
+reqwest.workspace = true

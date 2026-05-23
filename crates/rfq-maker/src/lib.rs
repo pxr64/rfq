@@ -111,8 +111,6 @@ struct PendingBuySettlement {
     /// Maker-built consignment handed to the taker at accept; needed again to
     /// finalize once the taker returns the signed PSBT.
     consignment: String,
-    /// Sats the maker over-selected — re-ingested as a change UTXO post-broadcast.
-    expected_change: u64,
 }
 
 /// Maker-side state for a sell-side swap. Created at `accept_quote` (stage
@@ -255,6 +253,34 @@ impl Maker {
         let mut added = 0;
         for u in utxos {
             if self.btc_store.ingest_change_utxo(u).await.is_ok() {
+                added += 1;
+            }
+        }
+        added
+    }
+
+    /// Same shape as [`Self::ingest_btc_change_utxos`] but for RGB. Required
+    /// for consecutive maker-side swaps: each swap consumes the maker's
+    /// RGB input and produces an RGB-change output at a new outpoint;
+    /// without this re-ingestion, `request_quote`'s coin selector sees
+    /// only the original (now-spent) entry in the inventory store and
+    /// returns `None` on the second swap. The chain observer calls this
+    /// after `sync_wallet` so the new outpoint is in the bp-wallet cache.
+    pub async fn ingest_rgb_change_utxos(&self, utxos: Vec<RgbInventoryUtxo>) -> usize {
+        let now = now_ms();
+        let mut added = 0;
+        for raw in utxos {
+            let inv = InventoryUtxo {
+                outpoint: raw.outpoint,
+                asset_id: raw.asset_id,
+                amount: raw.amount,
+                btc_sats: raw.btc_sats,
+                status: InventoryStatus::Available,
+                created_at_ms: now,
+                updated_at_ms: now,
+                pending_txid: None,
+            };
+            if self.store.ingest_change_utxo(inv).await.is_ok() {
                 added += 1;
             }
         }
@@ -949,10 +975,8 @@ impl MakerConnector for Maker {
                     InventoryStatus::Reserved { reservation_id: rid, .. } if rid == &reservation_id)
             })
             .collect();
-        let reserved_total: u64 = reserved.iter().map(|u| u.amount).sum();
         let reserved_outpoints: Vec<Outpoint> =
             reserved.iter().map(|u| u.outpoint.clone()).collect();
-        let expected_change = reserved_total.saturating_sub(quote.amount);
 
         // Declared-funding: discover the taker's BTC UTXOs from the address it
         // put on the ACCEPT, then select enough to cover the price + fee. The
@@ -1032,7 +1056,6 @@ impl MakerConnector for Maker {
                 quote: quote.clone(),
                 reservation_id: reservation_id.clone(),
                 consignment: transfer.consignment.clone().unwrap_or_default(),
-                expected_change,
             }),
         );
 
@@ -1126,6 +1149,11 @@ impl MakerConnector for Maker {
         }
 
         // Tx is on the wire — move the reserved UTXOs to PendingBitcoinConfirm.
+        // The RGB change UTXO from this swap is *not* ingested here: the chain
+        // observer's `ingest_rgb_change_utxos` does that with status `Available`
+        // once `sync_wallet` sees the new outpoint, mirroring the BTC change
+        // path. Pre-emptive ingestion was tried in #14e but left change stuck
+        // in `PendingBitcoinConfirm` forever (no transition back to Available).
         self.store
             .mark_pending_bitcoin_confirm(
                 &reservation_id,
@@ -1134,29 +1162,6 @@ impl MakerConnector for Maker {
             )
             .await
             .map_err(|e| RouterError::Maker(e.to_string()))?;
-
-        // Change re-ingestion: the broadcast tx produces an RGB change output
-        // back to the maker when the selection over-shot. Best-effort — an
-        // ingestion collision doesn't undo a settled swap.
-        if pending.expected_change > 0 {
-            let now = now_ms();
-            let change_utxo = InventoryUtxo {
-                outpoint: Outpoint::new(finalized.witness_txid.clone(), 1),
-                asset_id: quote.base_asset.clone(),
-                amount: pending.expected_change,
-                btc_sats: 0,
-                status: InventoryStatus::PendingBitcoinConfirm {
-                    reservation_id: reservation_id.clone(),
-                    witness_txid: finalized.witness_txid.clone(),
-                },
-                created_at_ms: now,
-                updated_at_ms: now,
-                pending_txid: Some(finalized.witness_txid.clone()),
-            };
-            if let Err(e) = self.store.ingest_change_utxo(change_utxo).await {
-                eprintln!("change re-ingestion failed (continuing): {e}");
-            }
-        }
 
         self.pending.write().await.remove(&quote_id);
 
@@ -2106,11 +2111,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sign_with_change_ingests_pending_bitcoin_confirm_utxo() {
-        // Single UTXO of 100; request 60 → change = 40. Change re-ingestion
-        // happens at `/sign` (post-broadcast), not at accept. After sign, the
-        // input UTXO is PendingBitcoinConfirm and a synthetic change UTXO of
-        // 40 has been ingested, also PendingBitcoinConfirm.
+    async fn sign_marks_input_pending_bitcoin_confirm_change_added_by_chain_observer() {
+        // Single UTXO of 100; request 60 → change = 40. After /sign, only the
+        // input UTXO is PendingBitcoinConfirm — the RGB change UTXO is added
+        // later by the chain observer (`ingest_rgb_change_utxos`) once
+        // `sync_wallet` sees the new outpoint, mirroring the BTC change path.
         let maker = maker_with_utxos(vec![utxo_with_amount(0, 100)]);
 
         let mut request = quote_request("rfq-1");
@@ -2136,13 +2141,8 @@ mod tests {
             .iter()
             .filter(|u| matches!(u.status, InventoryStatus::PendingBitcoinConfirm { .. }))
             .collect();
-        // Input (100) + change (40), both PendingBitcoinConfirm.
-        assert_eq!(pending.len(), 2);
-        let change = pending
-            .iter()
-            .find(|u| u.amount == 40)
-            .expect("expected a change UTXO");
-        assert!(change.pending_txid.is_some());
+        assert_eq!(pending.len(), 1, "only the input UTXO should be pending");
+        assert_eq!(pending[0].amount, 100);
     }
 
     #[tokio::test]

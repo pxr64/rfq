@@ -29,9 +29,12 @@ use bpwallet::fs::FsTextStore;
 use bpwallet::hot::{SecureIo, Seed, SeedType};
 use bpwallet::{Bip43, Wallet as BpWallet};
 use psrgbt::PsbtConstructor;
-use rfq_rgb::{ContractId, LibRgbBackend, RgbBackend, TxOut};
 use rfq_types::{AssetId, AssetKind, BitcoinNetwork, Outpoint};
 use rgb::RgbDescr;
+
+// Was `use rfq_rgb::{...}` when this file lived in tests/common/mod.rs;
+// it's now part of rfq-rgb's lib, so refer to siblings via `crate::`.
+use crate::{ContractId, LibRgbBackend, RgbBackend, TxOut};
 use tempfile::TempDir;
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
 
@@ -236,6 +239,19 @@ impl RegtestStack {
         &self.compose_dir
     }
 
+    /// Filesystem paths the dependent-crate integration tests need to
+    /// hand to `maker_node::RgbConfig` (so they can build a runtime
+    /// pointing at the same maker stash the harness already
+    /// bootstrapped). Exposed as accessors rather than `pub` fields
+    /// to keep `RoleHandles` itself encapsulated.
+    pub fn maker_stash_dir(&self) -> &Path {
+        &self.maker.stash_dir
+    }
+
+    pub fn maker_account_file(&self) -> &Path {
+        &self.maker.account_file
+    }
+
     /// Broadcast a raw witness tx via `bitcoin-cli sendrawtransaction`.
     /// Default `maxfeerate` is fine post-issue-#25: the swap composition
     /// now routes seal-anchor BTC value back to a maker change output
@@ -248,6 +264,21 @@ impl RegtestStack {
             .collect::<String>();
         let out = bitcoin_cli(&self.compose_dir, &["sendrawtransaction", &hex])?;
         Ok(out.trim().to_owned())
+    }
+
+    /// Send `btc` BTC from the miner wallet to `addr`, mine a
+    /// confirmation block, and wait for electrs to index it. Used by
+    /// tests that need a specific address pre-funded — e.g. the
+    /// maker-node HTTP test's `btc_funding_addr` (keychain 0), which
+    /// `fund_role` never touches.
+    pub fn fund_address(&self, addr: &str, btc: &str) -> Result<(), String> {
+        bitcoin_cli(
+            &self.compose_dir,
+            &["-rpcwallet=miner", "sendtoaddress", addr, btc],
+        )?;
+        self.mine_block()?;
+        wait_for_electrs_tip(&self.compose_dir, &self.electrum_url)?;
+        Ok(())
     }
 
     /// Mine one block to the miner wallet. Used by tests that need a
@@ -481,7 +512,7 @@ impl<'a> TakerGuard<'a> {
     /// inputs with only `witness_utxo` + `sighash_type` (the maker doesn't
     /// know the taker's descriptor), but `TestnetRefSigner` keys off
     /// `bip32_derivation` to pick a key — without it, `psbt.sign` returns
-    /// 0 matched inputs. `rfq_rgb::enrich_psbt_input` populates the
+    /// 0 matched inputs. `crate::enrich_psbt_input` populates the
     /// missing fields the same way the maker side enriches its own.
     ///
     /// Inputs the taker doesn't own (the maker's RGB inputs, already
@@ -526,7 +557,7 @@ impl<'a> TakerGuard<'a> {
         let mut enriched = 0usize;
         for (i, txid, vout) in prev_outs {
             if let Some((terminal, value)) = owned.get(&(txid, vout)).cloned() {
-                rfq_rgb::enrich_psbt_input(&mut psbt, i, &descriptor, terminal, value)
+                crate::enrich_psbt_input(&mut psbt, i, &descriptor, terminal, value)
                     .map_err(|e| format!("enrich taker input {i}: {e}"))?;
                 enriched += 1;
             }
