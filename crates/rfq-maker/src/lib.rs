@@ -496,6 +496,15 @@ impl Maker {
             RouterError::Maker("sell quote is missing its maker RGB invoice".to_owned())
         })?;
 
+        // Round-trip the maker's own invoice back into typed components for
+        // `create_swap_psbt_sell` below. Done once here so the backend doesn't
+        // re-parse the wire string it just minted.
+        let maker_invoice_parts = self
+            .rgb_backend
+            .parse_maker_invoice(&maker_rgb_invoice)
+            .await
+            .map_err(|e| RouterError::Maker(format!("maker invoice parse: {e}")))?;
+
         // Validate the consignment against the invoice the maker quoted.
         let info = match self
             .rgb_backend
@@ -577,13 +586,19 @@ impl Maker {
         }
 
         // Build the swap PSBT (maker BTC inputs signed in the mock string).
+        // `deliver_amount` falls back to the consigned total when the maker's
+        // invoice was minted amountless (current `create_invoice` always pins
+        // an amount, but the fallback keeps us future-proof).
+        let deliver_amount = maker_invoice_parts.amount.unwrap_or(info.total_amount);
         let transfer = match self
             .rgb_backend
             .create_swap_psbt_sell(
                 &info,
                 &taker_rgb_prevouts,
                 &maker_btc_inputs,
-                &maker_rgb_invoice,
+                maker_invoice_parts.contract_id,
+                maker_invoice_parts.seal,
+                deliver_amount,
                 &pending.btc_payout_addr,
                 pending.rgb_change_invoice.as_deref(),
                 quote.price,

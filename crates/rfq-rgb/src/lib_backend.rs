@@ -12,18 +12,19 @@ use amplify::Wrapper as _;
 use base64::Engine as _;
 use rgb::containers::{ConsignmentExt, FileContent, Transfer};
 use rgb::contract::FilterIncludeAll;
-use rgb::invoice::{Beneficiary, RgbInvoice, RgbInvoiceBuilder, XChainNet};
+use rgb::invoice::{Beneficiary, InvoiceState, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgb::persistence::fs::FsBinStore;
 use rgb::persistence::{StashReadProvider, Stock};
 use rgb::resolvers::AnyResolver;
 use rgb::validation::{ResolveWitness, ValidationConfig, Validity};
 use rgb::{
-    ChainNet, ContractId, GraphSeal, RgbDescr, RgbKeychain, RgbWallet, StateType, TxoSeal,
+    ChainNet, ContractId, GraphSeal, RgbDescr, RgbKeychain, RgbWallet, SecretSeal, StateType,
+    TxoSeal,
 };
 
 use crate::swap;
 
-use crate::{ConsignmentInfo, FinalizedSwap, RgbBackend, RgbError, TxOut};
+use crate::{ConsignmentInfo, FinalizedSwap, MakerInvoiceParts, RgbBackend, RgbError, TxOut};
 
 /// Library-backed `RgbBackend` implementation. Talks directly to `rgb-api` /
 /// `rgb-ops` (the same libraries `rgb-cmd` is built on) — no subprocess.
@@ -237,14 +238,19 @@ impl RgbBackend for LibRgbBackend {
         let batch = swap::build_buy_transition(&wallet, &inputs, &psbt, amount)?;
        
         // 4. Embed + commit the transition and emit the witness-extended consignment.
-        let (transfer, witness_id) =
-            swap::commit_and_consign(&mut wallet, &mut psbt, batch, &inputs)?;
-       
+        let (transfer, witness_id) = swap::commit_and_consign(
+            &mut wallet,
+            &mut psbt,
+            batch,
+            inputs.contract_id,
+            inputs.taker_seal,
+        )?;
+
         // 5. Sign the maker's inputs (after commit — U4); taker BTC inputs stay open.
         swap::sign_maker_inputs(&mut psbt, &account)?;
-       
+
         // 6. Encode the partial PSBT + consignment for the wire.
-        swap::encode_swap_transfer(&psbt, &transfer, witness_id)
+        swap::encode_swap_transfer_buy(&psbt, &transfer, witness_id)
     }
 
     async fn finalize_after_taker_sign(
@@ -330,6 +336,37 @@ impl RgbBackend for LibRgbBackend {
         Ok(builder.finish().to_string())
     }
 
+    async fn parse_maker_invoice(
+        &self,
+        invoice: &str,
+    ) -> Result<MakerInvoiceParts, RgbError> {
+        // The maker minted this invoice via `create_invoice`; we just reverse
+        // the wire encoding into the typed components rfq-maker threads into
+        // `create_swap_psbt_sell`. Reject witness-vout beneficiaries — the
+        // maker's `create_invoice` only emits blinded-seal invoices today.
+        let parsed = RgbInvoice::from_str(invoice).map_err(|_| RgbError::InvalidInvoice)?;
+        let contract_id = parsed.contract.ok_or_else(|| {
+            RgbError::TransferBuild("maker invoice carries no contract id".to_owned())
+        })?;
+        let seal = match parsed.beneficiary.into_inner() {
+            Beneficiary::BlindedSeal(seal) => seal,
+            Beneficiary::WitnessVout(..) => {
+                return Err(RgbError::TransferBuild(
+                    "maker invoice must carry a blinded-seal beneficiary".to_owned(),
+                ));
+            }
+        };
+        let amount = match parsed.assignment_state {
+            Some(InvoiceState::Amount(a)) => Some(*a.as_inner()),
+            _ => None,
+        };
+        Ok(MakerInvoiceParts {
+            contract_id,
+            seal,
+            amount,
+        })
+    }
+
     async fn validate_incoming_consignment(
         &self,
         consignment_base64: &str,
@@ -367,8 +404,12 @@ impl RgbBackend for LibRgbBackend {
 
         // Cryptographic validation: resolver fetches witness txes; the typed
         // system from the maker's stash anchors the validator's trust root.
-        let stock = self.load_stock()?;
-     
+        // `mut` because we `accept_transfer` after the introspection below —
+        // sell-side `create_swap_psbt_sell` then sees the taker's allocations
+        // via `stock.contract_assignments_for(...)`. `Stock::load(_, true)`
+        // autosaves on drop, so the accepted state persists to the next call.
+        let mut stock = self.load_stock()?;
+
         let mut resolver = self.resolver()?;
         resolver.add_consignment_txes(&consignment);
        
@@ -426,6 +467,13 @@ impl RgbBackend for LibRgbBackend {
             }
         }
 
+        // Absorb the consignment into the maker's stash so the taker's
+        // allocations are visible to `create_swap_psbt_sell` later (it spends
+        // them into the maker's seal). Mirrors rgb-cmd's Validate+Accept pair.
+        stock
+            .accept_transfer(validated, &resolver)
+            .map_err(|e| RgbError::StashLoad(format!("accept_transfer: {e}")))?;
+
         Ok(ConsignmentInfo {
             total_amount,
             outpoints,
@@ -435,21 +483,64 @@ impl RgbBackend for LibRgbBackend {
     #[allow(clippy::too_many_arguments)]
     async fn create_swap_psbt_sell(
         &self,
-        _consignment_info: &ConsignmentInfo,
-        _taker_rgb_prevouts: &[(Outpoint, TxOut)],
-        _maker_btc_inputs: &[(Outpoint, TxOut)],
-        _maker_rgb_invoice: &str,
-        _btc_payout_addr: &str,
-        _rgb_change_invoice: Option<&str>,
-        _gross_btc_sats: u64,
-        _actual_fee_sats: u64,
+        consignment_info: &ConsignmentInfo,
+        taker_rgb_prevouts: &[(Outpoint, TxOut)],
+        maker_btc_inputs: &[(Outpoint, TxOut)],
+        contract_id: ContractId,
+        maker_seal: SecretSeal,
+        deliver_amount: u64,
+        btc_payout_addr: &str,
+        rgb_change_invoice: Option<&str>,
+        gross_btc_sats: u64,
+        actual_fee_sats: u64,
     ) -> Result<SwapTransfer, RgbError> {
-        // TODO(#13): build the sell-side swap PSBT via bp-std + rgb-api and
-        // sign the maker's BTC inputs.
-        Err(RgbError::TransferBuild(
-            "LibRgbBackend::create_swap_psbt_sell is not implemented yet (issue #13); \
-             use MockRgbBackend for now"
-                .to_owned(),
-        ))
+        let account = self.load_signer()?;
+        let mut wallet = self.load_wallet()?;
+
+        // 1. Resolve the maker's side: taker's RGB-change seal (if any), the
+        //    taker's BTC payout spk, a fresh maker BTC change address, and
+        //    per-input terminals for the maker's BTC inputs.
+        let inputs = swap::prepare_sell_inputs(
+            &mut wallet,
+            contract_id,
+            maker_seal,
+            deliver_amount,
+            btc_payout_addr,
+            rgb_change_invoice,
+            maker_btc_inputs,
+        )?;
+
+        // 2. Assemble the unsigned swap tx (taker RGB + maker BTC inputs) with
+        //    the commitment host; from here the witness txid is final.
+        let mut psbt = swap::assemble_sell_psbt(
+            &inputs,
+            taker_rgb_prevouts,
+            gross_btc_sats,
+            actual_fee_sats,
+        )?;
+
+        // 3. Build the RGB transition: spend the taker's allocations (visible
+        //    in the maker's stash since `validate_incoming_consignment` ran
+        //    `accept_transfer`), deliver to the maker's seal, route any
+        //    over-consigned surplus to the taker's change seal.
+        let batch = swap::build_sell_transition(&wallet, &inputs, consignment_info)?;
+
+        // 4. Embed + commit the transition. The maker's emitted transfer is
+        //    discarded — the taker built and submitted its own at /consignment.
+        let (_transfer, witness_id) = swap::commit_and_consign(
+            &mut wallet,
+            &mut psbt,
+            batch,
+            inputs.contract_id,
+            inputs.maker_seal,
+        )?;
+
+        // 5. Sign the maker's BTC inputs (after commit — U4); taker RGB inputs
+        //    stay open for /sign.
+        swap::sign_maker_inputs(&mut psbt, &account)?;
+
+        // 6. Encode the partial PSBT for the wire (no consignment — taker's
+        //    own consignment is already on the maker side).
+        swap::encode_swap_transfer_sell(&psbt, witness_id)
     }
 }

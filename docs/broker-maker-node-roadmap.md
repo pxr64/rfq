@@ -76,7 +76,7 @@ Define how the mock-only scaffolding becomes a real regtest MVP without leaking 
 
 ## Library-Backed `rfq-rgb` Adapter (Issue #13)
 
-**Status: foundation + `create_invoice` + `validate_incoming_consignment` landed and live-verified; the atomic-swap trio is composition work the next session picks up.**
+**Status: foundation + `create_invoice` + `validate_incoming_consignment` landed and live-verified; swap-PSBT plumbing (B1), buy composition (B2), and sell composition (B3) landed and regtest-verified. B4 finalize + B5 end-to-end round-trip still ahead — see follow-ups.**
 
 Wrap the proven manual regtest RGB flow behind the `RgbBackend` trait, using
 `rgb-api` + `bp-std` + `bp-wallet` directly (the same libraries `rgb-cmd` builds
@@ -129,10 +129,49 @@ consignment lifecycle, beneficiary shape, change handling), the five known
 unknowns that need a build-iterate cycle to resolve, and a five-phase
 implementation plan (B1 plumbing → B2 buy → B3 sell → B4 finalize → B5 tests).
 
-**Next step:** start phase B1 (resolve U2/U3 — locate bp-std's
-per-input SIGHASH + manual-input `Psbt::new`/`add_input` path). The regtest
-stack is now one command (`make -C infra/regtest regtest-bootstrap`) so each
-phase can compile-iterate with live verification.
+**Phase progress:** B1 plumbing (commits `f865ce4`, `66b3e78`), B2 buy
+composition (`c803a0d`, `163d776`), and B3 sell composition all landed and
+regtest-verified. The single regtest-bootstrap command above is the
+iteration target; each phase compile-iterates with live verification via
+`cargo test -p rfq-rgb -- --ignored`.
+
+### Follow-up issues
+
+- **B4 — `finalize_after_taker_sign`** — Deserialize the signed PSBT,
+  extract the witness tx via bp-std, return `FinalizedSwap` with the
+  echoed consignment. Mostly extraction; design lives in
+  [`swap-psbt-design.md`](swap-psbt-design.md) (section
+  `finalize_after_taker_sign`). Next session-sized commit after B3.
+- **`validate_incoming_consignment` trait-sig cleanup** — The
+  `expected_invoice: &str` parameter has the same self-round-trip on
+  sell that B3 lifted for `create_swap_psbt_sell` (the maker created
+  the invoice itself; the parse only recovers `contract_id` for
+  cross-checking the consignment). Change to
+  `expected_contract_id: ContractId` and have rfq-maker extract it
+  once at /sign time alongside the seal (via the new
+  `parse_maker_invoice` trait method B3 added). Small follow-up; mock
+  impl + rfq-maker call site are the only ripple.
+- **Maker-node electrum + BTC wallet bootstrap** —
+  [`crates/maker-node/src/main.rs:312`](../crates/maker-node/src/main.rs#L312)
+  hard-codes `MockBitcoinClient::new()`, seeds mock taker funding
+  (`seed_address_unspent("bcrt1qtaker", ...)`), and seeds mock BTC
+  inventory (`with_btc_inventory(mock_btc_inventory())`).
+  `ElectrumClient` exists at
+  [`crates/rfq-btc/src/electrum.rs:26`](../crates/rfq-btc/src/electrum.rs#L26)
+  but isn't wired through config; `ElectrumClient::get_outpoint` is
+  also still a stub. Maker also needs a BTC wallet bootstrap (walk
+  the maker's wpkh descriptor against electrum) so the explicit
+  `with_btc_inventory` list can go away. Distinct from the
+  "Wallet UTXO-cache sync" follow-up under #14 (that one's about
+  freshness of the RGB-bearing wallet cache; this is about chain
+  access + maker BTC wallet plumbing).
+- **B5 — end-to-end round-trip test** — Drive two cooperating
+  `LibRgbBackend`s (maker + taker) through `/quote → /accept →
+  /consignment → /sign → broadcast`, exercising PSBT serialization
+  round-trip, signing, finalize. Confirms the full atomic-swap loop
+  works end-to-end on regtest with chain-correct prevouts (the B3
+  sell test uses synthetic taker prevouts because cli.rs has no
+  electrum). Depends on B4.
 
 ## RGB Maker UTXO Inventory Management (Issue #14)
 

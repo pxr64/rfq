@@ -15,6 +15,12 @@ pub use lib_backend::LibRgbBackend;
 /// input's `scriptPubKey` + `value_sats`, which the consignment doesn't carry.
 pub use rfq_btc::TxOut;
 
+/// Re-exports of the RGB types that cross the sell-side trait boundary.
+/// Callers (rfq-maker, mock backend) parse the maker's own invoice once and
+/// thread these typed values into `create_swap_psbt_sell` instead of re-parsing
+/// inside every backend impl. Lets downstream crates avoid an `rgb` dep.
+pub use rgb::{ContractId, SecretSeal};
+
 /// What the maker learns from a validated taker consignment on the sell side:
 /// the RGB amount transferred and the bitcoin outpoints carrying it (which
 /// become PSBT inputs). Real RGB validation (#13) will carry the contract id
@@ -33,6 +39,20 @@ pub struct FinalizedSwap {
     pub raw_tx: Vec<u8>,
     pub witness_txid: String,
     pub final_consignment_base64: String,
+}
+
+/// What the maker needs back from its own invoice string at sell-side /sign
+/// time. The maker minted the invoice via `create_invoice`, shipped the wire
+/// string to the taker on the `Quote`, and now needs the typed components to
+/// call `create_swap_psbt_sell` without re-parsing the wire string inside the
+/// backend (the abstraction needs the typed `ContractId` + `SecretSeal`, but
+/// rfq-maker doesn't want to depend on `rgb` directly to do the parse itself).
+/// `amount` mirrors the invoice's optional assignment amount.
+#[derive(Debug, Clone)]
+pub struct MakerInvoiceParts {
+    pub contract_id: ContractId,
+    pub seal: SecretSeal,
+    pub amount: Option<u64>,
 }
 
 #[derive(Debug, Error)]
@@ -103,6 +123,18 @@ pub trait RgbBackend: Send + Sync {
     /// `Quote` as `maker_rgb_invoice`; the taker builds a consignment to it.
     async fn create_invoice(&self, asset: &AssetId, amount: u64) -> Result<String, RgbError>;
 
+    /// Maker-side, sell flow: parse the maker's own invoice (the one returned
+    /// by `create_invoice`) back into the typed components
+    /// `create_swap_psbt_sell` needs. Called once at /sign time on the wire
+    /// string that was stored on the `Quote`; lets rfq-maker thread typed
+    /// `ContractId` + `SecretSeal` into the swap-PSBT call without depending
+    /// on `rgb` directly. Mock backends may fake the components from the
+    /// invoice string.
+    async fn parse_maker_invoice(
+        &self,
+        invoice: &str,
+    ) -> Result<MakerInvoiceParts, RgbError>;
+
     /// Maker-side, sell flow: validate a taker-submitted consignment against
     /// the maker's expected invoice and return the RGB amount + the bitcoin
     /// outpoints carrying it. `Err(TransferBuild)` when the consignment is
@@ -115,9 +147,17 @@ pub trait RgbBackend: Send + Sync {
 
     /// Sell-side swap PSBT construction. Inputs: the taker's RGB-bearing
     /// outpoints (with prevout data) plus the maker's BTC funding inputs.
-    /// Outputs: the maker's RGB seal, the taker's BTC payout
-    /// (`gross_btc_sats - actual_fee_sats`), maker BTC change, and taker RGB
-    /// change to `rgb_change_invoice` if any. The maker signs its own inputs.
+    /// Outputs: the taker's BTC payout (`gross_btc_sats - actual_fee_sats`),
+    /// maker BTC change, and taker RGB change to `rgb_change_invoice` if any.
+    /// The maker signs its own inputs.
+    ///
+    /// The maker's own RGB destination is passed as typed values:
+    /// `contract_id`, `maker_seal` (the blinded seal from the invoice the maker
+    /// minted in `create_invoice`), and `deliver_amount` (the amount the maker
+    /// expects to receive — surplus from `consignment_info.total_amount` goes
+    /// to `rgb_change_invoice`). The caller (rfq-maker) parses the maker's
+    /// invoice once at /sign time and threads these in; the backend doesn't
+    /// re-parse the invoice it just minted.
     ///
     /// All inputs are committed here, so `expected_witness_txid` is `Some(_)` —
     /// unlike the buy side, where the taker's inputs are still outstanding.
@@ -127,7 +167,9 @@ pub trait RgbBackend: Send + Sync {
         consignment_info: &ConsignmentInfo,
         taker_rgb_prevouts: &[(Outpoint, TxOut)],
         maker_btc_inputs: &[(Outpoint, TxOut)],
-        maker_rgb_invoice: &str,
+        contract_id: ContractId,
+        maker_seal: SecretSeal,
+        deliver_amount: u64,
         btc_payout_addr: &str,
         rgb_change_invoice: Option<&str>,
         gross_btc_sats: u64,
@@ -235,6 +277,33 @@ impl RgbBackend for MockRgbBackend {
         Ok(format!("rgb:mock-invoice:{}:{amount}:{nonce}", asset.id))
     }
 
+    async fn parse_maker_invoice(
+        &self,
+        invoice: &str,
+    ) -> Result<MakerInvoiceParts, RgbError> {
+        // Parse `rgb:mock-invoice:<asset_id>:<amount>:<nonce>`. The typed
+        // ContractId/SecretSeal are derived deterministically from the
+        // invoice string (just hashing) — real RGB cryptography isn't needed
+        // for the mock's downstream consumers; only round-trip stability is.
+        let rest = invoice.strip_prefix("rgb:mock-invoice:").ok_or_else(|| {
+            RgbError::TransferBuild(format!("not a mock invoice: {invoice}"))
+        })?;
+        let mut parts = rest.splitn(3, ':');
+        let _asset_id = parts
+            .next()
+            .ok_or_else(|| RgbError::TransferBuild("mock invoice: missing asset_id".to_owned()))?;
+        let amount: u64 = parts
+            .next()
+            .ok_or_else(|| RgbError::TransferBuild("mock invoice: missing amount".to_owned()))?
+            .parse()
+            .map_err(|_| RgbError::TransferBuild("mock invoice: bad amount".to_owned()))?;
+        Ok(MakerInvoiceParts {
+            contract_id: ContractId::from(mock_bytes32(&format!("{invoice}|contract"))),
+            seal: SecretSeal::from(mock_bytes32(&format!("{invoice}|seal"))),
+            amount: Some(amount),
+        })
+    }
+
     async fn validate_incoming_consignment(
         &self,
         consignment_base64: &str,
@@ -302,7 +371,9 @@ impl RgbBackend for MockRgbBackend {
         consignment_info: &ConsignmentInfo,
         taker_rgb_prevouts: &[(Outpoint, TxOut)],
         maker_btc_inputs: &[(Outpoint, TxOut)],
-        maker_rgb_invoice: &str,
+        contract_id: ContractId,
+        maker_seal: SecretSeal,
+        deliver_amount: u64,
         btc_payout_addr: &str,
         rgb_change_invoice: Option<&str>,
         gross_btc_sats: u64,
@@ -316,7 +387,8 @@ impl RgbBackend for MockRgbBackend {
         // confirm the signed PSBT still spends them. `maker-signed` stands in
         // for the maker's signatures over its own BTC inputs.
         let body = format!(
-            "mock-psbt:sell:maker_rgb_invoice={maker_rgb_invoice}:payout_addr={btc_payout_addr}\
+            "mock-psbt:sell:contract={contract_id}:maker_seal={maker_seal}\
+             :deliver={deliver_amount}:payout_addr={btc_payout_addr}\
              :gross={gross_btc_sats}:fee={actual_fee_sats}:payout={payout}\
              :rgb_amount={}:rgb_in=[{rgb_in}]:btc_in=[{btc_in}]:rgb_change={}:maker-signed",
             consignment_info.total_amount,
@@ -339,6 +411,22 @@ fn join_outpoints<'a>(outpoints: impl Iterator<Item = &'a Outpoint>) -> String {
         .map(|o| o.to_string())
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Deterministic 32-byte hash of a string, used by mock impls to fake out the
+/// typed `ContractId` / `SecretSeal` values the real backend would derive from
+/// an `RgbInvoice`. Not cryptographic — just stable across calls so tests can
+/// re-derive the same bytes.
+fn mock_bytes32(s: &str) -> [u8; 32] {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    let h = hasher.finish().to_le_bytes();
+    let mut out = [0u8; 32];
+    for chunk in out.chunks_mut(8) {
+        chunk.copy_from_slice(&h);
+    }
+    out
 }
 
 /// Deterministic 64-hex mock txid derived from the signed PSBT string. Lets

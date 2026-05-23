@@ -230,6 +230,111 @@ async fn create_swap_psbt_buy_produces_psbt_and_consignment() {
 }
 
 #[tokio::test]
+#[ignore = "requires the regtest stack post-`make rgb-transfer-maker`; needs RGB_TAKER_PAYOUT_ADDR + RGB_MAKER_BTC_OUTPOINT=<txid>:<vout>; full two-backend round-trip is B5 work"]
+async fn create_swap_psbt_sell_produces_psbt() {
+    use base64::Engine as _;
+    use rfq_rgb::TxOut;
+    use rfq_types::Outpoint;
+
+    let Some((backend, asset)) = lib_backend() else {
+        return;
+    };
+    let Some(taker_payout_addr) = env_or_skip("RGB_TAKER_PAYOUT_ADDR") else {
+        return;
+    };
+    let Some(mb_outpoint_s) = env_or_skip("RGB_MAKER_BTC_OUTPOINT") else {
+        return;
+    };
+    let mb_outpoint: Outpoint = mb_outpoint_s
+        .parse()
+        .expect("RGB_MAKER_BTC_OUTPOINT must be <txid>:<vout>");
+
+    // 1. Validate + absorb a real taker→maker consignment from
+    //    `make rgb-transfer-maker`. Change 2 makes this also accept_transfer
+    //    so the taker's allocations land in the maker stash.
+    let data_dir = PathBuf::from(std::env::var("RGB_DATA_DIR").expect("RGB_DATA_DIR"));
+    let consignment_bytes = std::fs::read(data_dir.join("consignment.rgb"))
+        .expect("run `make rgb-transfer-maker` first to produce consignment.rgb");
+    let consignment_b64 =
+        base64::engine::general_purpose::STANDARD.encode(consignment_bytes);
+    let taker_invoice = std::fs::read_to_string(data_dir.join("invoice.txt"))
+        .expect("run `make rgb-transfer-maker` first to produce invoice.txt");
+    let taker_invoice = taker_invoice.trim();
+    let info = backend
+        .validate_incoming_consignment(&consignment_b64, taker_invoice)
+        .await
+        .expect("validate_incoming_consignment");
+
+    // 2. Mint the maker's receive invoice and round-trip it to typed parts —
+    //    the same path rfq-maker takes at /sign time.
+    let maker_invoice = backend
+        .create_invoice(&asset, info.total_amount)
+        .await
+        .expect("create_invoice");
+    let parts = backend
+        .parse_maker_invoice(&maker_invoice)
+        .await
+        .expect("parse_maker_invoice");
+    assert_eq!(parts.amount, Some(info.total_amount));
+
+    // 3. Synthesize taker_rgb_prevouts — cli.rs has no electrum to fetch
+    //    real prevouts. Composition only needs the outpoint at PSBT-input
+    //    time; witness_utxo bytes aren't validated until broadcast, which
+    //    this test doesn't do. (Full chain-correct round-trip is B5.)
+    let taker_rgb_prevouts: Vec<(Outpoint, TxOut)> = info
+        .outpoints
+        .iter()
+        .map(|o| {
+            (
+                o.clone(),
+                TxOut {
+                    value_sats: 1_000,
+                    script_pubkey: vec![0u8; 22],
+                },
+            )
+        })
+        .collect();
+
+    // 4. Drive the sell composition. resolve_maker_btc_inputs only reads the
+    //    outpoint from the supplied (Outpoint, TxOut) pair — the wallet
+    //    provides the real value + terminal — so an empty TxOut is fine here.
+    let transfer = backend
+        .create_swap_psbt_sell(
+            &info,
+            &taker_rgb_prevouts,
+            &[(
+                mb_outpoint,
+                TxOut {
+                    value_sats: 0,
+                    script_pubkey: vec![],
+                },
+            )],
+            parts.contract_id,
+            parts.seal,
+            info.total_amount,
+            &taker_payout_addr,
+            None,
+            10_000,
+            500,
+        )
+        .await
+        .expect("create_swap_psbt_sell should compose a swap PSBT");
+
+    assert!(
+        !transfer.partial_psbt.is_empty(),
+        "expected a non-empty base64 PSBT"
+    );
+    assert!(
+        transfer.consignment.is_none(),
+        "sell side: taker built its own consignment"
+    );
+    let wt = transfer
+        .expected_witness_txid
+        .expect("declared-funding sell commits a stable witness txid");
+    assert_eq!(wt.len(), 64, "witness txid should be 64 hex chars, got {wt:?}");
+}
+
+#[tokio::test]
 #[ignore = "blocked on LibRgbBackend::finalize_after_taker_sign (issue #13); flip when impl lands"]
 async fn finalize_after_taker_sign_returns_witness_txid() {
     let Some((backend, _asset)) = lib_backend() else {

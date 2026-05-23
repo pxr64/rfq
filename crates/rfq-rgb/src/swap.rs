@@ -44,8 +44,8 @@ use bpstd::psbt::{Psbt, PsbtVer, UnsignedTx, UnsignedTxIn};
 use bpstd::seals::txout::CloseMethod;
 use bpstd::signers::TestnetRefSigner;
 use bpstd::{
-    Derive, Descriptor, Keychain, LockTime, Outpoint as BpOutpoint, Sats, ScriptPubkey, SeqNo,
-    SighashType, Terminal, TxOut as BpTxOut, TxVer, Txid, VarIntArray, Vout, XprivAccount,
+    Address, Derive, Descriptor, Keychain, LockTime, Outpoint as BpOutpoint, Sats, ScriptPubkey,
+    SeqNo, SighashType, Terminal, TxOut as BpTxOut, TxVer, Txid, VarIntArray, Vout, XprivAccount,
     XpubDerivable,
 };
 use bpwallet::Wallet;
@@ -59,7 +59,7 @@ use rgb::{Amount, ContractId, GraphSeal, RgbDescr, RgbWallet, SecretSeal, StateT
 
 use rfq_types::{Outpoint, SwapTransfer};
 
-use crate::{RgbError, TxOut};
+use crate::{ConsignmentInfo, RgbError, TxOut};
 
 /// The maker's RGB-enabled wallet: a `bp-wallet` wallet wrapped with its
 /// `Stock`. This is what [`LibRgbBackend::load_wallet`](crate::LibRgbBackend)
@@ -174,8 +174,8 @@ fn enrich_maker_input(
 /// descriptor (for input enrichment), and the resolved RGB inputs. Produced by
 /// [`prepare_buy_inputs`] and threaded through the remaining phases.
 pub(crate) struct BuyInputs {
-    contract_id: ContractId,
-    taker_seal: SecretSeal,
+    pub(crate) contract_id: ContractId,
+    pub(crate) taker_seal: SecretSeal,
     maker_payout_spk: ScriptPubkey,
     descriptor: RgbDescr,
     maker_inputs: Vec<MakerRgbInput>,
@@ -392,12 +392,16 @@ pub(crate) fn build_buy_transition(
 /// rewrites the host output's scriptPubkey, so the witness txid is stable from
 /// here on (and the maker must sign *after* this — U4). The committed fascia is
 /// consumed into the stash as [`WitnessOrd::Tentative`] (U5) and the
-/// witness-extended consignment is emitted. Returns the consignment + witness id.
+/// witness-extended consignment is emitted, addressed to `delivery_seal` (the
+/// counterparty's blinded seal — taker on buy, maker on sell). Returns the
+/// consignment + witness id; the sell path discards the consignment because
+/// the taker built and submitted its own.
 pub(crate) fn commit_and_consign(
     wallet: &mut MakerWallet,
     psbt: &mut Psbt,
     batch: Batch,
-    inputs: &BuyInputs,
+    contract_id: ContractId,
+    delivery_seal: SecretSeal,
 ) -> Result<(rgb::containers::Transfer, Txid), RgbError> {
     psbt.rgb_embed(batch)
         .map_err(|e| RgbError::TransferBuild(format!("rgb_embed: {e}")))?;
@@ -411,7 +415,7 @@ pub(crate) fn commit_and_consign(
         .map_err(|e| RgbError::TransferBuild(format!("consume_fascia: {e}")))?;
     let transfer = wallet
         .stock_mut()
-        .transfer(inputs.contract_id, [], [inputs.taker_seal], [], Some(witness_id))
+        .transfer(contract_id, [], [delivery_seal], [], Some(witness_id))
         .map_err(|e| RgbError::TransferBuild(format!("transfer: {e}")))?;
     Ok((transfer, witness_id))
 }
@@ -438,10 +442,11 @@ pub(crate) fn sign_maker_inputs(psbt: &mut Psbt, account: &XprivAccount) -> Resu
     Ok(())
 }
 
-/// **Phase 6.** Serialize the (partially-signed) PSBT and the consignment into
-/// the base64 [`SwapTransfer`] handed back over the wire. The witness txid is
-/// already committed, so it's published as `expected_witness_txid`.
-pub(crate) fn encode_swap_transfer(
+/// **Phase 6 (buy).** Serialize the (partially-signed) PSBT and the
+/// maker-emitted consignment into the base64 [`SwapTransfer`] handed back over
+/// the wire. The witness txid is already committed, so it's published as
+/// `expected_witness_txid`.
+pub(crate) fn encode_swap_transfer_buy(
     psbt: &Psbt,
     transfer: &rgb::containers::Transfer,
     witness_id: Txid,
@@ -455,4 +460,321 @@ pub(crate) fn encode_swap_transfer(
         consignment: Some(base64::engine::general_purpose::STANDARD.encode(consignment_bytes)),
         expected_witness_txid: Some(witness_id.to_string()),
     })
+}
+
+/// **Phase 6 (sell).** Serialize the (partially-signed) PSBT into the base64
+/// [`SwapTransfer`]. No consignment is attached — the taker built and shipped
+/// theirs at `/consignment`; the maker only needs the partial PSBT + the
+/// already-stable witness txid.
+pub(crate) fn encode_swap_transfer_sell(
+    psbt: &Psbt,
+    witness_id: Txid,
+) -> Result<SwapTransfer, RgbError> {
+    Ok(SwapTransfer {
+        partial_psbt: base64::engine::general_purpose::STANDARD.encode(psbt.serialize(PsbtVer::V2)),
+        consignment: None,
+        expected_witness_txid: Some(witness_id.to_string()),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Sell composition
+// ---------------------------------------------------------------------------
+
+/// A maker BTC funding input resolved against the wallet's UTXO set. Mirrors
+/// [`MakerRgbInput`] — same bp-std data needed to enrich the PSBT input via
+/// [`enrich_maker_input`].
+struct MakerBtcInput {
+    outpoint: BpOutpoint,
+    value: Sats,
+    terminal: Terminal,
+}
+
+/// Match each maker-declared BTC outpoint against the wallet's UTXO set,
+/// returning the bp outpoint + value + terminal for each. Errors if any
+/// outpoint isn't in the wallet (the maker said it owns a UTXO it doesn't).
+fn resolve_maker_btc_inputs(
+    wallet: &MakerWallet,
+    maker_btc_inputs: &[(Outpoint, TxOut)],
+) -> Result<Vec<MakerBtcInput>, RgbError> {
+    let mut resolved = Vec::with_capacity(maker_btc_inputs.len());
+    for (want, _txout) in maker_btc_inputs {
+        let utxo = wallet
+            .wallet()
+            .utxos()
+            .find(|u| {
+                u.outpoint.txid.to_string() == want.txid
+                    && u.outpoint.vout.into_u32() == want.vout
+            })
+            .ok_or_else(|| {
+                RgbError::TransferBuild(format!(
+                    "maker BTC outpoint {want} is not in the maker wallet"
+                ))
+            })?;
+        resolved.push(MakerBtcInput {
+            outpoint: utxo.outpoint,
+            value: utxo.value,
+            terminal: utxo.terminal,
+        });
+    }
+    Ok(resolved)
+}
+
+/// The maker-side data the sell composition is built from: the maker's receive
+/// contract + blinded seal + deliver amount (extracted by the caller from the
+/// maker's own invoice, since `create_swap_psbt_sell` no longer parses it),
+/// the optional taker RGB-change seal, the taker's BTC payout spk, a fresh
+/// maker BTC change address, the wallet descriptor (for input enrichment), and
+/// the resolved maker BTC inputs. Produced by [`prepare_sell_inputs`] and
+/// threaded through the remaining phases.
+pub(crate) struct SellInputs {
+    pub(crate) contract_id: ContractId,
+    pub(crate) maker_seal: SecretSeal,
+    deliver_amount: u64,
+    taker_change_seal: Option<SecretSeal>,
+    maker_change_spk: ScriptPubkey,
+    taker_payout_spk: ScriptPubkey,
+    descriptor: RgbDescr,
+    maker_btc_inputs: Vec<MakerBtcInput>,
+}
+
+/// **Phase 1 (sell).** Resolve the maker's side of the sell composition:
+/// parse the optional taker RGB-change invoice for its blinded seal; resolve
+/// the taker's BTC payout address into a scriptPubkey; pick a fresh maker BTC
+/// change address; and match the declared maker BTC inputs against the wallet
+/// UTXO set to grab their per-input terminals (needed for descriptor
+/// enrichment at PSBT-build time).
+pub(crate) fn prepare_sell_inputs(
+    wallet: &mut MakerWallet,
+    contract_id: ContractId,
+    maker_seal: SecretSeal,
+    deliver_amount: u64,
+    btc_payout_addr: &str,
+    rgb_change_invoice: Option<&str>,
+    maker_btc_inputs: &[(Outpoint, TxOut)],
+) -> Result<SellInputs, RgbError> {
+    let taker_change_seal = match rgb_change_invoice {
+        None => None,
+        Some(inv) => {
+            let invoice = RgbInvoice::from_str(inv).map_err(|_| RgbError::InvalidInvoice)?;
+            let seal = match invoice.beneficiary.into_inner() {
+                Beneficiary::BlindedSeal(seal) => seal,
+                Beneficiary::WitnessVout(..) => {
+                    return Err(RgbError::TransferBuild(
+                        "rgb_change_invoice must carry a blinded-seal beneficiary".to_owned(),
+                    ));
+                }
+            };
+            Some(seal)
+        }
+    };
+
+    let taker_payout_spk = Address::from_str(btc_payout_addr)
+        .map_err(|e| {
+            RgbError::TransferBuild(format!("bad btc_payout_addr {btc_payout_addr}: {e}"))
+        })?
+        .script_pubkey();
+
+    let maker_change_spk = wallet
+        .wallet_mut()
+        .next_address(Keychain::OUTER, true)
+        .script_pubkey();
+    let descriptor = wallet.wallet().descriptor().clone();
+    let resolved_btc = resolve_maker_btc_inputs(wallet, maker_btc_inputs)?;
+
+    Ok(SellInputs {
+        contract_id,
+        maker_seal,
+        deliver_amount,
+        taker_change_seal,
+        maker_change_spk,
+        taker_payout_spk,
+        descriptor,
+        maker_btc_inputs: resolved_btc,
+    })
+}
+
+/// **Phase 2 (sell).** Assemble the unsigned swap transaction and return it
+/// as a PSBT with every input enriched and the commitment host in place.
+///
+/// Inputs are the taker's RGB outpoints (witness_utxo + sighash only — the
+/// taker will sign these at `/sign`) followed by the maker's BTC funding
+/// outpoints (full descriptor enrichment so the maker signer recognizes them).
+/// Outputs are the taker's BTC payout (gross minus fee), the maker's BTC
+/// change (dropped if dust), and the opret `OP_RETURN` commitment host. After
+/// the output sort the txid is final.
+pub(crate) fn assemble_sell_psbt(
+    inputs: &SellInputs,
+    taker_rgb_prevouts: &[(Outpoint, TxOut)],
+    gross_btc_sats: u64,
+    actual_fee_sats: u64,
+) -> Result<Psbt, RgbError> {
+    let maker_btc_total: u64 = inputs
+        .maker_btc_inputs
+        .iter()
+        .map(|i| i.value.into_inner())
+        .sum();
+    let payout = gross_btc_sats.saturating_sub(actual_fee_sats);
+    let maker_change = maker_btc_total.saturating_sub(gross_btc_sats);
+
+    let seq = SeqNo::from_consensus_u32(SEQ_FINAL);
+    let mut tx_inputs: Vec<UnsignedTxIn> = Vec::new();
+    for (op, _) in taker_rgb_prevouts {
+        tx_inputs.push(UnsignedTxIn {
+            prev_output: to_bp_outpoint(op)?,
+            sequence: seq,
+        });
+    }
+    for mi in &inputs.maker_btc_inputs {
+        tx_inputs.push(UnsignedTxIn {
+            prev_output: mi.outpoint,
+            sequence: seq,
+        });
+    }
+    let mut tx_outputs = vec![BpTxOut::new(inputs.taker_payout_spk.clone(), Sats(payout))];
+    if maker_change > DUST_LIMIT_SATS {
+        tx_outputs.push(BpTxOut::new(
+            inputs.maker_change_spk.clone(),
+            Sats(maker_change),
+        ));
+    }
+    let unsigned_tx = UnsignedTx {
+        version: TxVer::V2,
+        inputs: VarIntArray::from_iter_checked(tx_inputs),
+        outputs: VarIntArray::from_iter_checked(tx_outputs),
+        lock_time: LockTime::ZERO,
+    };
+    let mut psbt = Psbt::from_tx(unsigned_tx);
+
+    let taker_count = taker_rgb_prevouts.len();
+    for (j, (_, txout)) in taker_rgb_prevouts.iter().enumerate() {
+        let input = psbt
+            .input_mut(j)
+            .ok_or_else(|| RgbError::TransferBuild("missing taker RGB PSBT input".to_owned()))?;
+        input.witness_utxo = Some(BpTxOut::new(
+            ScriptPubkey::from_unsafe(txout.script_pubkey.clone()),
+            Sats(txout.value_sats),
+        ));
+        input.sighash_type = Some(SighashType::all());
+    }
+    for (i, mi) in inputs.maker_btc_inputs.iter().enumerate() {
+        enrich_maker_input(
+            &mut psbt,
+            taker_count + i,
+            &inputs.descriptor,
+            mi.terminal,
+            mi.value,
+        )?;
+    }
+
+    // Opret OP_RETURN host (the wpkh maker's close method) + canonical ordering.
+    psbt.set_rgb_close_method(CloseMethod::OpretFirst);
+    psbt.construct_output_expect(ScriptPubkey::op_return(&[]), Sats::ZERO)
+        .set_opret_host()
+        .expect("freshly created opret output");
+    psbt.sort_outputs_by(|o| !o.is_opret_host())
+        .expect("PSBT outputs are modifiable");
+    psbt.complete_construction();
+
+    Ok(psbt)
+}
+
+/// **Phase 3 (sell).** Build the RGB state transition that spends the taker's
+/// (now stash-resident, after `validate_incoming_consignment`'s `accept_transfer`)
+/// allocations, assigns `deliver_amount` to the maker's blinded seal, and
+/// routes any surplus to the taker's change seal. Returns the [`Batch`] ready
+/// to embed.
+///
+/// Unlike the buy side, this doesn't bind any seal to a post-sort PSBT vout —
+/// both RGB destinations are pre-existing `BlindedSeal`s — so the transition
+/// is independent of PSBT output ordering.
+pub(crate) fn build_sell_transition(
+    wallet: &MakerWallet,
+    inputs: &SellInputs,
+    consignment_info: &ConsignmentInfo,
+) -> Result<Batch, RgbError> {
+    let contract = wallet
+        .stock()
+        .contract_data(inputs.contract_id)
+        .map_err(|e| RgbError::ContractNotFound(e.to_string()))?;
+    let assignment_type = contract
+        .schema
+        .assignment_types_for_state(StateType::Fungible)
+        .first()
+        .map(|t| **t)
+        .ok_or_else(|| RgbError::TransferBuild("contract has no fungible assignment".to_owned()))?;
+    let transition_type = contract
+        .schema
+        .default_transition_for_assignment(&assignment_type);
+
+    let mut builder = wallet
+        .stock()
+        .transition_builder_raw(inputs.contract_id, transition_type)
+        .map_err(|e| RgbError::TransferBuild(format!("transition builder: {e}")))?;
+
+    let taker_outpoints: Vec<BpOutpoint> = consignment_info
+        .outpoints
+        .iter()
+        .map(to_bp_outpoint)
+        .collect::<Result<Vec<_>, _>>()?;
+    let assignments = wallet
+        .stock()
+        .contract_assignments_for(inputs.contract_id, taker_outpoints)
+        .map_err(|e| RgbError::TransferBuild(format!("contract assignments: {e}")))?;
+    let mut sum_inputs: u64 = 0;
+    for (_seal, opouts) in assignments {
+        for (opout, state) in opouts {
+            builder = builder
+                .add_input(opout, state.clone())
+                .map_err(|e| RgbError::TransferBuild(format!("add_input: {e}")))?;
+            if let AllocatedState::Amount(value) = state {
+                sum_inputs = sum_inputs.saturating_add(value.as_inner().as_u64());
+            }
+        }
+    }
+    if sum_inputs != consignment_info.total_amount {
+        return Err(RgbError::TransferBuild(format!(
+            "stash allocations {sum_inputs} disagree with consignment total {}",
+            consignment_info.total_amount
+        )));
+    }
+    if sum_inputs < inputs.deliver_amount {
+        return Err(RgbError::TransferBuild(format!(
+            "consigned {sum_inputs} < deliver {}",
+            inputs.deliver_amount
+        )));
+    }
+
+    builder = builder
+        .add_fungible_state_raw(
+            assignment_type,
+            BuilderSeal::Concealed(inputs.maker_seal),
+            Amount::from(inputs.deliver_amount),
+        )
+        .map_err(|e| RgbError::TransferBuild(format!("add beneficiary state: {e}")))?;
+    let surplus = sum_inputs - inputs.deliver_amount;
+    if surplus > 0 {
+        let change_seal = inputs.taker_change_seal.ok_or_else(|| {
+            RgbError::TransferBuild(format!(
+                "taker over-consigned by {surplus}; rgb_change_invoice required"
+            ))
+        })?;
+        builder = builder
+            .add_fungible_state_raw(
+                assignment_type,
+                BuilderSeal::Concealed(change_seal),
+                Amount::from(surplus),
+            )
+            .map_err(|e| RgbError::TransferBuild(format!("add change state: {e}")))?;
+    }
+
+    let main = builder
+        .complete_transition()
+        .map_err(|e| RgbError::TransferBuild(format!("complete_transition: {e}")))?;
+    let mut batch = Batch {
+        main,
+        extras: Default::default(),
+    };
+    batch.set_priority(u64::MAX);
+    Ok(batch)
 }
