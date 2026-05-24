@@ -381,11 +381,11 @@ async fn buy_round_trip_two_backends_broadcasts() {
         };
 
         let maker = stack.maker_backend().await;
-        // Tiny gross + tiny fee: we don't care about value flow here, only
-        // that the tx parses + finalizes + broadcasts. The maker's RGB
-        // seal-anchor sats (1 BTC from `fund_role`) end up implicitly
-        // burned to fee — `stack.broadcast` passes `maxfeerate=0` to
-        // bypass Core's default cap so this still hits the mempool.
+        // Tiny gross + tiny fee: we don't care about value flow here,
+        // only that the tx parses + finalizes + broadcasts. Post-issue-#25
+        // the seal-anchor BTC value routes back to a maker change output
+        // so the actual fee is bounded by `actual_fee_sats` (500), well
+        // within Core's default `maxfeerate` cap.
         let transfer = maker
             .create_swap_psbt_buy(
                 &invoice,
@@ -441,6 +441,152 @@ async fn buy_round_trip_two_backends_broadcasts() {
         broadcast_txid, expected_wt,
         "bitcoind's echoed txid should match the PSBT-committed witness id"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs the regtest stack up + tools installed; see file header"]
+async fn chain_observer_enables_consecutive_buys() {
+    // Issue #27 / #28: prove the runtime gap is closed at the rfq-rgb
+    // layer. Drives buy #1 to completion + broadcast, mines a block,
+    // calls `sync_wallet` on both sides (the same call the chain observer
+    // loop makes on every tick), then drives buy #2 — which must use the
+    // *new* RGB outpoint the maker received as RGB-change from buy #1.
+    //
+    // Before #27 this test would fail at buy #2: without `sync_wallet`,
+    // the bp-wallet UTXO cache stays frozen at startup, so
+    // `list_inventory_utxos` after buy #1 returns only the original
+    // (already-spent) outpoint and `create_swap_psbt_buy` errors with
+    // "reserved RGB outpoint not in maker wallet".
+    let stack = common::stack().await;
+    let asset = stack.asset();
+
+    let buy = |amount: u64, gross: u64, fee: u64| {
+        let asset = asset.clone();
+        async move {
+            // Reusable single-buy round-trip: returns the witness txid the
+            // tx broadcast under.
+            let (invoice, maker_outpoints) = {
+                let maker = stack.maker_backend().await;
+                let invoice = maker
+                    .create_invoice(&asset, amount)
+                    .await
+                    .expect("create_invoice");
+                let utxos = maker
+                    .list_inventory_utxos(&asset)
+                    .await
+                    .expect("list_inventory_utxos");
+                let outpoints: Vec<Outpoint> = utxos.iter().map(|u| u.outpoint.clone()).collect();
+                assert!(
+                    !outpoints.is_empty(),
+                    "maker should have at least one RGB allocation"
+                );
+                (invoice, outpoints)
+            };
+
+            let (partial_psbt, consignment, expected_wt) = {
+                let taker_btc_input = {
+                    let taker = stack.taker_backend().await;
+                    taker
+                        .spare_btc_input(&asset)
+                        .await
+                        .expect("taker spare BTC input")
+                };
+                let maker = stack.maker_backend().await;
+                let transfer = maker
+                    .create_swap_psbt_buy(
+                        &invoice,
+                        amount,
+                        &maker_outpoints,
+                        std::slice::from_ref(&taker_btc_input),
+                        stack.taker_funding_addr(),
+                        gross,
+                        fee,
+                    )
+                    .await
+                    .expect("create_swap_psbt_buy");
+                let consignment = transfer.consignment.expect("buy emits consignment");
+                let expected_wt = transfer
+                    .expected_witness_txid
+                    .clone()
+                    .expect("buy commits a stable witness txid");
+                (transfer.partial_psbt, consignment, expected_wt)
+            };
+
+            let signed_psbt = {
+                let taker = stack.taker_backend().await;
+                taker
+                    .sign_and_finalize(&partial_psbt)
+                    .expect("taker sign+finalize")
+            };
+
+            let finalized = {
+                let maker = stack.maker_backend().await;
+                maker
+                    .finalize_after_taker_sign(&signed_psbt, &consignment)
+                    .await
+                    .expect("finalize_after_taker_sign")
+            };
+            assert_eq!(finalized.witness_txid, expected_wt);
+
+            let broadcast_txid = stack.broadcast(&finalized.raw_tx).expect("broadcast");
+            assert_eq!(broadcast_txid, expected_wt);
+            expected_wt
+        }
+    };
+
+    // --- Buy #1 -----------------------------------------------------------
+    let initial_maker_outpoint = {
+        let maker = stack.maker_backend().await;
+        let utxos = maker
+            .list_inventory_utxos(&asset)
+            .await
+            .expect("list_inventory_utxos");
+        utxos
+            .first()
+            .map(|u| u.outpoint.clone())
+            .expect("maker should have an RGB allocation pre-buy")
+    };
+    let wt1 = buy(100, 1_000, 500).await;
+
+    // --- Mine + sync (what the chain observer loop does on each tick) ---
+    stack.mine_block().expect("mine block");
+    {
+        let maker = stack.maker_backend().await;
+        maker.sync_wallet().await.expect("maker sync_wallet");
+    }
+    {
+        let taker = stack.taker_backend().await;
+        taker.sync_wallet().await.expect("taker sync_wallet");
+    }
+
+    // --- Maker now sees its RGB-change UTXO from buy #1 -------------------
+    let new_maker_outpoints: Vec<Outpoint> = {
+        let maker = stack.maker_backend().await;
+        let utxos = maker
+            .list_inventory_utxos(&asset)
+            .await
+            .expect("list_inventory_utxos post-sync");
+        utxos.iter().map(|u| u.outpoint.clone()).collect()
+    };
+    assert!(
+        !new_maker_outpoints.is_empty(),
+        "post-sync maker inventory should not be empty — the RGB change from buy #1 should appear"
+    );
+    assert!(
+        !new_maker_outpoints.contains(&initial_maker_outpoint),
+        "post-buy maker inventory should NOT still contain the consumed initial outpoint; \
+         got new={new_maker_outpoints:?}, initial={initial_maker_outpoint:?}"
+    );
+    let new_outpoint = &new_maker_outpoints[0];
+    assert_eq!(
+        new_outpoint.txid, wt1,
+        "the new outpoint should be on the witness tx from buy #1"
+    );
+
+    // --- Buy #2 — spends the new RGB-change UTXO -------------------------
+    // Smaller amount + fee to fit within the post-buy-#1 allocations.
+    let wt2 = buy(50, 1_000, 500).await;
+    assert_ne!(wt1, wt2, "two distinct broadcasts");
 }
 
 #[tokio::test]

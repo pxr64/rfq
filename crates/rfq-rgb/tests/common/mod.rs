@@ -249,6 +249,22 @@ impl RegtestStack {
         let out = bitcoin_cli(&self.compose_dir, &["sendrawtransaction", &hex])?;
         Ok(out.trim().to_owned())
     }
+
+    /// Mine one block to the miner wallet. Used by tests that need a
+    /// just-broadcast witness tx to confirm so a follow-up swap can spend
+    /// its outputs (e.g. issue #27's chain-observer two-buy verification).
+    pub fn mine_block(&self) -> Result<(), String> {
+        let miner_addr_out = bitcoin_cli(
+            &self.compose_dir,
+            &["-rpcwallet=miner", "getnewaddress", "", "bech32"],
+        )?;
+        let miner_addr = miner_addr_out.trim();
+        bitcoin_cli(
+            &self.compose_dir,
+            &["-rpcwallet=miner", "generatetoaddress", "1", miner_addr],
+        )?;
+        Ok(())
+    }
 }
 
 /// Maker backend handle holding the shared backend lock. Derefs to
@@ -352,6 +368,17 @@ impl<'a> TakerGuard<'a> {
             .map_err(|e| format!("taker create_invoice: {e}"))
     }
 
+    /// Refresh the taker's bp-wallet UTXO cache against electrum so
+    /// post-broadcast BTC change outputs (e.g. from a prior buy swap)
+    /// become visible to `spare_btc_input` / `lookup_prevout`. Mirrors
+    /// `LibRgbBackend::sync_wallet` on the maker side.
+    pub async fn sync_wallet(&self) -> Result<(), String> {
+        self.lib_backend()
+            .sync_wallet()
+            .await
+            .map_err(|e| format!("taker sync_wallet: {e}"))
+    }
+
     fn lib_backend(&self) -> LibRgbBackend {
         LibRgbBackend::new(
             self.stash_dir.clone(),
@@ -392,28 +419,57 @@ impl<'a> TakerGuard<'a> {
         ))
     }
 
-    /// A taker keychain-9 funding outpoint that does **not** carry an RGB
-    /// allocation, paired with its prevout `TxOut` (value + scriptPubkey).
-    /// Used as `taker_btc_inputs[0]` in `create_swap_psbt_buy` — must skip
-    /// the RGB-bearing outpoint (the one the bootstrap issuer→taker
-    /// transfer's blinded seal landed on), otherwise the swap tx would
-    /// consume the taker's RGB allocation at bitcoin layer without an
-    /// RGB transition accounting for it.
+    /// Any taker-controlled UTXO that does **not** carry an RGB allocation
+    /// for `asset`, paired with its prevout `TxOut`. Used as
+    /// `taker_btc_inputs[0]` in `create_swap_psbt_buy` — must skip
+    /// RGB-bearing outpoints, otherwise the swap tx would consume the
+    /// taker's RGB allocation at bitcoin layer without an RGB transition
+    /// accounting for it.
+    ///
+    /// Scans the full bp-wallet UTXO cache (not just the bootstrap
+    /// keychain-9 funding outpoints), so post-broadcast BTC change from
+    /// a prior swap — landing on keychain 1 (the change chain) — is also
+    /// eligible. Required for consecutive-swap tests (issue #27/#28).
     pub async fn spare_btc_input(
         &self,
         asset: &rfq_types::AssetId,
     ) -> Result<(Outpoint, TxOut), String> {
+        use bpstd::Derive as _;
         let rgb_utxos = self.inventory(asset).await?;
-        let rgb_set: std::collections::HashSet<Outpoint> =
-            rgb_utxos.iter().map(|u| u.outpoint.clone()).collect();
-        let want = self
-            .funding_outpoints
+        let rgb_set: std::collections::HashSet<(String, u32)> = rgb_utxos
             .iter()
-            .find(|op| !rgb_set.contains(op))
+            .map(|u| (u.outpoint.txid.clone(), u.outpoint.vout))
+            .collect();
+
+        let provider = FsTextStore::new(self.stash_dir.join("regtest").join("taker"))
+            .map_err(|e| format!("taker wallet provider: {e}"))?;
+        let wallet: BpWallet<XpubDerivable, RgbDescr> =
+            BpWallet::load(provider, true).map_err(|e| format!("taker wallet load: {e}"))?;
+        let descriptor = wallet.descriptor().clone();
+        let utxo = wallet
+            .utxos()
+            .find(|u| {
+                let key = (u.outpoint.txid.to_string(), u.outpoint.vout.into_u32());
+                !rgb_set.contains(&key)
+            })
             .ok_or_else(|| {
-                "no spare taker BTC outpoint — bump taker funding in bootstrap".to_owned()
+                "no spare taker BTC outpoint — every wallet UTXO is RGB-bearing".to_owned()
             })?;
-        self.lookup_prevout(want)
+        let derived = descriptor
+            .derive(utxo.terminal.keychain, utxo.terminal.index)
+            .next()
+            .ok_or_else(|| "descriptor produced no script".to_owned())?;
+        let spk: Vec<u8> = derived.to_script_pubkey().as_slice().to_vec();
+        Ok((
+            Outpoint {
+                txid: utxo.outpoint.txid.to_string(),
+                vout: utxo.outpoint.vout.into_u32(),
+            },
+            TxOut {
+                value_sats: utxo.value.sats(),
+                script_pubkey: spk,
+            },
+        ))
     }
 
     /// Enrich every PSBT input whose `prev_output` belongs to the taker
@@ -827,6 +883,13 @@ fn fund_role(
         &["-rpcwallet=miner", "generatetoaddress", "1", miner_addr],
     )?;
 
+    // Wait for electrs to index the just-mined block before we ask
+    // bp-wallet (via rgb-cmd `utxos --sync`) to scan. Without this, the
+    // sync queries electrs while it's still indexing and returns an
+    // empty UTXO set — manifests as "wallet total balance: 0 ṩ" at
+    // bootstrap time.
+    wait_for_electrs_tip(compose_dir, electrum_url)?;
+
     // Sync so electrs's new UTXO shows up in the stash.
     rgb_cmd(
         tools_dir,
@@ -1150,15 +1213,73 @@ fn run_split(label: &str, cmd: &mut Command) -> Result<(String, String), String>
     ))
 }
 
-fn ensure_miner_wallet(compose_dir: &Path) -> Result<(), String> {
-    if bitcoin_cli(compose_dir, &["-rpcwallet=miner", "getwalletinfo"]).is_ok() {
-        return Ok(());
+/// Block until electrs has indexed the same tip bitcoind reports. The
+/// bootstrap's `rgb utxos --sync` query goes through bp-electrum to
+/// electrs; if electrs is still indexing the just-mined block at sync
+/// time, the query returns an empty UTXO set and the wallet thinks it
+/// has zero balance. Poll the electrum tip in a tight loop (≤2s
+/// budget); regtest indexing is sub-second under normal load.
+fn wait_for_electrs_tip(compose_dir: &Path, electrum_url: &str) -> Result<(), String> {
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    let target: u64 = bitcoin_cli(compose_dir, &["getblockcount"])?
+        .trim()
+        .parse()
+        .map_err(|e| format!("parse getblockcount: {e}"))?;
+    let client = electrum::Client::new(electrum_url)
+        .map_err(|e| format!("electrum connect for sync wait: {e}"))?;
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        use electrum::ElectrumApi as _;
+        let header = client
+            .block_headers_subscribe_raw()
+            .map_err(|e| format!("electrum headers_subscribe: {e}"))?;
+        if header.height as u64 >= target {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "electrs tip {} did not catch up to bitcoind tip {} within 2s",
+                header.height, target
+            ));
+        }
+        sleep(Duration::from_millis(50));
     }
-    let dir = bitcoin_cli(compose_dir, &["listwalletdir"])?;
-    if dir.contains("\"miner\"") {
-        bitcoin_cli(compose_dir, &["loadwallet", "miner"])?;
-    } else {
-        bitcoin_cli(compose_dir, &["createwallet", "miner"])?;
+}
+
+fn ensure_miner_wallet(compose_dir: &Path) -> Result<(), String> {
+    if bitcoin_cli(compose_dir, &["-rpcwallet=miner", "getwalletinfo"]).is_err() {
+        let dir = bitcoin_cli(compose_dir, &["listwalletdir"])?;
+        if dir.contains("\"miner\"") {
+            bitcoin_cli(compose_dir, &["loadwallet", "miner"])?;
+        } else {
+            bitcoin_cli(compose_dir, &["createwallet", "miner"])?;
+        }
+    }
+
+    // Make sure the chain has matured coinbase that the miner wallet can
+    // spend before any `fund_role` calls `sendtoaddress`. Coinbase needs
+    // 100 confirmations to mature, so a fresh regtest stack needs ≥101
+    // blocks before the first reward is spendable. If `make regtest-up`
+    // was run without a prior `regtest-mine`, the chain is at height 0
+    // and the bootstrap's first `sendtoaddress` would fail with an
+    // opaque error.
+    let tip = bitcoin_cli(compose_dir, &["getblockcount"])?
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    if tip < 101 {
+        let addr = bitcoin_cli(
+            compose_dir,
+            &["-rpcwallet=miner", "getnewaddress", "", "bech32"],
+        )?;
+        let n = (101u64 - tip).to_string();
+        bitcoin_cli(
+            compose_dir,
+            &["-rpcwallet=miner", "generatetoaddress", &n, addr.trim()],
+        )?;
     }
     Ok(())
 }
