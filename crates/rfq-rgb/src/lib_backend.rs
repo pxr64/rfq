@@ -8,6 +8,7 @@ use bpstd::{Network, Sats, XprivAccount, XpubDerivable};
 use bpwallet::fs::FsTextStore;
 use bpwallet::hot::SecureIo;
 use bpwallet::Wallet;
+use psrgbt::PsbtConstructor;
 use amplify::Wrapper as _;
 use base64::Engine as _;
 use rgb::containers::{ConsignmentExt, FileContent, Transfer};
@@ -255,15 +256,23 @@ impl RgbBackend for LibRgbBackend {
 
     async fn finalize_after_taker_sign(
         &self,
-        _signed_psbt_base64: &str,
-        _original_consignment_base64: &str,
+        signed_psbt_base64: &str,
+        original_consignment_base64: &str,
     ) -> Result<FinalizedSwap, RgbError> {
-        // TODO(#13): finalize the PSBT with bp-std, extract the witness tx,
-        // emit the witness-extended consignment.
-        Err(RgbError::FinalizeFailed(
-            "LibRgbBackend::finalize_after_taker_sign is not implemented yet (issue #13)"
-                .to_owned(),
-        ))
+        // Maker descriptor is needed to finalize the maker's own inputs
+        // (sign_maker_inputs leaves them with partial_sigs only). The taker's
+        // inputs should already be finalized on its end.
+        let wallet = self.load_wallet()?;
+        let descriptor = wallet.wallet().descriptor().clone();
+        let (raw_tx, witness_id) = swap::finalize_signed_psbt(&descriptor, signed_psbt_base64)?;
+        Ok(FinalizedSwap {
+            raw_tx,
+            witness_txid: witness_id.to_string(),
+            // Consignment was witness-extended at PSBT-build (D3); re-emitting
+            // via stock.transfer here would duplicate. See
+            // docs/swap-psbt-design.md §finalize_after_taker_sign.
+            final_consignment_base64: original_consignment_base64.to_owned(),
+        })
     }
 
     async fn create_invoice(&self, asset: &AssetId, amount: u64) -> Result<String, RgbError> {

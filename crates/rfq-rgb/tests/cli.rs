@@ -273,18 +273,67 @@ async fn create_swap_psbt_sell_produces_psbt() {
 }
 
 #[tokio::test]
-#[ignore = "blocked on LibRgbBackend::finalize_after_taker_sign (issue #13); flip when impl lands"]
-async fn finalize_after_taker_sign_returns_witness_txid() {
+#[ignore = "needs the regtest stack up + tools installed; see file header"]
+async fn finalize_after_taker_sign_returns_extractable_witness_tx() {
     let stack = common::stack().await;
-
-    // TODO(#13): plug in a real signed PSBT once B4 lands.
+    let asset = stack.asset();
     let backend = stack.maker_backend().await;
-    let result = backend
-        .finalize_after_taker_sign("c2lnbmVk", "Y29uc2lnbm1lbnQ=")
-        .await;
 
+    // Reuse the buy composition with no taker BTC inputs: the PSBT then has
+    // only maker inputs, so the maker's own descriptor finalizes everything
+    // and finalize_after_taker_sign can be exercised end-to-end without a
+    // second-party signer. A real two-backend round-trip is B5 territory.
+    let invoice = backend
+        .create_invoice(&asset, 100)
+        .await
+        .expect("create_invoice");
+    let utxos = backend
+        .list_inventory_utxos(&asset)
+        .await
+        .expect("list_inventory_utxos");
+    let maker_outpoints: Vec<Outpoint> = utxos.iter().map(|u| u.outpoint.clone()).collect();
+    let transfer = backend
+        .create_swap_psbt_buy(&invoice, 100, &maker_outpoints, &[], "bcrt1qtaker", 1_000, 100)
+        .await
+        .expect("create_swap_psbt_buy should compose a swap PSBT");
+
+    let consignment = transfer.consignment.expect("buy emits consignment");
+    let expected_wt = transfer
+        .expected_witness_txid
+        .clone()
+        .expect("declared-funding buy commits a stable witness txid");
+
+    let finalized = backend
+        .finalize_after_taker_sign(&transfer.partial_psbt, &consignment)
+        .await
+        .expect("finalize should succeed when the maker is the sole signer");
+
+    assert_eq!(
+        finalized.witness_txid, expected_wt,
+        "finalize must surface the same witness id committed at PSBT-build (D3 invariant)"
+    );
+    assert!(
+        !finalized.raw_tx.is_empty(),
+        "extracted witness tx should be non-empty"
+    );
+    assert_eq!(
+        finalized.final_consignment_base64, consignment,
+        "finalize echoes back the original consignment; no re-emit"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs the regtest stack up + tools installed; see file header"]
+async fn finalize_after_taker_sign_rejects_garbage_psbt() {
+    let stack = common::stack().await;
+    let backend = stack.maker_backend().await;
+
+    // Garbage base64 must surface as FinalizeFailed, not panic.
+    let result = backend
+        .finalize_after_taker_sign("not-base64!", "Y29uc2lnbm1lbnQ=")
+        .await;
     assert!(
         matches!(result, Err(RgbError::FinalizeFailed(_))),
-        "stub should return FinalizeFailed error until issue #13 lands"
+        "expected FinalizeFailed on garbage input, got {result:?}"
     );
 }

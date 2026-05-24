@@ -44,9 +44,9 @@ use bpstd::psbt::{Psbt, PsbtVer, UnsignedTx, UnsignedTxIn};
 use bpstd::seals::txout::CloseMethod;
 use bpstd::signers::TestnetRefSigner;
 use bpstd::{
-    Address, Derive, Descriptor, Keychain, LockTime, Outpoint as BpOutpoint, Sats, ScriptPubkey,
-    SeqNo, SighashType, Terminal, TxOut as BpTxOut, TxVer, Txid, VarIntArray, Vout, XprivAccount,
-    XpubDerivable,
+    Address, ConsensusEncode, Derive, Descriptor, Keychain, LockTime, Outpoint as BpOutpoint, Sats,
+    ScriptPubkey, SeqNo, SighashType, Terminal, TxOut as BpTxOut, TxVer, Txid, VarIntArray, Vout,
+    XprivAccount, XpubDerivable,
 };
 use bpwallet::Wallet;
 use psrgbt::{PsbtConstructor, RgbExt, RgbPsbt};
@@ -776,4 +776,48 @@ pub(crate) fn build_sell_transition(
     };
     batch.set_priority(u64::MAX);
     Ok(batch)
+}
+
+// ---------------------------------------------------------------------------
+// Finalize (both flows)
+// ---------------------------------------------------------------------------
+
+/// **Finalize.** Both buy and sell converge here once the taker has signed
+/// (and finalized) its own inputs and shipped the PSBT back to the maker.
+///
+/// `psbt.finalize(descriptor)` walks each input's `partial_sigs` and tries to
+/// satisfy the descriptor; inputs whose keys the descriptor doesn't cover are
+/// left untouched. The maker's inputs were left with only `partial_sigs` by
+/// [`sign_maker_inputs`] (it calls `psbt.sign` but not `psbt.finalize`), so the
+/// maker descriptor satisfies and finalizes them here. The taker's inputs
+/// should already carry `final_witness` from the taker's own sign+finalize
+/// round; if not, [`Psbt::is_finalized`] catches it and we reject the PSBT
+/// before extraction.
+///
+/// The witness txid is the same one [`commit_and_consign`] returned at
+/// PSBT-build (D3 invariant — input set was final by then, so the txid is
+/// stable through sign/finalize); we just re-read it from the PSBT and hand
+/// it back so callers don't need to thread it through.
+pub(crate) fn finalize_signed_psbt(
+    descriptor: &RgbDescr,
+    signed_psbt_base64: &str,
+) -> Result<(Vec<u8>, Txid), RgbError> {
+    let mut psbt = Psbt::from_base64(signed_psbt_base64)
+        .map_err(|e| RgbError::FinalizeFailed(format!("decode signed PSBT: {e}")))?;
+
+    psbt.finalize(descriptor);
+
+    if !psbt.is_finalized() {
+        return Err(RgbError::FinalizeFailed(
+            "PSBT has unfinalized inputs after maker finalize; \
+             taker submitted partial sigs without finalizing its own inputs"
+                .to_owned(),
+        ));
+    }
+
+    let witness_id = psbt.txid();
+    let tx = psbt
+        .extract()
+        .map_err(|e| RgbError::FinalizeFailed(format!("extract signed tx: {e}")))?;
+    Ok((tx.consensus_serialize(), witness_id))
 }
