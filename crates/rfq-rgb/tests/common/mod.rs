@@ -236,16 +236,17 @@ impl RegtestStack {
         &self.compose_dir
     }
 
-    /// Broadcast a raw witness tx via `bitcoin-cli sendrawtransaction` with
-    /// `maxfeerate=0` so the buy composition's implicit "seal-anchor BTC
-    /// burned as fee" doesn't trip Bitcoin Core's default max-feerate cap.
-    /// Returns the txid bitcoind echoed back.
+    /// Broadcast a raw witness tx via `bitcoin-cli sendrawtransaction`.
+    /// Default `maxfeerate` is fine post-issue-#25: the swap composition
+    /// now routes seal-anchor BTC value back to a maker change output
+    /// (buy) / folds it into the taker payout (sell), so the tx fee is
+    /// bounded by `actual_fee_sats` rather than the seal-anchor value.
     pub fn broadcast(&self, raw_tx: &[u8]) -> Result<String, String> {
         let hex = raw_tx
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
-        let out = bitcoin_cli(&self.compose_dir, &["sendrawtransaction", &hex, "0"])?;
+        let out = bitcoin_cli(&self.compose_dir, &["sendrawtransaction", &hex])?;
         Ok(out.trim().to_owned())
     }
 }

@@ -188,6 +188,11 @@ pub(crate) struct BuyInputs {
     pub(crate) contract_id: ContractId,
     pub(crate) taker_seal: SecretSeal,
     maker_payout_spk: ScriptPubkey,
+    /// Fresh maker BTC change address for the seal-anchor BTC value of the
+    /// maker's RGB inputs (issue #25). Without this, the consumed seal-anchor
+    /// sats would be burned to fee — the maker's RGB-change *seal* is bound
+    /// to `maker_payout_spk`, but no output carries the *bitcoin* surplus.
+    maker_btc_change_spk: ScriptPubkey,
     descriptor: RgbDescr,
     maker_inputs: Vec<MakerRgbInput>,
 }
@@ -214,8 +219,16 @@ pub(crate) fn prepare_buy_inputs(
         }
     };
 
-    // Fresh external key for the maker's BTC payout (receives the price).
+    // Fresh external key for the maker's BTC payout (receives the price)
+    // + a separate fresh external key for the seal-anchor BTC change
+    // (issue #25 — keeps the payout output cleanly at `gross_btc_sats`
+    // while routing the consumed seal-anchor sats back to the maker
+    // instead of burning them to fee).
     let maker_payout_spk = wallet
+        .wallet_mut()
+        .next_address(Keychain::OUTER, true)
+        .script_pubkey();
+    let maker_btc_change_spk = wallet
         .wallet_mut()
         .next_address(Keychain::OUTER, true)
         .script_pubkey();
@@ -226,6 +239,7 @@ pub(crate) fn prepare_buy_inputs(
         contract_id,
         taker_seal,
         maker_payout_spk,
+        maker_btc_change_spk,
         descriptor,
         maker_inputs,
     })
@@ -272,6 +286,23 @@ pub(crate) fn assemble_unsigned_psbt(
         });
     }
     let mut tx_outputs = vec![BpTxOut::new(inputs.maker_payout_spk.clone(), Sats(gross_btc_sats))];
+    // Route the maker's RGB-input BTC value (seal-anchor sats) back to a
+    // fresh maker change output — without this, Bitcoin Core treats the
+    // surplus as fee and rejects the broadcast under the default
+    // `maxfeerate` cap (issue #25). The RGB-change *seal* still binds to
+    // `maker_payout_spk` (set later in `build_buy_transition` against
+    // `payout_vout`); this output only carries BTC.
+    let maker_rgb_btc_total: u64 = inputs
+        .maker_inputs
+        .iter()
+        .map(|i| i.value.into_inner())
+        .sum();
+    if maker_rgb_btc_total > DUST_LIMIT_SATS {
+        tx_outputs.push(BpTxOut::new(
+            inputs.maker_btc_change_spk.clone(),
+            Sats(maker_rgb_btc_total),
+        ));
+    }
     if taker_change > DUST_LIMIT_SATS {
         tx_outputs.push(BpTxOut::new(funding_spk, Sats(taker_change)));
     }
@@ -625,7 +656,15 @@ pub(crate) fn assemble_sell_psbt(
         .iter()
         .map(|i| i.value.into_inner())
         .sum();
-    let payout = gross_btc_sats.saturating_sub(actual_fee_sats);
+    // Fold the taker's RGB-input BTC value (seal-anchor sats) into the
+    // taker's payout output so it doesn't get burned to fee (issue #25).
+    // The taker keeps its own BTC: gets the agreed swap price minus the
+    // explicit fee, plus the seal-anchor sats from the outpoints it
+    // consigned. Bundling into one output keeps tx size minimal.
+    let taker_rgb_btc_total: u64 = taker_rgb_prevouts.iter().map(|(_, t)| t.value_sats).sum();
+    let payout = gross_btc_sats
+        .saturating_sub(actual_fee_sats)
+        .saturating_add(taker_rgb_btc_total);
     let maker_change = maker_btc_total.saturating_sub(gross_btc_sats);
 
     let seq = SeqNo::from_consensus_u32(SEQ_FINAL);
