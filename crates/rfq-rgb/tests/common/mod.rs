@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
+use bpstd::HardenedIndex;
+use bpwallet::hot::{SecureIo, Seed, SeedType};
+use bpwallet::Bip43;
 use rfq_rgb::{ContractId, LibRgbBackend, RgbBackend};
 use rfq_types::{AssetId, AssetKind, BitcoinNetwork, Outpoint};
 use tempfile::TempDir;
@@ -328,39 +331,28 @@ fn create_role_wallet(
     electrum_url: &str,
     role: &str,
 ) -> Result<RoleHandles, String> {
-    let seed_file = tempdir.join(format!("{role}.seed"));
     let account_file = tempdir.join(format!("{role}.account"));
     let stash_dir = tempdir.join(role);
     std::fs::create_dir_all(&stash_dir)
         .map_err(|e| format!("create stash dir {stash_dir:?}: {e}"))?;
 
-    // bp-hot seed: generates a random seed at `seed_file`. SEED_PASSWORD=""
-    // mirrors rgb-wallets-init.
-    run(
-        "bp-hot seed",
-        Command::new(bp_hot_path(tools_dir))
-            .env("SEED_PASSWORD", "")
-            .arg("seed")
-            .arg(&seed_file),
-    )?;
-
-    // bp-hot derive: produces an account file and prints the descriptor on
-    // stdout. We parse the `Account: <descriptor>` line.
-    let derive_out = run(
-        "bp-hot derive",
-        Command::new(bp_hot_path(tools_dir))
-            .env("SEED_PASSWORD", "")
-            .arg("derive")
-            .arg("-N")
-            .arg("--scheme")
-            .arg("bip84")
-            .arg("--account")
-            .arg("0h")
-            .arg(&seed_file)
-            .arg(&account_file),
-    )?;
-    let descriptor = parse_descriptor(&derive_out)?;
-    // `/<0;1;9>/*` terminal: external (0), change (1), RGB seal-anchor (9).
+    // In-Rust replacement for `bp-hot seed` + `bp-hot derive -N --scheme bip84
+    // --account 0h ...`. The seed itself stays in memory — `LibRgbBackend`
+    // only needs the encrypted account file (loaded via `XprivAccount::read`
+    // in `lib_backend.rs:122`). `derive(_, testnet=true, _)` mirrors the
+    // shell's omission of `--mainnet`; the empty account password mirrors the
+    // shell's `-N` (`--no-password`) flag.
+    let seed = Seed::random(SeedType::Bit128);
+    let account = seed.derive(Bip43::Bip84, true, HardenedIndex::hardened(0));
+    account
+        .write(&account_file, "")
+        .map_err(|e| format!("write account file {account_file:?}: {e}"))?;
+    // `to_xpub_account().to_string()` mirrors the `Account:` line bp-hot
+    // derive used to print: `[fingerprint/84h/1h/0h]tpubD...`. The
+    // `/<0;1;9>/*` terminal declares external (0), change (1), and RGB
+    // seal-anchor (9) keychains — `rgb address -k 9` needs keychain 9 in
+    // the descriptor or it can't derive anchor addresses.
+    let descriptor = account.to_xpub_account().to_string();
     let descriptor_with_terminal = format!("{descriptor}/<0;1;9>/*");
 
     // rgb create --wpkh <descriptor> <role>
@@ -643,24 +635,16 @@ fn env_or_default(key: &str, default: PathBuf) -> PathBuf {
     std::env::var(key).map(PathBuf::from).unwrap_or(default)
 }
 
-fn bp_hot_path(tools_dir: &Path) -> PathBuf {
-    tools_dir.join("bp-wallet/bin/bp-hot")
-}
-
 fn rgb_path(tools_dir: &Path) -> PathBuf {
     tools_dir.join("rgb-cmd/bin/rgb")
 }
 
 fn require_tools(tools_dir: &Path) -> Result<(), String> {
-    let bp = bp_hot_path(tools_dir);
     let rgb = rgb_path(tools_dir);
-    let binding = [&bp, &rgb];
-    let missing: Vec<_> = binding.iter().filter(|p| !p.is_file()).collect();
-    if !missing.is_empty() {
+    if !rgb.is_file() {
         return Err(format!(
-            "regtest tools missing under {tools_dir:?}.\n\
-             Run: make -C infra/regtest rgb-tools-install\n\
-             Missing: {missing:?}",
+            "rgb-cmd missing at {rgb:?}.\n\
+             Run: make -C infra/regtest rgb-tools-install",
         ));
     }
     Ok(())
@@ -692,17 +676,6 @@ fn require_stack_up(compose_dir: &Path, electrum_url: &str) -> Result<(), String
 }
 
 use std::net::ToSocketAddrs;
-
-fn parse_descriptor(derive_output: &str) -> Result<String, String> {
-    for line in derive_output.lines() {
-        if let Some(rest) = line.strip_prefix("Account:") {
-            return Ok(rest.trim().to_owned());
-        }
-    }
-    Err(format!(
-        "bp-hot derive output missing `Account:` line:\n{derive_output}"
-    ))
-}
 
 fn last_word(s: &str) -> Option<String> {
     s.lines()
