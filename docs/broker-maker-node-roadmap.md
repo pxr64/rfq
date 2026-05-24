@@ -15,7 +15,7 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [x] Define broker-to-maker node protocol
 - [x] Define regtest RGB20 integration plan
 - [x] Validate end-to-end NIA issuance + issuer→maker transfer on regtest
-- [ ] Issue #13: Library-backed `rfq-rgb` adapter — foundation landed; real `LibRgbBackend` swap methods **parked**, issue needs a re-scope (see below)
+- [x] Issue #13: Library-backed `rfq-rgb` adapter — foundation, `create_invoice`, `validate_incoming_consignment`, the full swap-PSBT trio (B1–B5), and two-backend buy + sell round-trip tests all landed and regtest-verified. Group B follow-ups (validate-trait sig cleanup, maker-node BTC wallet bootstrap, seal-anchor change handling) tracked below.
 - [x] Issue #14: RGB maker UTXO inventory management (supersedes #11)
 - [x] Issue #15: Atomic swap settlement — buy side (BTC → RGB)
 - [x] Issue #16: Atomic swap settlement — sell side (RGB → BTC)
@@ -76,7 +76,7 @@ Define how the mock-only scaffolding becomes a real regtest MVP without leaking 
 
 ## Library-Backed `rfq-rgb` Adapter (Issue #13)
 
-**Status: foundation + `create_invoice` + `validate_incoming_consignment` landed and live-verified; swap-PSBT plumbing (B1), buy composition (B2), and sell composition (B3) landed and regtest-verified. B4 finalize + B5 end-to-end round-trip still ahead — see follow-ups.**
+**Status: done.** Foundation + `create_invoice` + `validate_incoming_consignment` + the full swap-PSBT trio (B1 plumbing, B2 buy composition, B3 sell composition, B4 finalize-after-taker-sign, B5 two-backend round-trip tests) all landed and regtest-verified. Both buy and sell round-trips broadcast through bitcoind end-to-end with cooperating maker + taker `LibRgbBackend`s.
 
 Wrap the proven manual regtest RGB flow behind the `RgbBackend` trait, using
 `rgb-api` + `bp-std` + `bp-wallet` directly (the same libraries `rgb-cmd` builds
@@ -109,55 +109,56 @@ either way.
   Mirrors `rgb-cmd`'s `Validate`/`Accept`. Live-verified by
   `tests/cli.rs::validate_incoming_consignment_accepts_a_real_consignment`.
 
-**Group B — composition work next**: `create_swap_psbt_buy`,
-`create_swap_psbt_sell`, `finalize_after_taker_sign`. Unlike the methods
-above, these don't have an `rgb-cmd` analog to mirror — rgb-cmd only does
-unilateral transfers; an atomic swap is what *this project* is building.
-Every primitive we need is already public (bp-std `Psbt::new` + per-input
-`sighash_type`, `psbt.sign(&signer)` naturally signs only what the signer's
-keys cover, rgb-api's `stock.transition_builder_raw`, `psbt.rgb_embed`,
-`psbt.rgb_commit`, `stock.consume_fascia`, `stock.transfer`). The work is
-**composing them below `pay()`** into the two-party shape the swap protocol
-needs (partial PSBT, taker adds inputs later for buy / both parties' inputs
-present at build for sell, per-input SIGHASH, deferred witness txid on buy).
+**Group B — composition** delivered the two-party swap-PSBT trio. Unlike the
+methods above, these had no `rgb-cmd` analog to mirror — rgb-cmd only does
+unilateral transfers. Every primitive was already public (bp-std `Psbt`,
+`psbt.sign(&signer)`, rgb-api's `stock.transition_builder_raw`,
+`psbt.rgb_embed`/`rgb_commit`, `stock.consume_fascia`/`transfer`); the
+work was **composing them below `pay()`** into the two-party shape:
+partial PSBT, taker contributes BTC for buy / RGB for sell, per-input
+SIGHASH, stable witness txid via declared-funding.
 
-**Design landed**: [`docs/swap-psbt-design.md`](swap-psbt-design.md) — the
+**Design**: [`docs/swap-psbt-design.md`](swap-psbt-design.md) — the
 implementation-level companion to `docs/swap-flows.md`. Defines the
-inputs/outputs/signing matrix per side, the lifecycle per trait method, six
-explicit design decisions (SIGHASH model, when `rgb_commit` is called,
-consignment lifecycle, beneficiary shape, change handling), the five known
-unknowns that need a build-iterate cycle to resolve, and a five-phase
-implementation plan (B1 plumbing → B2 buy → B3 sell → B4 finalize → B5 tests).
+inputs/outputs/signing matrix per side, the lifecycle per trait method,
+six explicit design decisions, the known unknowns each phase resolved,
+and the five-phase plan (B1 plumbing → B2 buy → B3 sell → B4 finalize →
+B5 tests).
 
-**Phase progress:** B1 plumbing (commits `f865ce4`, `66b3e78`), B2 buy
-composition (`c803a0d`, `163d776`), and B3 sell composition all landed and
-regtest-verified. The single regtest-bootstrap command above is the
-iteration target; each phase compile-iterates with live verification via
-`cargo test -p rfq-rgb -- --ignored`.
+**Phase commits:**
 
-### Follow-up issues
+- B1 plumbing: `f865ce4`, `66b3e78`
+- B2 buy composition: `c803a0d`, `163d776`
+- B3 sell composition: `efc1293` + correction `0987676`
+- B4 finalize: `98addd3` (+ prereq `70fb2a2` promoting
+  `enrich_psbt_input` to pub)
+- B5 round-trip tests: `a6f8d81` — two-backend buy + sell, broadcasts
+  through bitcoind
 
-- **B4 — `finalize_after_taker_sign`** — Deserialize the signed PSBT,
-  extract the witness tx via bp-std, return `FinalizedSwap` with the
-  echoed consignment. Mostly extraction; design lives in
-  [`swap-psbt-design.md`](swap-psbt-design.md) (section
-  `finalize_after_taker_sign`). Next session-sized commit after B3.
-- **`validate_incoming_consignment` trait-sig cleanup** — The
-  `expected_invoice: &str` parameter has the same self-round-trip on
-  sell that B3 lifted for `create_swap_psbt_sell` (the maker created
-  the invoice itself; the parse only recovers `contract_id` for
-  cross-checking the consignment). Change to
+### Open follow-ups (still under issue #13)
+
+- **`validate_incoming_consignment` semantics** — currently returns
+  the consignment's *output* seals (recipient destinations). The B5
+  sell round-trip needed *input* outpoints (where to spend the
+  taker's RGB from); test works around this via a pre-consign
+  inventory snapshot — fragile. Long-term fix: either rename the
+  existing field (it's still useful for the validate-only path) and
+  add a typed inputs accessor, or pivot the field's semantics.
+- **`validate_incoming_consignment` trait-sig cleanup** — Drop the
+  `expected_invoice: &str` self-round-trip (same shape B3 lifted for
+  `create_swap_psbt_sell`). The maker created the invoice itself; the
+  parse only recovers `contract_id` for cross-checking. Change to
   `expected_contract_id: ContractId` and have rfq-maker extract it
-  once at /sign time alongside the seal (via the new
-  `parse_maker_invoice` trait method B3 added). Small follow-up; mock
-  impl + rfq-maker call site are the only ripple.
+  once at /sign time alongside the seal (via the `parse_maker_invoice`
+  trait method B3 added). Mock impl + rfq-maker call site are the
+  only ripple.
 - **Maker-node electrum + BTC wallet bootstrap** —
-  [`crates/maker-node/src/main.rs:312`](../crates/maker-node/src/main.rs#L312)
+  [`crates/maker-node/src/main.rs`](../crates/maker-node/src/main.rs)
   hard-codes `MockBitcoinClient::new()`, seeds mock taker funding
   (`seed_address_unspent("bcrt1qtaker", ...)`), and seeds mock BTC
   inventory (`with_btc_inventory(mock_btc_inventory())`).
   `ElectrumClient` exists at
-  [`crates/rfq-btc/src/electrum.rs:26`](../crates/rfq-btc/src/electrum.rs#L26)
+  [`crates/rfq-btc/src/electrum.rs`](../crates/rfq-btc/src/electrum.rs)
   but isn't wired through config; `ElectrumClient::get_outpoint` is
   also still a stub. Maker also needs a BTC wallet bootstrap (walk
   the maker's wpkh descriptor against electrum) so the explicit
@@ -165,13 +166,14 @@ iteration target; each phase compile-iterates with live verification via
   "Wallet UTXO-cache sync" follow-up under #14 (that one's about
   freshness of the RGB-bearing wallet cache; this is about chain
   access + maker BTC wallet plumbing).
-- **B5 — end-to-end round-trip test** — Drive two cooperating
-  `LibRgbBackend`s (maker + taker) through `/quote → /accept →
-  /consignment → /sign → broadcast`, exercising PSBT serialization
-  round-trip, signing, finalize. Confirms the full atomic-swap loop
-  works end-to-end on regtest with chain-correct prevouts (the B3
-  sell test uses synthetic taker prevouts because cli.rs has no
-  electrum). Depends on B4.
+- **Seal-anchor BTC value handling** — Both buy and sell composition
+  implicitly burn the seal-anchor input's BTC value as fee (no
+  dedicated maker BTC change output for it). The B5 round-trip tests
+  pass `maxfeerate=0` to `sendrawtransaction` to bypass Core's default
+  cap; production won't want this. Either add an explicit maker BTC
+  change output for the RGB input's sats, or document the trade-off
+  (the seal-anchor sats are tiny relative to typical swap notional —
+  may be acceptable).
 
 ## RGB Maker UTXO Inventory Management (Issue #14)
 
