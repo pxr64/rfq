@@ -19,7 +19,6 @@ use rfq_types::{
     HealthResponse, InventorySnapshot, MakerId, Outpoint, Quote, QuoteId, QuoteRequest,
     RgbInventoryUtxo, SettlementIntent,
 };
-use rfq_wallet::{MockWalletBackend, WalletBackend};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle, time};
 
 #[derive(Debug, Parser)]
@@ -44,6 +43,11 @@ struct MakerNodeConfig {
     poll_interval_ms: u64,
     cleanup_interval_ms: u64,
     rebalance_interval_ms: u64,
+    /// How often the chain-observer loop refreshes the wallet UTXO cache +
+    /// BTC inventory + checks pending-confirm txes. Only fires when the
+    /// real RGB backend is configured (otherwise the mock has nothing to
+    /// observe). Default 5s (issue #27).
+    chain_observer_interval_ms: u64,
     rebalance_policy: RebalancePolicyConfig,
     rgb: Option<RgbConfig>,
 }
@@ -111,6 +115,10 @@ impl MakerNodeConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(60_000),
+            chain_observer_interval_ms: env::var("CHAIN_OBSERVER_INTERVAL_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(5_000),
             rebalance_policy: RebalancePolicyConfig {
                 fragmentation_threshold: env::var("REBALANCE_FRAGMENTATION_THRESHOLD")
                     .ok()
@@ -179,22 +187,28 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let _client = RfqClient::new(config.api_url()?);
-    let wallet = MockWalletBackend::default();
-    let maker = build_maker(&config).await?;
+    let runtime = build_runtime(&config).await?;
+    let maker = runtime.maker;
+    let chain_observer_deps = runtime.chain_observer;
     let app = maker_app(maker.clone());
     let listener = TcpListener::bind(&config.maker_listen_addr).await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let maker_type = std::any::type_name::<Maker>();
-    let sample_invoice = wallet.create_rgb_invoice("mock-contract", 1)?;
 
     println!("maker-node starting");
     println!("maker_id={}", config.maker_id);
     println!("rfq_api_url={}", config.rfq_api_url);
     println!("maker_listen_addr={}", config.maker_listen_addr);
-    println!("poll_interval_ms={}", config.poll_interval_ms);
     println!("cleanup_interval_ms={}", config.cleanup_interval_ms);
     println!("rebalance_interval_ms={}", config.rebalance_interval_ms);
-    println!("wallet_sample_invoice={sample_invoice}");
+    println!(
+        "chain_observer={}",
+        if chain_observer_deps.is_some() {
+            format!("enabled (interval_ms={})", config.chain_observer_interval_ms)
+        } else {
+            "disabled (no RGB config)".to_owned()
+        }
+    );
     println!("maker_runtime={maker_type}");
 
     let cleanup_task = spawn_cleanup_loop(maker.clone(), config.cleanup_interval_ms);
@@ -203,7 +217,9 @@ async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> 
         config.rebalance_interval_ms,
         (&config.rebalance_policy).into(),
     );
-    let placeholder_task = spawn_placeholder_loop(config.poll_interval_ms);
+    let chain_observer_task = chain_observer_deps.map(|deps| {
+        spawn_chain_observer_loop(maker.clone(), deps, config.chain_observer_interval_ms)
+    });
     let server_task = tokio::spawn(async move {
         let result = axum::serve(listener, app)
             .with_graceful_shutdown(async {
@@ -221,25 +237,26 @@ async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> 
     let _ = shutdown_tx.send(());
     cleanup_task.abort();
     rebalance_task.abort();
-    placeholder_task.abort();
+    if let Some(t) = &chain_observer_task {
+        t.abort();
+    }
     let _ = server_task.await;
     let _ = cleanup_task.await;
     let _ = rebalance_task.await;
-    let _ = placeholder_task.await;
+    if let Some(t) = chain_observer_task {
+        let _ = t.await;
+    }
 
     Ok(())
 }
 
 async fn health(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let broker_status = broker_health_status(&config).await?;
-    let wallet = MockWalletBackend::default();
-    let _sample_signed_psbt = wallet.sign_psbt("mock-psbt")?;
 
     println!("maker-node health ok");
     println!("maker_id={}", config.maker_id);
     println!("rfq_api_url={}", config.rfq_api_url);
     println!("broker_status={broker_status}");
-    println!("wallet=mock-ready");
     println!(
         "maker_runtime={}",
         std::any::type_name::<rfq_maker::Maker>()
@@ -269,7 +286,31 @@ async fn inventory(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+/// Output of [`build_runtime`]. Holds the maker + (when a real RGB backend
+/// is configured) the dependencies the chain-observer loop needs to refresh
+/// wallet state out-of-band of the request path.
+struct MakerNodeRuntime {
+    maker: Maker,
+    chain_observer: Option<ChainObserverDeps>,
+}
+
+/// Shared with the chain observer so it can drive `LibRgbBackend::sync_wallet`
+/// + `list_btc_only_utxos` against the same RGB stash + asset the maker uses.
+/// `None` for the mock fallback (nothing on-chain to observe).
+struct ChainObserverDeps {
+    rgb_backend: Arc<LibRgbBackend>,
+    asset: AssetId,
+}
+
+/// Thin compatibility shim around [`build_runtime`] for tests + the
+/// `inventory` CLI subcommand that don't need the chain-observer deps.
 async fn build_maker(config: &MakerNodeConfig) -> Result<Maker, Box<dyn std::error::Error>> {
+    Ok(build_runtime(config).await?.maker)
+}
+
+async fn build_runtime(
+    config: &MakerNodeConfig,
+) -> Result<MakerNodeRuntime, Box<dyn std::error::Error>> {
     let maker_id = MakerId(config.maker_id.clone());
     let asset = AssetId {
         network: BitcoinNetwork::Regtest,
@@ -285,22 +326,29 @@ async fn build_maker(config: &MakerNodeConfig) -> Result<Maker, Box<dyn std::err
         Some(rgb_cfg) => {
             // Production-ish path: real RGB stash + real electrum-backed
             // chain access + real wallet-derived BTC inventory.
-            let backend = LibRgbBackend::new(
+            let backend = Arc::new(LibRgbBackend::new(
                 rgb_cfg.data_dir.clone(),
                 rgb_cfg.wallet_name.clone(),
                 rgb_cfg.network.clone(),
                 rgb_cfg.electrum_url.clone(),
                 rgb_cfg.signer_account_file.clone(),
                 rgb_cfg.signer_password.clone(),
-            );
+            ));
             let rgb_utxos = backend.list_inventory_utxos(&asset).await?;
             let now_ms = now_ms();
             let btc_inventory = backend.list_btc_only_utxos(&asset, now_ms).await?;
             let bitcoin_client: Arc<dyn BitcoinClient> =
                 Arc::new(ElectrumClient::connect(&rgb_cfg.electrum_url)?);
-            let rgb_backend: Arc<dyn RgbBackend> = Arc::new(backend);
-            Ok(Maker::new(maker_id, rgb_utxos, rgb_backend, bitcoin_client)
-                .with_btc_inventory(btc_inventory))
+            let rgb_backend_trait: Arc<dyn RgbBackend> = backend.clone();
+            let maker = Maker::new(maker_id, rgb_utxos, rgb_backend_trait, bitcoin_client)
+                .with_btc_inventory(btc_inventory);
+            Ok(MakerNodeRuntime {
+                maker,
+                chain_observer: Some(ChainObserverDeps {
+                    rgb_backend: backend,
+                    asset,
+                }),
+            })
         }
         None => {
             // Mock fallback: useful for tests + the `maker-node` demo runs
@@ -316,8 +364,12 @@ async fn build_maker(config: &MakerNodeConfig) -> Result<Maker, Box<dyn std::err
             let rgb_backend: Arc<dyn RgbBackend> = Arc::new(MockRgbBackend::new(vec![utxo.clone()]));
             let bitcoin_client = Arc::new(MockBitcoinClient::new());
             bitcoin_client.seed_address_unspent("bcrt1qtaker", mock_taker_funding());
-            Ok(Maker::new(maker_id, vec![utxo], rgb_backend, bitcoin_client)
-                .with_btc_inventory(mock_btc_inventory()))
+            let maker = Maker::new(maker_id, vec![utxo], rgb_backend, bitcoin_client)
+                .with_btc_inventory(mock_btc_inventory());
+            Ok(MakerNodeRuntime {
+                maker,
+                chain_observer: None,
+            })
         }
     }
 }
@@ -543,16 +595,55 @@ fn spawn_rebalance_loop(
     })
 }
 
-fn spawn_placeholder_loop(poll_interval_ms: u64) -> JoinHandle<()> {
+/// Periodic chain-observer loop. On each tick:
+/// 1. Refresh the bp-wallet on-disk UTXO cache via electrum
+///    (`LibRgbBackend::sync_wallet`).
+/// 2. Re-list wallet-derived BTC inventory and ingest any new outpoints
+///    into the maker's BTC store (`Maker::ingest_btc_change_utxos`).
+/// 3. Sweep `PendingBitcoinConfirm` reservations against the chain
+///    (`Maker::sweep_confirmations`).
+///
+/// Only spawned when `RgbConfig` is present; the mock fallback has no
+/// chain to observe. Closes the runtime gap from issue #27: without this
+/// loop the daemon's view of its own wallet state freezes at startup,
+/// and pending-confirm reservations stay pending forever.
+fn spawn_chain_observer_loop(
+    maker: Maker,
+    deps: ChainObserverDeps,
+    interval_ms: u64,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_millis(poll_interval_ms));
-
+        let mut interval = time::interval(Duration::from_millis(interval_ms));
+        // Skip the immediate first-tick `interval.tick()` returns so the
+        // observer starts ~`interval_ms` after spawn rather than racing
+        // the maker's own startup snapshot.
+        interval.tick().await;
         loop {
             interval.tick().await;
-            println!("maker-node placeholder tick");
+            if let Err(e) = deps.rgb_backend.sync_wallet().await {
+                eprintln!("chain_observer wallet sync failed (continuing): {e}");
+                continue;
+            }
+            let now = now_ms();
+            match deps.rgb_backend.list_btc_only_utxos(&deps.asset, now).await {
+                Ok(utxos) => {
+                    let added = maker.ingest_btc_change_utxos(utxos).await;
+                    if added > 0 {
+                        println!("chain_observer ingested_btc_utxos={added}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("chain_observer list_btc_only_utxos failed: {e}");
+                }
+            }
+            let spent = maker.sweep_confirmations().await;
+            if spent > 0 {
+                println!("chain_observer marked_spent={spent}");
+            }
         }
     })
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -750,6 +841,7 @@ mod tests {
             poll_interval_ms: 1_000,
             cleanup_interval_ms: 1_000,
             rebalance_interval_ms: 60_000,
+            chain_observer_interval_ms: 5_000,
             rebalance_policy: RebalancePolicyConfig::default(),
             rgb: None,
         }

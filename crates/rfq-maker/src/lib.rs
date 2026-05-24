@@ -244,6 +244,61 @@ impl Maker {
         ExtendedInventorySnapshot::from_utxos(utxos.iter())
     }
 
+    /// Bulk-ingest BTC UTXOs discovered out-of-band (e.g. by the chain
+    /// observer's periodic re-list of wallet-derived BTC inventory) into
+    /// the BTC store. Existing outpoints are silently skipped — the store's
+    /// `ingest_change_utxo` returns `UtxoNotAvailable` on duplicates, which
+    /// we treat as a no-op (the chain observer re-lists everything each
+    /// tick; most entries are already known). Returns the count actually
+    /// inserted. Issue #27.
+    pub async fn ingest_btc_change_utxos(&self, utxos: Vec<BtcInventoryUtxo>) -> usize {
+        let mut added = 0;
+        for u in utxos {
+            if self.btc_store.ingest_change_utxo(u).await.is_ok() {
+                added += 1;
+            }
+        }
+        added
+    }
+
+    /// For every reservation currently in `PendingBitcoinConfirm`, probe
+    /// the chain via `BitcoinClient::get_outpoint` to see if the witness
+    /// tx is on-chain; if so, transition the reservation to `Spent`.
+    /// Returns the count of UTXOs that moved. Issue #27.
+    ///
+    /// Confirmation probe: we ask for `(witness_txid, 0)`. Swap txes put
+    /// the opret commitment at vout 0, so a confirmed tx replies with
+    /// `NonSegwitOutpoint`; a still-missing tx replies with `Backend`
+    /// (typically "transaction not found"). Any "tx exists in some form"
+    /// response counts as confirmed; everything else is "not yet."
+    pub async fn sweep_confirmations(&self) -> usize {
+        use std::collections::HashMap;
+        let mut pending: HashMap<ReservationId, String> = HashMap::new();
+        for u in self.btc_store.list_all().await {
+            if let BtcInventoryStatus::PendingBitcoinConfirm {
+                reservation_id,
+                witness_txid,
+            } = u.status
+            {
+                pending.insert(reservation_id, witness_txid);
+            }
+        }
+        let mut spent = 0;
+        for (reservation_id, witness_txid) in pending {
+            if !tx_confirmed(&*self.bitcoin_client, &witness_txid).await {
+                continue;
+            }
+            if let Ok(n) = self
+                .btc_store
+                .mark_spent(&reservation_id, witness_txid, now_ms())
+                .await
+            {
+                spent += n;
+            }
+        }
+        spent
+    }
+
     pub async fn release_expired_reservations(&self) -> usize {
         let now = now_ms();
         // Both pools age out here, so the maker-node cleanup loop's single call
@@ -1131,6 +1186,27 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// "Is this witness tx on chain?" probe used by `Maker::sweep_confirmations`
+/// without adding a new method to the `BitcoinClient` trait. Queries
+/// `(witness_txid, 0)` via `get_outpoint`: for our swap txes vout 0 is the
+/// opret commitment (non-segwit), so a confirmed tx replies with
+/// `NonSegwitOutpoint`; a still-missing tx replies with a `Backend` error
+/// (typically "transaction not found"). Real `Ok` would also count as
+/// confirmed (e.g. a non-swap tx with segwit at vout 0). Anything else
+/// (connection failure, etc.) reads as "not yet" — harmless, the next
+/// sweep tick retries.
+async fn tx_confirmed(client: &dyn BitcoinClient, witness_txid: &str) -> bool {
+    use rfq_btc::BtcError;
+    use rfq_types::Outpoint;
+    let probe = Outpoint::new(witness_txid.to_owned(), 0);
+    match client.get_outpoint(&probe).await {
+        Ok(_) => true,
+        Err(BtcError::NonSegwitOutpoint(_)) => true,
+        Err(BtcError::OutpointNotFound(_)) => true,
+        Err(_) => false,
+    }
 }
 
 /// Greedy largest-first selection over the taker's declared-funding UTXOs.

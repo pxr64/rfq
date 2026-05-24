@@ -16,6 +16,7 @@ base64 = "0.22"
 rgb-api = { version = "=0.11.1-rc.6", features = ["electrum_blocking", "fs", "serde"] }
 bp-std = { version = "=0.11.1-alpha.2", features = ["client-side-validation", "serde", "signers"] }
 bp-wallet = { version = "=0.11.1-alpha.2", features = ["fs", "signers", "electrum"] }
+bp-electrum = "=0.11.1-alpha.2"
 rgb-psbt-utils = "=0.11.1-rc.6"
 amplify = "=4.8.0"
 rand = "0.9"

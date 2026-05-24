@@ -124,6 +124,40 @@ impl LibRgbBackend {
             .map_err(|e| RgbError::TransferBuild(format!("load signer account: {e}")))
     }
 
+    /// Refresh the on-disk bp-wallet UTXO cache against electrum. Without
+    /// this, `load_wallet`'s cache stays frozen at whatever was last
+    /// persisted; the maker's own swap-tx change outputs + any incoming
+    /// sells stay invisible to `list_inventory_utxos` /
+    /// `list_btc_only_utxos` until something calls back here. The
+    /// maker-node's chain-observer loop drives this on a timer (issue #27).
+    ///
+    /// Uses `wallet.update(&AnyIndexer::Electrum(...))` — an incremental
+    /// scan against the wallet's existing descriptor terminals, NOT a
+    /// full `sync_from_scratch`. Persists via `Wallet`'s autosave-on-drop
+    /// (the wallet handle is dropped at end of fn).
+    pub async fn sync_wallet(&self) -> Result<(), RgbError> {
+        use bpwallet::AnyIndexer;
+        // bp-electrum exports its lib as `electrum` (vs `electrum-client`'s
+        // `electrum_client`); they're distinct crates. bp-wallet's
+        // `AnyIndexer::Electrum` variant takes the bp-electrum `Client`.
+        let mut wallet = self.load_wallet()?;
+        let client = electrum::Client::new(&self.electrum_url)
+            .map_err(|e| RgbError::StashLoad(format!("electrum connect: {e}")))?;
+        let indexer = AnyIndexer::Electrum(Box::new(client));
+        let result = wallet.wallet_mut().update(&indexer);
+        // bp-wallet `update` returns `MayError<(), Vec<Error>>` — partial
+        // failures bubble through via `err`. Treat any error as a hard
+        // failure for now; the observer loop logs + retries on the next tick.
+        if let Some(errors) = result.err {
+            return Err(RgbError::StashLoad(format!(
+                "wallet sync surfaced {} error(s): {:?}",
+                errors.len(),
+                errors
+            )));
+        }
+        Ok(())
+    }
+
     /// Wallet-derived BTC inventory: every spendable wallet UTXO that is
     /// **not** carrying an RGB allocation for `asset`. Replaces the hardcoded
     /// `mock_btc_inventory()` in `maker-node/src/main.rs`. Each returned
