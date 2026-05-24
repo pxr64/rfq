@@ -10,6 +10,7 @@ use thiserror::Error;
 mod lib_backend;
 mod swap;
 pub use lib_backend::LibRgbBackend;
+pub use swap::enrich_psbt_input;
 
 /// Re-export of the bitcoin prevout type — a sell-side swap PSBT pins each RGB
 /// input's `scriptPubKey` + `value_sats`, which the consignment doesn't carry.

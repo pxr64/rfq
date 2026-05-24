@@ -138,12 +138,23 @@ fn resolve_maker_inputs(
     Ok(resolved)
 }
 
-/// Fully enrich a maker-controlled PSBT input from the wallet descriptor, so the
-/// maker's signer recognizes it. Replicates the field-set of
-/// `psbt::Psbt::construct_input` (which we can't call directly — it only adds
-/// new inputs, and our taker inputs aren't on the maker descriptor, forcing the
-/// `Psbt::from_tx` path).
-fn enrich_maker_input(
+/// Fully enrich a descriptor-controlled PSBT input so a `TestnetRefSigner`
+/// over the matching account can sign it. Populates `witness_utxo`,
+/// `sighash_type`, the redeem/witness scripts, the `bip32_derivation` map
+/// (the load-bearing field for ECDSA signing — without it the signer's
+/// `get(origin)` returns None and `psbt.sign` matches zero inputs), and the
+/// taproot equivalents.
+///
+/// Replicates the field-set of `psbt::Psbt::construct_input` (which we can't
+/// call directly here — it only adds *new* inputs, but our PSBT was built
+/// via `Psbt::from_tx` so the inputs already exist).
+///
+/// Public so a real taker (or a test harness simulating one) can prep its
+/// own inputs after receiving the maker-built PSBT: the buy/sell composition
+/// leaves taker inputs with only `witness_utxo` + `sighash_type` (the maker
+/// doesn't know the taker's descriptor), so the taker has to enrich and
+/// sign on its end before handing the PSBT back.
+pub fn enrich_psbt_input(
     psbt: &mut Psbt,
     index: usize,
     descriptor: &RgbDescr,
@@ -274,7 +285,7 @@ pub(crate) fn assemble_unsigned_psbt(
 
     let maker_count = inputs.maker_inputs.len();
     for (i, mi) in inputs.maker_inputs.iter().enumerate() {
-        enrich_maker_input(&mut psbt, i, &inputs.descriptor, mi.terminal, mi.value)?;
+        enrich_psbt_input(&mut psbt, i, &inputs.descriptor, mi.terminal, mi.value)?;
     }
     for (j, (_, txout)) in taker_btc_inputs.iter().enumerate() {
         let input = psbt
@@ -483,7 +494,7 @@ pub(crate) fn encode_swap_transfer_sell(
 
 /// A maker BTC funding input resolved against the wallet's UTXO set. Mirrors
 /// [`MakerRgbInput`] — same bp-std data needed to enrich the PSBT input via
-/// [`enrich_maker_input`].
+/// [`enrich_psbt_input`].
 struct MakerBtcInput {
     outpoint: BpOutpoint,
     value: Sats,
@@ -658,7 +669,7 @@ pub(crate) fn assemble_sell_psbt(
         input.sighash_type = Some(SighashType::all());
     }
     for (i, mi) in inputs.maker_btc_inputs.iter().enumerate() {
-        enrich_maker_input(
+        enrich_psbt_input(
             &mut psbt,
             taker_count + i,
             &inputs.descriptor,
