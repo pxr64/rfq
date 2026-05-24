@@ -119,7 +119,7 @@ async fn validate_incoming_consignment_accepts_a_real_consignment() {
 
     let backend = stack.maker_backend().await;
     let info = backend
-        .validate_incoming_consignment(&consignment_b64, stack.maker_invoice())
+        .validate_incoming_consignment(&consignment_b64, stack.contract_id())
         .await
         .expect("validate_incoming_consignment should accept the bootstrap transfer");
 
@@ -130,7 +130,7 @@ async fn validate_incoming_consignment_accepts_a_real_consignment() {
     );
     assert!(
         !info.outpoints.is_empty(),
-        "expected at least one outpoint extracted from the validated transfer",
+        "expected at least one input outpoint extracted from the validated transfer",
     );
 }
 
@@ -479,31 +479,14 @@ async fn sell_round_trip_two_backends_broadcasts() {
         // drop MakerGuard → release lock for the taker
     };
 
-    // --- Taker snapshot + change invoice + consignment --------------------
-    // Snapshot the taker's RGB inventory BEFORE `rgb transfer` consigns it
-    // away — we need the *input* outpoints (where RGB lives now), not the
-    // consignment's output seals (the maker's blinded seal + a witness-vout
-    // change seal that isn't on-chain yet). The taker's 500 RGB is more
-    // than the maker's 200 invoice, so we also mint a change invoice for
-    // the 300 surplus before consigning.
-    let (taker_rgb_inputs, taker_rgb_total, taker_change_invoice, consignment_b64) = {
+    // --- Taker mints a change invoice + builds the consignment ----------
+    // The taker's 500 RGB exceeds the maker's 200 invoice, so a change
+    // invoice is needed for the 300 surplus. Its `amount` field is
+    // irrelevant — swap.rs only reads the beneficiary seal off it.
+    let (taker_change_invoice, consignment_b64) = {
         let taker = stack.taker_backend().await;
-        let taker_utxos = taker
-            .inventory(&asset)
-            .await
-            .expect("taker inventory before consignment");
-        assert!(
-            !taker_utxos.is_empty(),
-            "taker should have RGB from the bootstrap issuer→taker transfer"
-        );
-        let inputs: Vec<Outpoint> = taker_utxos.iter().map(|u| u.outpoint.clone()).collect();
-        let total: u64 = taker_utxos.iter().map(|u| u.amount).sum();
-
-        // The change-invoice's amount field is irrelevant — swap.rs only
-        // reads the beneficiary seal off it. Use the surplus for clarity.
-        let surplus = total - 200;
         let change_invoice = taker
-            .create_invoice(&asset, surplus)
+            .create_invoice(&asset, 300)
             .await
             .expect("taker create_invoice (change)");
 
@@ -512,40 +495,35 @@ async fn sell_round_trip_two_backends_broadcasts() {
             .taker_consignment_for(&maker_invoice)
             .expect("taker_consignment_for");
         (
-            inputs,
-            total,
             change_invoice,
             base64::engine::general_purpose::STANDARD.encode(bytes),
         )
     };
 
-    // --- Maker validates (state side-effect) ------------------------------
-    {
+    // --- Maker validates: returns the taker's *input* outpoints directly,
+    // and absorbs the taker's transition into the maker's stash so
+    // `contract_assignments_for(taker_inputs)` in `create_swap_psbt_sell`
+    // sees the allocations.
+    let consignment_info = {
         let maker = stack.maker_backend().await;
-        let _info = maker
-            .validate_incoming_consignment(&consignment_b64, &maker_invoice)
+        maker
+            .validate_incoming_consignment(&consignment_b64, maker_parts.contract_id)
             .await
-            .expect("validate_incoming_consignment");
-        // `_info.outpoints` are the consignment's *output* seals (M +
-        // witness-vout change) — not what create_swap_psbt_sell needs.
-        // The validate call is still required for its side effect:
-        // `accept_transfer` absorbs the taker's transition into the
-        // maker's stash so `contract_assignments_for(taker_inputs)` will
-        // see them in step 6.
+            .expect("validate_incoming_consignment")
     };
+    assert!(
+        !consignment_info.outpoints.is_empty(),
+        "validate should surface the taker's RGB input outpoints"
+    );
 
-    // --- Resolve taker_rgb_prevouts from the input snapshot ---------------
+    // --- Resolve taker_rgb_prevouts from the validated input outpoints ----
     let taker_rgb_prevouts = {
         let taker = stack.taker_backend().await;
-        let mut prevouts = Vec::with_capacity(taker_rgb_inputs.len());
-        for op in &taker_rgb_inputs {
+        let mut prevouts = Vec::with_capacity(consignment_info.outpoints.len());
+        for op in &consignment_info.outpoints {
             prevouts.push(taker.lookup_prevout(op).expect("lookup_prevout"));
         }
         prevouts
-    };
-    let consignment_info = ConsignmentInfo {
-        total_amount: taker_rgb_total,
-        outpoints: taker_rgb_inputs,
     };
 
     let (partial_psbt, expected_wt) = {

@@ -4,14 +4,14 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, SwapTransfer};
 
-use bpstd::{Network, Sats, XprivAccount, XpubDerivable};
+use bpstd::{Network, Sats, Txid, XprivAccount, XpubDerivable};
 use bpwallet::fs::FsTextStore;
 use bpwallet::hot::SecureIo;
 use bpwallet::Wallet;
 use psrgbt::PsbtConstructor;
 use amplify::Wrapper as _;
 use base64::Engine as _;
-use rgb::containers::{ConsignmentExt, FileContent, Transfer};
+use rgb::containers::{ConsignmentExt, FileContent, Transfer, ValidConsignment};
 use rgb::contract::FilterIncludeAll;
 use rgb::invoice::{Beneficiary, InvoiceState, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgb::persistence::fs::FsBinStore;
@@ -19,8 +19,8 @@ use rgb::persistence::{StashReadProvider, Stock};
 use rgb::resolvers::AnyResolver;
 use rgb::validation::{ResolveWitness, ValidationConfig, Validity};
 use rgb::{
-    ChainNet, ContractId, GraphSeal, RgbDescr, RgbKeychain, RgbWallet, SecretSeal, StateType,
-    TxoSeal,
+    AssignmentsRef, BundleId, ChainNet, ContractId, Genesis, GraphSeal, Operation, OpId, RgbDescr,
+    RgbKeychain, RgbWallet, SecretSeal, StateType, Transition, TxoSeal,
 };
 
 use crate::swap;
@@ -146,6 +146,106 @@ fn chain_net_for(network: Network) -> ChainNet {
         Network::Testnet3 => ChainNet::BitcoinTestnet3,
         Network::Testnet4 => ChainNet::BitcoinTestnet4,
     }
+}
+
+/// Either a genesis or a transition operation, paired with its anchoring
+/// witness txid where applicable. Used as a lookup target when resolving
+/// an [`Opout`](rgb::Opout) back to the bitcoin outpoint that carries the
+/// referenced RGB allocation.
+enum OpRef<'a> {
+    /// Genesis seals are explicit (`outpoint_or` returns the seal's own
+    /// outpoint regardless of the txid passed); the dummy txid is only here
+    /// to keep the call site uniform with the transition arm.
+    Genesis(&'a Genesis),
+    /// A state transition + its bundle's witness txid. Witness-vout seals
+    /// resolve against this txid via `seal.outpoint_or(txid)`.
+    Transition(&'a Transition, Txid),
+}
+
+/// Walk a validated transfer's terminal transitions, resolve each input
+/// [`Opout`](rgb::Opout) back to the bitcoin outpoint carrying the spent
+/// RGB allocation, and sum the consumed amounts. Returns
+/// `(total_amount, input_outpoints)` for [`ConsignmentInfo`].
+///
+/// "Terminal" here means transitions belonging to a bundle listed in
+/// `validated.terminals` (the bundles whose outputs include the recipient's
+/// seal — the "leaves" of the consignment graph). The non-terminal history
+/// (earlier transitions back to genesis) is still present in the
+/// consignment for validation purposes but its inputs are irrelevant to
+/// the swap PSBT: the swap only spends from outpoints carrying RGB *now*.
+fn extract_input_outpoints(
+    validated: &ValidConsignment<true>,
+) -> Result<(u64, Vec<Outpoint>), RgbError> {
+    use std::collections::{BTreeSet, HashMap};
+
+    // Index every operation in the consignment by OpId so we can hop from
+    // an Opout's `op` field back to the assignments it references.
+    let mut op_lookup: HashMap<OpId, OpRef<'_>> = HashMap::new();
+    op_lookup.insert(validated.genesis.id(), OpRef::Genesis(&validated.genesis));
+    for wb in validated.bundled_witnesses() {
+        let witness_txid = wb.pub_witness.txid();
+        for known in &wb.bundle.known_transitions {
+            op_lookup.insert(
+                known.transition.id(),
+                OpRef::Transition(&known.transition, witness_txid),
+            );
+        }
+    }
+
+    let terminal_bundle_ids: BTreeSet<BundleId> =
+        validated.terminals.keys().copied().collect();
+
+    let mut input_outpoints = Vec::new();
+    let mut total_amount: u64 = 0;
+    for wb in validated.bundled_witnesses() {
+        if !terminal_bundle_ids.contains(&wb.bundle.bundle_id()) {
+            continue;
+        }
+        for known in &wb.bundle.known_transitions {
+            for opout in known.transition.inputs.iter() {
+                let prior_op = op_lookup.get(&opout.op).ok_or_else(|| {
+                    RgbError::TransferBuild(format!(
+                        "consignment opout references unknown op {}",
+                        opout.op
+                    ))
+                })?;
+                let (assignments_ref, witness_txid) = match prior_op {
+                    OpRef::Genesis(g) => (
+                        AssignmentsRef::from(&g.assignments),
+                        Txid::coinbase(),
+                    ),
+                    OpRef::Transition(tx, witness_txid) => {
+                        (AssignmentsRef::from(&tx.assignments), *witness_txid)
+                    }
+                };
+                let ta = assignments_ref.get(opout.ty).ok_or_else(|| {
+                    RgbError::TransferBuild(format!(
+                        "opout {} references missing assignment type",
+                        opout
+                    ))
+                })?;
+                let seal = ta.revealed_seal_at(opout.no).map_err(|_| {
+                    RgbError::TransferBuild(format!(
+                        "opout {} index out of bounds for prior assignment",
+                        opout
+                    ))
+                })?;
+                if let Some(seal) = seal {
+                    let op = seal.outpoint_or(witness_txid);
+                    input_outpoints.push(Outpoint {
+                        txid: op.txid.to_string(),
+                        vout: op.vout.into_u32(),
+                    });
+                    if let Ok(state) = ta.as_fungible_state_at(opout.no) {
+                        total_amount =
+                            total_amount.saturating_add(state.as_inner().as_u64());
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((total_amount, input_outpoints))
 }
 
 #[async_trait]
@@ -379,7 +479,7 @@ impl RgbBackend for LibRgbBackend {
     async fn validate_incoming_consignment(
         &self,
         consignment_base64: &str,
-        expected_invoice: &str,
+        expected_contract_id: ContractId,
     ) -> Result<ConsignmentInfo, RgbError> {
         // Mirrors rgb-cmd's `Validate`/`Accept` path: decode → validate the
         // state transition against the resolver + the maker's typesystem →
@@ -391,23 +491,15 @@ impl RgbBackend for LibRgbBackend {
             .map_err(|e| {
                 RgbError::TransferBuild(format!("consignment is not valid base64: {e}"))
             })?;
-      
+
         let consignment = Transfer::load(bytes.as_slice())
             .map_err(|e| RgbError::TransferBuild(format!("consignment decode: {e}")))?;
 
-        // Cross-check the consignment is for the contract the invoice names.
-        let invoice = RgbInvoice::from_str(expected_invoice)
-            .map_err(|_| RgbError::InvalidInvoice)?;
-      
-        let invoice_contract = invoice.contract.ok_or_else(|| {
-            RgbError::TransferBuild("expected_invoice carries no contract id".to_owned())
-        })?;
-       
-        if consignment.contract_id() != invoice_contract {
+        if consignment.contract_id() != expected_contract_id {
             return Err(RgbError::TransferBuild(format!(
-                "consignment contract {} does not match invoice contract {}",
+                "consignment contract {} does not match expected {}",
                 consignment.contract_id(),
-                invoice_contract
+                expected_contract_id
             )));
         }
 
@@ -421,7 +513,7 @@ impl RgbBackend for LibRgbBackend {
 
         let mut resolver = self.resolver()?;
         resolver.add_consignment_txes(&consignment);
-       
+
         let validation_config = ValidationConfig {
             chain_net: chain_net_for(self.parse_network()?),
             trusted_typesystem: stock
@@ -431,11 +523,11 @@ impl RgbBackend for LibRgbBackend {
                 .clone(),
             ..Default::default()
         };
-       
+
         let validated = consignment
             .validate(&resolver, &validation_config)
             .map_err(|e| RgbError::TransferBuild(format!("consignment validation: {e:?}")))?;
-       
+
         if validated.validation_status().validity() != Validity::Valid {
             return Err(RgbError::TransferBuild(format!(
                 "consignment invalid: {}",
@@ -443,38 +535,14 @@ impl RgbBackend for LibRgbBackend {
             )));
         }
 
-        // Introspect the validated consignment for owned-state allocations:
-        // each terminal transition's fungible assignment carries a seal
-        // (resolvable to a bitcoin outpoint) and an amount. Sum the amounts
-        // and collect the outpoints; the swap-PSBT methods consume both.
-        let mut outpoints = Vec::new();
-        let mut total_amount: u64 = 0;
-        // `ConsignmentApi::bundles_info` would be cleaner but isn't publicly
-        // re-exported by rgb-api; the public `ConsignmentExt::bundled_witnesses`
-        // exposes the same data via the `WitnessBundle` struct (pub fields).
-        for wb in validated.bundled_witnesses() {
-            let witness_txid = wb.pub_witness.txid();
-            for known in &wb.bundle.known_transitions {
-                for (_assignment_type, typed) in known.transition.assignments.iter() {
-                    for assignment in typed.as_fungible() {
-                        // `as_revealed_state` returns `&RevealedValue` (which
-                        // wraps a `FungibleState`); reach the u64 via Wrapper.
-                        let state = assignment.as_revealed_state();
-                        total_amount =
-                            total_amount.saturating_add(state.as_inner().as_u64());
-                        if let Some(seal) = assignment.revealed_seal() {
-                            // Witness-vout seals resolve against the bundle's
-                            // anchoring txid; explicit seals carry their own.
-                            let op = seal.outpoint_or(witness_txid);
-                            outpoints.push(Outpoint {
-                                txid: op.txid.to_string(),
-                                vout: op.vout.into_u32(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        // Walk the terminal transitions' *input* Opouts and resolve each
+        // back to the bitcoin outpoint that currently carries the RGB.
+        // These are the outpoints `create_swap_psbt_sell` will pin as PSBT
+        // inputs. Output assignments (the consignment's destinations —
+        // maker's blinded seal + the taker's witness-vout change seal) are
+        // *not* what we want here: they reference a witness tx that hasn't
+        // broadcast yet, so they're not in any wallet's UTXO set.
+        let (total_amount, outpoints) = extract_input_outpoints(&validated)?;
 
         // Absorb the consignment into the maker's stash so the taker's
         // allocations are visible to `create_swap_psbt_sell` later (it spends

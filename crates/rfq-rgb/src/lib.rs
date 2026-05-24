@@ -22,10 +22,16 @@ pub use rfq_btc::TxOut;
 /// inside every backend impl. Lets downstream crates avoid an `rgb` dep.
 pub use rgb::{ContractId, SecretSeal};
 
-/// What the maker learns from a validated taker consignment on the sell side:
-/// the RGB amount transferred and the bitcoin outpoints carrying it (which
-/// become PSBT inputs). Real RGB validation (#13) will carry the contract id
-/// and per-allocation amounts; the mock keeps only what the swap flow consumes.
+/// What the maker learns from a validated taker consignment on the sell side.
+///
+/// `outpoints` are the **input** outpoints of the consignment's terminal
+/// transition — i.e. the bitcoin outpoints currently carrying the taker's
+/// RGB, which `create_swap_psbt_sell` will pin as PSBT inputs. *Not* the
+/// transition's output destinations (the maker's blinded seal + the taker's
+/// witness-vout change seal) — those are post-transition state on a witness
+/// tx that hasn't broadcast yet, so they're useless to the swap composition.
+///
+/// `total_amount` sums the spendable RGB at those input outpoints.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsignmentInfo {
     pub total_amount: u64,
@@ -137,13 +143,20 @@ pub trait RgbBackend: Send + Sync {
     ) -> Result<MakerInvoiceParts, RgbError>;
 
     /// Maker-side, sell flow: validate a taker-submitted consignment against
-    /// the maker's expected invoice and return the RGB amount + the bitcoin
-    /// outpoints carrying it. `Err(TransferBuild)` when the consignment is
-    /// malformed or doesn't match `expected_invoice`.
+    /// the maker's expected contract and return the RGB input outpoints +
+    /// total amount (see [`ConsignmentInfo`]). `Err(TransferBuild)` when the
+    /// consignment is malformed or doesn't match `expected_contract_id`.
+    ///
+    /// Takes a typed [`ContractId`] rather than the maker's invoice string
+    /// — the maker minted the invoice itself in `create_invoice` and only
+    /// needs the contract id here for cross-checking; rfq-maker already
+    /// parses the invoice once at /sign time (via `parse_maker_invoice`)
+    /// so reusing the typed `contract_id` from `MakerInvoiceParts` avoids
+    /// a self-round-trip inside the backend.
     async fn validate_incoming_consignment(
         &self,
         consignment_base64: &str,
-        expected_invoice: &str,
+        expected_contract_id: ContractId,
     ) -> Result<ConsignmentInfo, RgbError>;
 
     /// Sell-side swap PSBT construction. Inputs: the taker's RGB-bearing
@@ -308,10 +321,10 @@ impl RgbBackend for MockRgbBackend {
     async fn validate_incoming_consignment(
         &self,
         consignment_base64: &str,
-        expected_invoice: &str,
+        expected_contract_id: ContractId,
     ) -> Result<ConsignmentInfo, RgbError> {
-        // Real Stock validation lands in #13. The mock parses a deterministic
-        // pipe-delimited blob the taker builds:
+        // Real Stock validation lands in `LibRgbBackend`. The mock parses a
+        // deterministic pipe-delimited blob the taker builds:
         //   mock-consignment|sell|invoice=<inv>|amount=<n>|outpoints=<csv>
         // and rejects the sentinel `rgb-invalid` so tests can drive the
         // consignment-rejected path.
@@ -348,7 +361,14 @@ impl RgbBackend for MockRgbBackend {
 
         let invoice =
             invoice.ok_or_else(|| RgbError::TransferBuild("missing invoice field".to_owned()))?;
-        if invoice != expected_invoice {
+        // Re-derive the embedded invoice's contract_id with the same
+        // mock_bytes32 pattern parse_maker_invoice uses, and compare to
+        // the typed expected_contract_id. Keeps the mock consignment
+        // format unchanged across the test sites that still embed
+        // `invoice=<inv>`, while the trait now takes a typed contract id.
+        let derived_contract_id =
+            ContractId::from(mock_bytes32(&format!("{invoice}|contract")));
+        if derived_contract_id != expected_contract_id {
             return Err(RgbError::TransferBuild(
                 "consignment invoice does not match the maker's quote".to_owned(),
             ));

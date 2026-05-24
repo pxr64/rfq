@@ -505,10 +505,16 @@ impl Maker {
             .await
             .map_err(|e| RouterError::Maker(format!("maker invoice parse: {e}")))?;
 
-        // Validate the consignment against the invoice the maker quoted.
+        // Validate the consignment against the contract the maker quoted.
+        // Uses the typed `contract_id` from `parse_maker_invoice` above to
+        // avoid the self-round-trip of re-parsing the maker's own invoice
+        // string inside the backend.
         let info = match self
             .rgb_backend
-            .validate_incoming_consignment(&consignment_base64, &maker_rgb_invoice)
+            .validate_incoming_consignment(
+                &consignment_base64,
+                maker_invoice_parts.contract_id,
+            )
             .await
         {
             Ok(info) => info,
