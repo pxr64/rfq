@@ -125,8 +125,9 @@ pub trait InventoryStore: Send + Sync {
     ) -> Result<usize, InventoryError>;
 
     /// Mark every UTXO in `reservation_id` as `Spent`. Accepts UTXOs currently
-    /// in `Reserved` or `PendingRgbAcceptance` (the settlement state machine
-    /// will drive the latter; today's Maker uses the former directly).
+    /// in `Reserved`, `PendingBitcoinConfirm`, or `PendingRgbAcceptance` —
+    /// the chain-observer loop sweeps `PendingBitcoinConfirm → Spent`
+    /// directly once the witness tx confirms, mirroring `BtcInventoryStore`.
     /// Idempotent: a repeat call with the same `reservation_id` succeeds
     /// (no-op) if the UTXOs are already `Spent` under the same witness_txid.
     async fn mark_spent(
@@ -436,6 +437,16 @@ impl InventoryStore for InMemoryInventoryStore {
                     quote_id,
                     ..
                 } if rid == reservation_id => (true, Some(quote_id.clone())),
+                InventoryStatus::PendingBitcoinConfirm {
+                    reservation_id: rid,
+                    ..
+                } if rid == reservation_id => {
+                    // Chain-observer sweeps PendingBitcoinConfirm → Spent
+                    // directly once the witness tx confirms. Quote id isn't
+                    // retained past Reserved; synthesize a placeholder
+                    // (same as the PendingRgbAcceptance branch below).
+                    (true, None)
+                }
                 InventoryStatus::PendingRgbAcceptance {
                     reservation_id: rid,
                     ..
@@ -1025,6 +1036,35 @@ mod tests {
         assert!(matches!(
             store.get(&outpoint(0)).await.unwrap().status,
             InventoryStatus::PendingRgbAcceptance { ref witness_txid, .. } if witness_txid == "wt-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mark_spent_accepts_pending_bitcoin_confirm_input() {
+        let store = seeded_store(vec![utxo(asset(), 0, 100)]).await;
+        let rid = store
+            .reserve_utxos(
+                &RfqId("rfq-1".into()),
+                &QuoteId("q-1".into()),
+                &[outpoint(0)],
+                NOW_MS + 30_000,
+                NOW_MS,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_pending_bitcoin_confirm(&rid, "wt-1".into(), NOW_MS + 100)
+            .await
+            .unwrap();
+
+        let count = store
+            .mark_spent(&rid, "wt-1".into(), NOW_MS + 200)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(matches!(
+            store.get(&outpoint(0)).await.unwrap().status,
+            InventoryStatus::Spent { ref witness_txid, .. } if witness_txid == "wt-1"
         ));
     }
 

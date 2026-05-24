@@ -287,10 +287,16 @@ impl Maker {
         added
     }
 
-    /// For every reservation currently in `PendingBitcoinConfirm`, probe
-    /// the chain via `BitcoinClient::get_outpoint` to see if the witness
-    /// tx is on-chain; if so, transition the reservation to `Spent`.
-    /// Returns the count of UTXOs that moved. Issue #27.
+    /// For every reservation currently in `PendingBitcoinConfirm` — in
+    /// either the BTC store or the RGB store — probe the chain via
+    /// `BitcoinClient::get_outpoint` to see if the witness tx is on-chain;
+    /// if so, transition the reservation to `Spent`. Returns the count of
+    /// UTXOs that moved. Issue #27 (BTC side) + RGB-side follow-up.
+    ///
+    /// Both sides are swept in the same pass because a swap commits both
+    /// the maker's RGB inputs and (for sells) the BTC payout under the
+    /// same witness tx; probing once per distinct witness_txid avoids
+    /// duplicate electrum round-trips.
     ///
     /// Confirmation probe: we ask for `(witness_txid, 0)`. Swap txes put
     /// the opret commitment at vout 0, so a confirmed tx replies with
@@ -298,24 +304,62 @@ impl Maker {
     /// (typically "transaction not found"). Any "tx exists in some form"
     /// response counts as confirmed; everything else is "not yet."
     pub async fn sweep_confirmations(&self) -> usize {
-        use std::collections::HashMap;
-        let mut pending: HashMap<ReservationId, String> = HashMap::new();
+        use std::collections::{HashMap, HashSet};
+
+        let mut btc_pending: HashMap<ReservationId, String> = HashMap::new();
         for u in self.btc_store.list_all().await {
             if let BtcInventoryStatus::PendingBitcoinConfirm {
                 reservation_id,
                 witness_txid,
             } = u.status
             {
-                pending.insert(reservation_id, witness_txid);
+                btc_pending.insert(reservation_id, witness_txid);
             }
         }
+
+        let mut rgb_pending: HashMap<ReservationId, String> = HashMap::new();
+        for u in self.store.list_all().await {
+            if let InventoryStatus::PendingBitcoinConfirm {
+                reservation_id,
+                witness_txid,
+            } = u.status
+            {
+                rgb_pending.insert(reservation_id, witness_txid);
+            }
+        }
+
+        let mut confirmed: HashMap<String, bool> = HashMap::new();
+        let txids: HashSet<&str> = btc_pending
+            .values()
+            .chain(rgb_pending.values())
+            .map(String::as_str)
+            .collect();
+        for txid in txids {
+            confirmed.insert(
+                txid.to_owned(),
+                tx_confirmed(&*self.bitcoin_client, txid).await,
+            );
+        }
+
         let mut spent = 0;
-        for (reservation_id, witness_txid) in pending {
-            if !tx_confirmed(&*self.bitcoin_client, &witness_txid).await {
+        for (reservation_id, witness_txid) in btc_pending {
+            if !confirmed.get(&witness_txid).copied().unwrap_or(false) {
                 continue;
             }
             if let Ok(n) = self
                 .btc_store
+                .mark_spent(&reservation_id, witness_txid, now_ms())
+                .await
+            {
+                spent += n;
+            }
+        }
+        for (reservation_id, witness_txid) in rgb_pending {
+            if !confirmed.get(&witness_txid).copied().unwrap_or(false) {
+                continue;
+            }
+            if let Ok(n) = self
+                .store
                 .mark_spent(&reservation_id, witness_txid, now_ms())
                 .await
             {
@@ -1113,7 +1157,7 @@ impl MakerConnector for Maker {
         }
 
         let reservation_id = pending.reservation_id.clone();
-        let quote = &pending.quote;
+        let _quote = &pending.quote;
 
         // No fee-slippage guard here: under declared-funding the buy PSBT is
         // fully committed at accept time (every input is known then), so the
@@ -2330,6 +2374,65 @@ mod tests {
         assert_eq!(snapshot.available_amount, 100);
         assert_eq!(snapshot.reserved_amount, 0);
         assert_eq!(snapshot.spent_amount, 0);
+    }
+
+    #[tokio::test]
+    async fn sweep_confirmations_marks_pending_rgb_and_btc_spent() {
+        let reservation_id = ReservationId("res-rgb-1".to_owned());
+        let wt = "wt-shared-1".to_owned();
+
+        let rgb_pending = inv_utxo(
+            0,
+            100,
+            InventoryStatus::PendingBitcoinConfirm {
+                reservation_id: reservation_id.clone(),
+                witness_txid: wt.clone(),
+            },
+        );
+        let maker = maker_with_store(vec![rgb_pending]);
+
+        let btc_reservation_id = ReservationId("res-btc-1".to_owned());
+        let btc_pending = BtcInventoryUtxo {
+            outpoint: Outpoint::new(format!("{:064x}", 0xb7c1u64), 0),
+            value_sats: 50_000,
+            script_pubkey: sell_p2wpkh(),
+            status: BtcInventoryStatus::PendingBitcoinConfirm {
+                reservation_id: btc_reservation_id.clone(),
+                witness_txid: wt.clone(),
+            },
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            pending_txid: None,
+        };
+        let maker = maker.with_btc_inventory(vec![btc_pending]);
+
+        let spent = maker.sweep_confirmations().await;
+        assert_eq!(spent, 2, "one UTXO from each store should sweep");
+
+        let rgb_status = maker
+            .utxo_snapshot()
+            .await
+            .into_iter()
+            .next()
+            .unwrap()
+            .status;
+        assert!(matches!(
+            rgb_status,
+            InventoryStatus::Spent { ref witness_txid, .. } if witness_txid == &wt
+        ));
+
+        let btc_status = maker
+            .btc_store
+            .list_all()
+            .await
+            .into_iter()
+            .next()
+            .unwrap()
+            .status;
+        assert!(matches!(
+            btc_status,
+            BtcInventoryStatus::Spent { ref witness_txid, .. } if witness_txid == &wt
+        ));
     }
 
     #[tokio::test]
