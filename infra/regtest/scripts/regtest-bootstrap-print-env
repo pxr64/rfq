@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Print the env block a developer needs after `make regtest-bootstrap`
-# completes, so they can immediately run:
-#   cargo test -p rfq-rgb -- --ignored
+# Print follow-up instructions after `make regtest-bootstrap` completes:
+#   1. TOML stanza for `~/.config/colorex/maker.toml` (the `colorex maker` daemon)
+#   2. ELECTRUM_URL export for `cargo test -p rfq-rgb -- --ignored`
 set -euo pipefail
 
 source "$(dirname "$0")/common.sh"
@@ -11,29 +11,38 @@ if [[ -f "$ARTIFACTS_DIR/contract-id" ]]; then
   contract_id="$(cat "$ARTIFACTS_DIR/contract-id")"
 fi
 
-cat <<EOF
-
-══════════════════════════════════════════════════════════════════════
-  Regtest stack is bootstrapped. Paste this into your shell:
-
-  export RGB_DATA_DIR="$DATA_DIR/maker"
-  export RGB_WALLET="maker"
-  export RGB_NETWORK="regtest"
-  export ELECTRUM_URL="$ELECTRUM_URL"
-  export RGB_SIGNER_ACCOUNT_FILE="$WALLETS_DIR/maker.account"
-  export RGB_SIGNER_PASSWORD=""
-EOF
-
+contract_line="# contract_id not set — run \`make rgb-issue-asset\` to create one"
 if [[ -n "$contract_id" ]]; then
-  echo "  export RGB_CONTRACT_ID=\"$contract_id\""
-else
-  echo "  # RGB_CONTRACT_ID not set — run \`make rgb-issue-asset\` to create one"
+  contract_line="contract_id  = \"$contract_id\""
 fi
 
 cat <<EOF
 
-  Then verify LibRgbBackend against the live stack:
+══════════════════════════════════════════════════════════════════════
+  Regtest stack is bootstrapped.
 
+  1. Drop this TOML into ~/.config/colorex/maker.toml (or pass it via
+     \`colorex maker up --config /path/to/maker.toml\`):
+
+  [maker]
+  node_id     = "regtest-maker"
+  listen_addr = "127.0.0.1:4000"
+  broker_url  = "http://127.0.0.1:3000"
+
+  [rgb]
+  network      = "regtest"
+  data_dir     = "$DATA_DIR/maker"
+  wallet_name  = "maker"
+  electrum_url = "$ELECTRUM_URL"
+  $contract_line
+
+  [rgb.signer]
+  account_file = "$WALLETS_DIR/maker.account"
+  password     = ""
+
+  2. To verify LibRgbBackend against the live stack:
+
+  export ELECTRUM_URL="$ELECTRUM_URL"
   cargo test -p rfq-rgb -- --ignored
 
 ══════════════════════════════════════════════════════════════════════

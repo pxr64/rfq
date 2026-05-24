@@ -562,9 +562,9 @@ sign. Signing needs an `XprivAccount` loaded separately via the
 `bpwallet::hot::SecureIo::read(path, password)` trait method (bp-wallet
 hot/seed.rs:117). Plumbing for B1:
 
-- `RgbConfig` gains `signer_account_file: PathBuf` (env
-  `RGB_SIGNER_ACCOUNT_FILE`) + `signer_password: String` (env
-  `RGB_SIGNER_PASSWORD`, default `""` for regtest).
+- `RgbConfig.signer` gains `account_file: PathBuf` + `password: String`
+  (TOML `[rgb.signer].account_file` + `[rgb.signer].password`, default `""`
+  for regtest).
 - `LibRgbBackend::load_signer() -> Result<XprivAccount, RgbError>`
   parallel to `load_wallet()`; calls `XprivAccount::read(...)`.
 
@@ -609,7 +609,7 @@ let sig_count = psbt.sign(&signer)
     .map_err(|e| RgbError::SignFailed(e.to_string()))?;
 if sig_count == 0 {
     // Maker's signer should hold at least one input key.
-    // Zero means RGB_SIGNER_ACCOUNT_FILE points at the wrong account.
+    // Zero means [rgb.signer].account_file points at the wrong account.
     return Err(RgbError::SignerHoldsNoKeysForInputs);
 }
 ```
@@ -751,8 +751,8 @@ When we pick this up:
     methods use the same pattern.
   - Private `FasciaResolver` helper in `lib_backend.rs` (resolves U5 —
     see that section for the recipe).
-  - `LibRgbBackend::load_signer()` reading `RGB_SIGNER_ACCOUNT_FILE` +
-    `RGB_SIGNER_PASSWORD`; add both env vars to `RgbConfig` (resolves U6).
+  - `LibRgbBackend::load_signer()` reading `[rgb.signer].account_file` +
+    `[rgb.signer].password`; both live in `maker.toml` (resolves U6).
   - Add `BitcoinClient::list_unspent(addr)` to the `rfq-btc` trait, with
     `ElectrumClient` impl (electrum protocol `blockchain.scripthash.listunspent`
     + `get_outpoint` to surface the prevout shape) and `MockBitcoinClient`

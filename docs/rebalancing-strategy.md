@@ -78,7 +78,7 @@ Three reasons.
 
 ## The low-traffic caveat
 
-(C) drifts if RFQ traffic dries up while fragmentation keeps climbing. Fallback design: after a configurable idle window (`REBALANCE_IDLE_FALLBACK_MS`, default e.g. 24 hours), if `fragmentation_score >= threshold` **and** no settlement has piggybacked the queued plan in that window, fire a standalone self-transfer — i.e., fall back to (A).
+(C) drifts if RFQ traffic dries up while fragmentation keeps climbing. Fallback design: after a configurable idle window (`intervals.rebalance_idle_fallback` in `maker.toml`, default e.g. 24 hours), if `fragmentation_score >= threshold` **and** no settlement has piggybacked the queued plan in that window, fire a standalone self-transfer — i.e., fall back to (A).
 
 This fallback is **spec'd here but not implemented in 14e.** The trigger metrics exist; the idle-time tracking does not. Both land in the follow-up executor issue.
 
@@ -89,7 +89,7 @@ This fallback is **spec'd here but not implemented in 14e.** The trigger metrics
 - `RebalancePolicy` configuration struct in [crates/maker-node/src/main.rs](../crates/maker-node/src/main.rs).
 - `RebalancePlan` data type representing proposed merges / splits.
 - `Maker::rebalance(policy) -> RebalancePlan` — pure planner, no broadcast.
-- `spawn_rebalance_loop` running on `REBALANCE_INTERVAL_MS` (default 60s) that calls `rebalance()` and logs the plan when triggers fire.
+- `spawn_rebalance_loop` running on `intervals.rebalance` (default `"60s"` in `maker.toml`) that calls `rebalance()` and logs the plan when triggers fire.
 
 **Deferred to follow-up issue (rebalance execution via settlement-tx piggybacking):**
 - The actual splice that bakes `RebalancePlan` outputs into the next outgoing settlement PSBT.

@@ -1,9 +1,13 @@
-//! Library entry points for the `maker-node` binary. Exposes the config
+//! Library entry points for the `colorex` binary. Exposes the config
 //! types, runtime builder, axum `Router`, and background-loop spawners so
 //! the binary (`src/main.rs`) and integration tests
 //! (`tests/regtest_http_round_trip.rs`) can share them.
 
-use std::{env, path::PathBuf, sync::Arc, time::Duration};
+pub mod init;
+pub mod node_key;
+pub mod output;
+
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Path, State},
@@ -13,7 +17,6 @@ use axum::{
     Json, Router,
 };
 use rfq_btc::{BitcoinClient, ElectrumClient, MockBitcoinClient};
-use rfq_client::Url;
 use rfq_maker::{Maker, RebalancePolicy};
 use rfq_rgb::{LibRgbBackend, MockRgbBackend, RgbBackend};
 use rfq_router::MakerConnector;
@@ -23,32 +26,110 @@ use rfq_types::{
     HealthResponse, InventorySnapshot, MakerId, Outpoint, Quote, QuoteId, QuoteRequest,
     RgbInventoryUtxo, SettlementIntent,
 };
+use serde::{Deserialize, Serialize};
 use tokio::{task::JoinHandle, time};
 
-#[derive(Debug, Clone, PartialEq)]
+/// Top-level config for the `colorex maker` daemon. Loaded from a TOML file
+/// at `~/.config/colorex/maker.toml` (XDG-style). Every section has serde
+/// defaults so a minimal file (or even an empty one) still parses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MakerNodeConfig {
-    pub rfq_api_url: String,
-    pub maker_listen_addr: String,
-    pub maker_id: String,
-    pub poll_interval_ms: u64,
-    pub cleanup_interval_ms: u64,
-    pub rebalance_interval_ms: u64,
+    #[serde(default)]
+    pub maker: MakerSection,
+    #[serde(default)]
+    pub intervals: IntervalsConfig,
+    #[serde(default)]
+    pub rebalance: RebalancePolicyConfig,
+    /// Optional. Absence → mock RGB backend (no on-chain settlement).
+    #[serde(default)]
+    pub rgb: Option<RgbConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MakerSection {
+    #[serde(default = "default_node_id")]
+    pub node_id: String,
+    #[serde(default = "default_listen_addr")]
+    pub listen_addr: String,
+    #[serde(default = "default_broker_url")]
+    pub broker_url: String,
+}
+
+impl Default for MakerSection {
+    fn default() -> Self {
+        Self {
+            node_id: default_node_id(),
+            listen_addr: default_listen_addr(),
+            broker_url: default_broker_url(),
+        }
+    }
+}
+
+fn default_node_id() -> String {
+    "mock-maker-node".to_owned()
+}
+fn default_listen_addr() -> String {
+    "127.0.0.1:4000".to_owned()
+}
+fn default_broker_url() -> String {
+    "http://127.0.0.1:3000".to_owned()
+}
+
+/// Background-loop tick rates. Durations parsed via `humantime_serde`
+/// (e.g. `"1s"`, `"60s"`, `"500ms"`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntervalsConfig {
+    #[serde(with = "humantime_serde", default = "default_cleanup_interval")]
+    pub cleanup: Duration,
+    #[serde(with = "humantime_serde", default = "default_rebalance_interval")]
+    pub rebalance: Duration,
     /// How often the chain-observer loop refreshes the wallet UTXO cache +
     /// BTC inventory + checks pending-confirm txes. Only fires when the
-    /// real RGB backend is configured (otherwise the mock has nothing to
-    /// observe). Default 5s (issue #27).
-    pub chain_observer_interval_ms: u64,
-    pub rebalance_policy: RebalancePolicyConfig,
-    pub rgb: Option<RgbConfig>,
+    /// real RGB backend is configured (mock has nothing to observe).
+    #[serde(with = "humantime_serde", default = "default_chain_observer_interval")]
+    pub chain_observer: Duration,
+}
+
+impl Default for IntervalsConfig {
+    fn default() -> Self {
+        Self {
+            cleanup: default_cleanup_interval(),
+            rebalance: default_rebalance_interval(),
+            chain_observer: default_chain_observer_interval(),
+        }
+    }
+}
+
+fn default_cleanup_interval() -> Duration {
+    Duration::from_secs(1)
+}
+fn default_rebalance_interval() -> Duration {
+    Duration::from_secs(60)
+}
+fn default_chain_observer_interval() -> Duration {
+    Duration::from_secs(5)
 }
 
 /// Mirror of `RebalancePolicy` with `PartialEq` for the config tests. The
 /// `RebalancePolicy` struct itself contains an `f64` and can't derive `Eq`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RebalancePolicyConfig {
+    #[serde(default = "default_fragmentation_threshold")]
     pub fragmentation_threshold: f64,
+    #[serde(default = "default_max_utxo_count")]
     pub max_utxo_count: u64,
+    #[serde(default = "default_min_utxo_count")]
     pub min_utxo_count: u64,
+}
+
+fn default_fragmentation_threshold() -> f64 {
+    0.7
+}
+fn default_max_utxo_count() -> u64 {
+    50
+}
+fn default_min_utxo_count() -> u64 {
+    3
 }
 
 impl From<&RebalancePolicyConfig> for RebalancePolicy {
@@ -72,88 +153,107 @@ impl Default for RebalancePolicyConfig {
     }
 }
 
-/// Library-backed RGB adapter config. Populated from env when ALL fields resolve;
-/// missing any → maker-node falls back to `MockRgbBackend`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Library-backed RGB adapter config. Presence of `[rgb]` in the TOML
+/// activates the real `LibRgbBackend`; absence keeps the mock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RgbConfig {
+    pub network: String,
     pub data_dir: PathBuf,
     pub wallet_name: String,
-    pub network: String,
     pub electrum_url: String,
     pub contract_id: String,
-    pub signer_account_file: PathBuf,
-    pub signer_password: String,
+    pub signer: SignerConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignerConfig {
+    pub account_file: PathBuf,
+    /// Inline password. Regtest accounts are typically written with an empty
+    /// string; mainnet operators set this. Future enhancement: support
+    /// `account_password_file` indirection so the TOML doesn't carry the
+    /// secret directly.
+    #[serde(default)]
+    pub password: String,
+}
+
+/// Errors surfaced when loading or parsing a `MakerNodeConfig`.
+#[derive(Debug)]
+pub enum ConfigError {
+    Io(std::io::Error),
+    Parse(toml::de::Error),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::Io(e) => write!(f, "read config: {e}"),
+            ConfigError::Parse(e) => write!(f, "parse config: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConfigError::Io(e) => Some(e),
+            ConfigError::Parse(e) => Some(e),
+        }
+    }
+}
+
+impl From<std::io::Error> for ConfigError {
+    fn from(e: std::io::Error) -> Self {
+        ConfigError::Io(e)
+    }
+}
+
+impl From<toml::de::Error> for ConfigError {
+    fn from(e: toml::de::Error) -> Self {
+        ConfigError::Parse(e)
+    }
 }
 
 impl MakerNodeConfig {
-    pub fn from_env() -> Self {
-        Self {
-            rfq_api_url: env::var("RFQ_API_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:3000".to_owned()),
-            maker_listen_addr: env::var("MAKER_LISTEN_ADDR")
-                .unwrap_or_else(|_| "127.0.0.1:4000".to_owned()),
-            maker_id: env::var("MAKER_ID").unwrap_or_else(|_| "mock-maker-node".to_owned()),
-            poll_interval_ms: env::var("POLL_INTERVAL_MS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(1_000),
-            cleanup_interval_ms: env::var("CLEANUP_INTERVAL_MS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(1_000),
-            rebalance_interval_ms: env::var("REBALANCE_INTERVAL_MS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(60_000),
-            chain_observer_interval_ms: env::var("CHAIN_OBSERVER_INTERVAL_MS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(5_000),
-            rebalance_policy: RebalancePolicyConfig {
-                fragmentation_threshold: env::var("REBALANCE_FRAGMENTATION_THRESHOLD")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.7),
-                max_utxo_count: env::var("REBALANCE_MAX_UTXO_COUNT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(50),
-                min_utxo_count: env::var("REBALANCE_MIN_UTXO_COUNT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(3),
-            },
-            rgb: RgbConfig::from_env(),
+    /// Default config path: `$XDG_CONFIG_HOME/colorex/maker.toml`, falling
+    /// back to `~/.config/colorex/maker.toml`. Uses `dirs::config_dir()`
+    /// which honours `XDG_CONFIG_HOME` on Unix; on macOS we deliberately
+    /// override to `~/.config/colorex/` (not the Apple `Application Support`
+    /// path that `directories::ProjectDirs` would pick) for CLI ergonomics.
+    pub fn default_path() -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            // dirs::config_dir() on macOS = ~/Library/Application Support
+            // — wrong for a CLI tool. Use $HOME/.config/colorex/ directly.
+            if let Some(home) = dirs::home_dir() {
+                return home.join(".config/colorex/maker.toml");
+            }
         }
+        let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        base.join("colorex/maker.toml")
     }
 
-    pub fn api_url(&self) -> Result<Url, String> {
-        Url::parse(&self.rfq_api_url).map_err(|error| error.to_string())
+    /// Read + parse a TOML config from disk. Tilde paths inside the RGB
+    /// section are expanded post-parse via `shellexpand::tilde`.
+    pub fn load(path: &std::path::Path) -> Result<Self, ConfigError> {
+        let raw = std::fs::read_to_string(path)?;
+        Self::load_str(&raw)
+    }
+
+    /// Parse a TOML string (test-friendly entry point, used by both the
+    /// `loads_example_config` test and any in-process config injection).
+    pub fn load_str(s: &str) -> Result<Self, ConfigError> {
+        let mut cfg: MakerNodeConfig = toml::from_str(s)?;
+        if let Some(rgb) = cfg.rgb.as_mut() {
+            rgb.data_dir = expand_tilde_path(&rgb.data_dir);
+            rgb.signer.account_file = expand_tilde_path(&rgb.signer.account_file);
+        }
+        Ok(cfg)
     }
 }
 
-impl RgbConfig {
-    pub fn from_env() -> Option<Self> {
-        let data_dir = env::var("RGB_DATA_DIR").ok()?;
-        let contract_id = env::var("RGB_CONTRACT_ID").ok()?;
-        let electrum_url =
-            env::var("ELECTRUM_URL").unwrap_or_else(|_| "localhost:50001".to_owned());
-        let wallet_name = env::var("RGB_WALLET").unwrap_or_else(|_| "maker".to_owned());
-        let network = env::var("RGB_NETWORK").unwrap_or_else(|_| "regtest".to_owned());
-        let signer_account_file = env::var("RGB_SIGNER_ACCOUNT_FILE").ok()?;
-        // Regtest accounts are typically written with an empty password; mainnet
-        // operators set RGB_SIGNER_PASSWORD.
-        let signer_password = env::var("RGB_SIGNER_PASSWORD").unwrap_or_default();
-        Some(Self {
-            data_dir: PathBuf::from(data_dir),
-            wallet_name,
-            network,
-            electrum_url,
-            contract_id,
-            signer_account_file: PathBuf::from(signer_account_file),
-            signer_password,
-        })
-    }
+fn expand_tilde_path(p: &std::path::Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    PathBuf::from(shellexpand::tilde(s.as_ref()).into_owned())
 }
 
 /// Output of [`build_runtime`]. Holds the maker + (when a real RGB backend
@@ -181,7 +281,7 @@ pub async fn build_maker(config: &MakerNodeConfig) -> Result<Maker, Box<dyn std:
 pub async fn build_runtime(
     config: &MakerNodeConfig,
 ) -> Result<MakerNodeRuntime, Box<dyn std::error::Error>> {
-    let maker_id = MakerId(config.maker_id.clone());
+    let maker_id = MakerId(config.maker.node_id.clone());
     let asset = AssetId {
         network: BitcoinNetwork::Regtest,
         kind: AssetKind::Rgb20,
@@ -201,8 +301,8 @@ pub async fn build_runtime(
                 rgb_cfg.wallet_name.clone(),
                 rgb_cfg.network.clone(),
                 rgb_cfg.electrum_url.clone(),
-                rgb_cfg.signer_account_file.clone(),
-                rgb_cfg.signer_password.clone(),
+                rgb_cfg.signer.account_file.clone(),
+                rgb_cfg.signer.password.clone(),
             ));
             let rgb_utxos = backend.list_inventory_utxos(&asset).await?;
             let now_ms = now_ms();
@@ -421,9 +521,9 @@ impl From<rfq_router::RouterError> for MakerNodeHttpError {
     }
 }
 
-pub fn spawn_cleanup_loop(maker: Maker, cleanup_interval_ms: u64) -> JoinHandle<()> {
+pub fn spawn_cleanup_loop(maker: Maker, cleanup_interval: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_millis(cleanup_interval_ms));
+        let mut interval = time::interval(cleanup_interval);
 
         loop {
             interval.tick().await;
@@ -442,11 +542,11 @@ pub fn spawn_cleanup_loop(maker: Maker, cleanup_interval_ms: u64) -> JoinHandle<
 /// docs/rebalancing-strategy.md.
 pub fn spawn_rebalance_loop(
     maker: Maker,
-    rebalance_interval_ms: u64,
+    rebalance_interval: Duration,
     policy: RebalancePolicy,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_millis(rebalance_interval_ms));
+        let mut interval = time::interval(rebalance_interval);
 
         loop {
             interval.tick().await;
@@ -470,16 +570,46 @@ mod tests {
 
     fn test_config() -> MakerNodeConfig {
         MakerNodeConfig {
-            rfq_api_url: "http://127.0.0.1:3000".to_owned(),
-            maker_listen_addr: "127.0.0.1:4000".to_owned(),
-            maker_id: "test-maker".to_owned(),
-            poll_interval_ms: 1_000,
-            cleanup_interval_ms: 1_000,
-            rebalance_interval_ms: 60_000,
-            chain_observer_interval_ms: 5_000,
-            rebalance_policy: RebalancePolicyConfig::default(),
+            maker: MakerSection {
+                node_id: "test-maker".to_owned(),
+                ..MakerSection::default()
+            },
+            intervals: IntervalsConfig::default(),
+            rebalance: RebalancePolicyConfig::default(),
             rgb: None,
         }
+    }
+
+    #[test]
+    fn loads_minimal_config_uses_defaults() {
+        let cfg = MakerNodeConfig::load_str("").expect("empty TOML parses with defaults");
+        assert_eq!(cfg.maker.node_id, "mock-maker-node");
+        assert_eq!(cfg.maker.listen_addr, "127.0.0.1:4000");
+        assert_eq!(cfg.maker.broker_url, "http://127.0.0.1:3000");
+        assert_eq!(cfg.intervals.cleanup, Duration::from_secs(1));
+        assert_eq!(cfg.intervals.rebalance, Duration::from_secs(60));
+        assert_eq!(cfg.intervals.chain_observer, Duration::from_secs(5));
+        assert!(cfg.rgb.is_none());
+    }
+
+    #[test]
+    fn loads_example_config() {
+        let raw = include_str!("../config.toml.example");
+        let cfg = MakerNodeConfig::load_str(raw).expect("example TOML parses");
+        assert_eq!(cfg.maker.node_id, "node·7af2");
+        let rgb = cfg.rgb.expect("example has [rgb] block");
+        assert_eq!(rgb.network, "regtest");
+        assert_eq!(
+            rgb.contract_id,
+            "rgb:HvGfPj8l-7PK6bkl-WgWvEPH-_zV4VSZ-v2EPZ_p-6Wr7PvM---"
+        );
+        // Tilde expansion fires at load time.
+        assert!(
+            !rgb.data_dir.to_string_lossy().starts_with('~'),
+            "data_dir tilde should expand: {}",
+            rgb.data_dir.display()
+        );
+        assert!(!rgb.signer.account_file.to_string_lossy().starts_with('~'));
     }
 
     async fn test_app() -> Router {
@@ -664,12 +794,12 @@ mod tests {
 pub fn spawn_chain_observer_loop(
     maker: Maker,
     deps: ChainObserverDeps,
-    interval_ms: u64,
+    tick_interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_millis(interval_ms));
+        let mut interval = time::interval(tick_interval);
         // Skip the immediate first-tick `interval.tick()` returns so the
-        // observer starts ~`interval_ms` after spawn rather than racing
+        // observer starts ~`tick_interval` after spawn rather than racing
         // the maker's own startup snapshot.
         interval.tick().await;
         loop {

@@ -29,7 +29,7 @@ Minimal Rust workspace for an RGB-ready RFQ architecture. The code is intentiona
 cargo check --workspace
 cargo test --workspace
 cargo run -p rfq-api
-cargo run -p maker-node -- health
+cargo run -p maker-node --bin colorex -- maker health
 ```
 
 ## Regtest RGB Infra

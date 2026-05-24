@@ -42,17 +42,17 @@ Add inventory observability so maker-node and broker health/debug flows can repo
 Make maker-node release expired reservations without waiting for new RFQ traffic.
 
 - Add a maker inventory cleanup method returning released reservation count.
-- Add `CLEANUP_INTERVAL_MS` config to maker-node.
-- Spawn a background cleanup loop in `maker-node run`.
+- Add `intervals.cleanup` config (formerly `CLEANUP_INTERVAL_MS` env var) to maker-node.
+- Spawn a background cleanup loop in `colorex maker up`.
 - Add graceful shutdown with `tokio::signal::ctrl_c`.
 
 ## Issue #4: Maker-Node Runtime Wiring
 
 Turn maker-node from a placeholder CLI into a useful daemon shell.
 
-- Make `maker-node health` validate config, broker reachability, mock wallet, and inventory snapshot.
-- Make `maker-node inventory` print `InventorySnapshot`.
-- Keep `maker-node run` as a daemon shell with cleanup loop and placeholder quote serving until the broker-to-maker protocol exists.
+- Make `colorex maker health` validate config, broker reachability, mock wallet, and inventory snapshot.
+- Make `colorex maker inventory` print `InventorySnapshot`.
+- Keep `colorex maker up` as a daemon shell with cleanup loop and placeholder quote serving until the broker-to-maker protocol exists.
 
 ## Broker-To-Maker Node Protocol
 
@@ -93,8 +93,8 @@ either way.
 
 - `LibRgbBackend` skeleton in `crates/rfq-rgb/src/lib_backend.rs`, with real
   `list_inventory_utxos` (reads the `Stock`) and `validate_invoice`.
-- `RgbConfig` on `MakerNodeConfig` (env-driven: `RGB_NETWORK`, `ELECTRUM_URL`,
-  `RGB_DATA_DIR`, `RGB_WALLET`, `RGB_CONTRACT_ID`); backend selection in
+- `RgbConfig` on `MakerNodeConfig` (TOML-driven `[rgb]` table with `network`,
+  `electrum_url`, `data_dir`, `wallet_name`, `contract_id`); backend selection in
   `maker-node` + `rfq-api` (`Some(cfg)` → `LibRgbBackend`, `None` →
   `MockRgbBackend`).
 - `rgb-*` / `bp-*` deps stay strictly inside `crates/rfq-rgb`; downstream

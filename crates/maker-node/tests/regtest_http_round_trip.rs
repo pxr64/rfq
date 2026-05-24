@@ -8,8 +8,8 @@
 use std::time::Duration;
 
 use maker_node::{
-    build_runtime, maker_app, spawn_chain_observer_loop, MakerNodeConfig, MakerNodeRuntime,
-    RebalancePolicyConfig, RgbConfig,
+    build_runtime, maker_app, spawn_chain_observer_loop, IntervalsConfig, MakerNodeConfig,
+    MakerNodeRuntime, MakerSection, RebalancePolicyConfig, RgbConfig, SignerConfig,
 };
 use rfq_rgb::test_helpers;
 use rfq_types::{
@@ -27,25 +27,30 @@ async fn http_two_consecutive_buys_via_chain_observer() {
     // --- Build a real-RGB-backed maker config pointed at the bootstrapped
     //     maker stash -------------------------------------------------------
     let mut config = MakerNodeConfig {
-        rfq_api_url: "http://127.0.0.1:3000".to_owned(),
-        maker_listen_addr: "127.0.0.1:0".to_owned(), // resolved post-bind
-        maker_id: "regtest-http-test".to_owned(),
-        poll_interval_ms: 1_000,
-        cleanup_interval_ms: 60_000,
-        rebalance_interval_ms: 60_000,
-        // Aggressive observer cadence so the test doesn't have to wait 5s
-        // between swaps. 500ms is fast enough that the wait_for_observer
-        // sleep below catches the post-broadcast tick.
-        chain_observer_interval_ms: 500,
-        rebalance_policy: RebalancePolicyConfig::default(),
+        maker: MakerSection {
+            node_id: "regtest-http-test".to_owned(),
+            listen_addr: "127.0.0.1:0".to_owned(), // resolved post-bind
+            broker_url: "http://127.0.0.1:3000".to_owned(),
+        },
+        intervals: IntervalsConfig {
+            cleanup: Duration::from_secs(60),
+            rebalance: Duration::from_secs(60),
+            // Aggressive observer cadence so the test doesn't have to wait 5s
+            // between swaps. 500ms is fast enough that the wait_for_observer
+            // sleep below catches the post-broadcast tick.
+            chain_observer: Duration::from_millis(500),
+        },
+        rebalance: RebalancePolicyConfig::default(),
         rgb: Some(RgbConfig {
+            network: "regtest".to_owned(),
             data_dir: stack.maker_stash_dir().to_owned(),
             wallet_name: "maker".to_owned(),
-            network: "regtest".to_owned(),
             electrum_url: stack.electrum_url().to_owned(),
             contract_id: stack.contract_id_str().to_owned(),
-            signer_account_file: stack.maker_account_file().to_owned(),
-            signer_password: String::new(),
+            signer: SignerConfig {
+                account_file: stack.maker_account_file().to_owned(),
+                password: String::new(),
+            },
         }),
     };
 
@@ -70,7 +75,7 @@ async fn http_two_consecutive_buys_via_chain_observer() {
     // sync it manually before driving buy #2 (it needs to see its BTC
     // change UTXO from buy #1).
     stack.mine_block().expect("mine block #1");
-    wait_for_observer(config.chain_observer_interval_ms).await;
+    wait_for_observer(config.intervals.chain_observer).await;
     sync_taker(stack).await;
 
     // --- Drive buy #2 — should reuse the RGB change UTXO from buy #1 -----
@@ -82,7 +87,7 @@ async fn http_two_consecutive_buys_via_chain_observer() {
     // pre-buy-#2 change in PendingBitcoinConfirm and the post-buy-#2 change
     // not yet in the store at all.
     stack.mine_block().expect("mine block #2");
-    wait_for_observer(config.chain_observer_interval_ms).await;
+    wait_for_observer(config.intervals.chain_observer).await;
 
     // Confirm via inventory: maker should still have RGB allocation after
     // two consecutive swaps (the change from buy #2).
@@ -125,11 +130,11 @@ async fn spawn_maker_node(
     let chain_observer = chain_observer.expect("RGB config present → chain observer must spawn");
 
     let app = maker_app(maker.clone());
-    let listener = TcpListener::bind(&config.maker_listen_addr)
+    let listener = TcpListener::bind(&config.maker.listen_addr)
         .await
         .expect("bind listener");
     let bound_addr = listener.local_addr().expect("local_addr");
-    config.maker_listen_addr = bound_addr.to_string();
+    config.maker.listen_addr = bound_addr.to_string();
     let base_url = format!("http://{bound_addr}");
 
     tokio::spawn(async move {
@@ -142,7 +147,7 @@ async fn spawn_maker_node(
     let observer_handle = spawn_chain_observer_loop(
         maker.clone(),
         chain_observer,
-        config.chain_observer_interval_ms,
+        config.intervals.chain_observer,
     );
 
     (maker, observer_handle, base_url)
@@ -246,8 +251,8 @@ async fn drive_buy(
 
 /// Sleep long enough for the chain observer to tick at least twice
 /// (covers the initial "skip the immediate tick" + one real tick).
-async fn wait_for_observer(interval_ms: u64) {
-    tokio::time::sleep(Duration::from_millis(interval_ms * 3)).await;
+async fn wait_for_observer(interval: Duration) {
+    tokio::time::sleep(interval * 3).await;
 }
 
 /// Refresh the taker's bp-wallet cache so newly-confirmed UTXOs (just-funded

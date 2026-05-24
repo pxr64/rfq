@@ -4,9 +4,18 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "colorex"
+path = "src/main.rs"
+
 [dependencies]
 axum.workspace = true
 clap.workspace = true
+dialoguer = { version = "0.11", default-features = false, features = ["password"] }
+dirs = "5"
+hex = "0.4"
+humantime-serde = "1"
+rand = "0.8"
 rfq-btc = { path = "../rfq-btc", features = ["electrum"] }
 rfq-client = { path = "../rfq-client" }
 rfq-maker = { path = "../rfq-maker" }
@@ -15,8 +24,11 @@ rfq-router = { path = "../rfq-router" }
 rfq-store = { path = "../rfq-store" }
 rfq-types = { path = "../rfq-types" }
 rfq-wallet = { path = "../rfq-wallet" }
+secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
 serde.workspace = true
+shellexpand = "3"
 tokio.workspace = true
+toml = "0.8"
 
 [dev-dependencies]
 serde_json.workspace = true
