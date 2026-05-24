@@ -22,11 +22,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
-use bpstd::HardenedIndex;
+use bpstd::psbt::Psbt;
+use bpstd::signers::TestnetRefSigner;
+use bpstd::{ConsensusEncode, Derive, HardenedIndex, Sats, Terminal, XprivAccount, XpubDerivable};
+use bpwallet::fs::FsTextStore;
 use bpwallet::hot::{SecureIo, Seed, SeedType};
-use bpwallet::Bip43;
-use rfq_rgb::{ContractId, LibRgbBackend, RgbBackend};
+use bpwallet::{Bip43, Wallet as BpWallet};
+use psrgbt::PsbtConstructor;
+use rfq_rgb::{ContractId, LibRgbBackend, RgbBackend, TxOut};
 use rfq_types::{AssetId, AssetKind, BitcoinNetwork, Outpoint};
+use rgb::RgbDescr;
 use tempfile::TempDir;
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
 
@@ -60,6 +65,10 @@ pub struct RegtestStack {
     contract_id_str: String,
     issuer: RoleHandles,
     maker: RoleHandles,
+    /// Third-party role with its own RGB stash + funded BTC, used as the
+    /// counterparty in the buy/sell round-trip tests. Drives the
+    /// `taker_sign_and_finalize` half of the swap.
+    taker: RoleHandles,
     /// Consignment bytes produced by the bootstrap issuer→maker transfer,
     /// cached for the validate test (and any future test that needs a real
     /// pre-accepted consignment).
@@ -67,10 +76,22 @@ pub struct RegtestStack {
     /// Maker's receive invoice from the bootstrap transfer (the same one
     /// the issuer paid). Cross-checked by `validate_incoming_consignment`.
     maker_invoice: String,
+    /// Taker's receive invoice from the issuer→taker bootstrap transfer.
+    /// The sell round-trip uses it to figure out which taker outpoint(s)
+    /// carry RGB after the second transfer broadcasts and confirms.
+    taker_invoice: String,
     /// All maker keychain-9 outpoints from the funding phase. The transfer
     /// landed RGB on one of them; the others are pure BTC and usable as
     /// `maker_btc_inputs` in the sell composition.
     maker_funding_outpoints: Vec<Outpoint>,
+    /// Taker keychain-9 outpoints from the funding phase. Pure BTC (no RGB
+    /// transfer ever lands on the taker in the bootstrap); the buy round-trip
+    /// uses one as `taker_btc_inputs[0]`.
+    taker_funding_outpoints: Vec<Outpoint>,
+    /// Taker's keychain-0 address — the `btc_funding_addr` arg the maker
+    /// passes to `create_swap_psbt_buy` so the taker's BTC change goes back
+    /// to a taker-controlled address.
+    taker_funding_addr: String,
     /// Issuer keychain-0 address; reused as a fresh-looking taker payout
     /// destination so the sell test doesn't need to know about the issuer.
     taker_payout_addr: String,
@@ -143,6 +164,20 @@ impl RegtestStack {
         }
     }
 
+    /// Acquire the shared backend lock and return a taker-side handle.
+    /// The buy/sell round-trip tests use this to read taker UTXOs and to
+    /// sign+finalize the maker-built PSBT before handing it back.
+    pub async fn taker_backend(&self) -> TakerGuard<'_> {
+        let guard = self.backend_lock.lock().await;
+        TakerGuard {
+            _guard: guard,
+            stash_dir: self.taker.stash_dir.clone(),
+            account_file: self.taker.account_file.clone(),
+            electrum_url: self.electrum_url.clone(),
+            funding_outpoints: self.taker_funding_outpoints.clone(),
+        }
+    }
+
     pub fn consignment_bytes(&self) -> &[u8] {
         &self.consignment_bytes
     }
@@ -151,8 +186,67 @@ impl RegtestStack {
         &self.maker_invoice
     }
 
+    pub fn taker_invoice(&self) -> &str {
+        &self.taker_invoice
+    }
+
+    /// Run `rgb transfer` from the taker's stash for `recipient_invoice`,
+    /// returning the raw consignment bytes. The PSBT `rgb transfer`
+    /// produces is discarded — the swap composition builds its own. Used
+    /// by the sell round-trip to manufacture a taker→maker consignment
+    /// for `validate_incoming_consignment` + `create_swap_psbt_sell`.
+    ///
+    /// Mutates the taker's stash (the transition is recorded as if the
+    /// throwaway PSBT had been broadcast). Subsequent transfers from the
+    /// taker would see the RGB as already consigned — fine for the
+    /// single-test-run shape, since `RegtestStack` is bootstrapped once
+    /// per process.
+    pub fn taker_consignment_for(&self, recipient_invoice: &str) -> Result<Vec<u8>, String> {
+        let label = format!("taker-{}", uniq_label());
+        let consignment_path = self
+            ._tempdir
+            .path()
+            .join(format!("{label}.consignment.rgb"));
+        let psbt_path = self._tempdir.path().join(format!("{label}.psbt"));
+        rgb_cmd(
+            &self.tools_dir,
+            &self.taker.stash_dir,
+            "taker",
+            &self.electrum_url,
+            &[
+                "transfer",
+                recipient_invoice,
+                &consignment_path.display().to_string(),
+                &psbt_path.display().to_string(),
+            ],
+        )?;
+        std::fs::read(&consignment_path)
+            .map_err(|e| format!("read taker consignment {consignment_path:?}: {e}"))
+    }
+
+    pub fn taker_funding_addr(&self) -> &str {
+        &self.taker_funding_addr
+    }
+
     pub fn taker_payout_addr(&self) -> &str {
         &self.taker_payout_addr
+    }
+
+    pub fn compose_dir(&self) -> &Path {
+        &self.compose_dir
+    }
+
+    /// Broadcast a raw witness tx via `bitcoin-cli sendrawtransaction` with
+    /// `maxfeerate=0` so the buy composition's implicit "seal-anchor BTC
+    /// burned as fee" doesn't trip Bitcoin Core's default max-feerate cap.
+    /// Returns the txid bitcoind echoed back.
+    pub fn broadcast(&self, raw_tx: &[u8]) -> Result<String, String> {
+        let hex = raw_tx
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let out = bitcoin_cli(&self.compose_dir, &["sendrawtransaction", &hex, "0"])?;
+        Ok(out.trim().to_owned())
     }
 }
 
@@ -208,6 +302,192 @@ impl<'a> std::ops::Deref for IssuerGuard<'a> {
     }
 }
 
+/// Taker-side handle holding the shared backend lock. There's no maker-side
+/// `LibRgbBackend` here — the taker only needs to read its own UTXOs and
+/// drive `psbt.sign` + `psbt.finalize` on the maker-built PSBT, so the
+/// guard exposes those operations directly via bp-std / bp-wallet calls.
+///
+/// Keeping this out of `LibRgbBackend` mirrors the architectural split: the
+/// `RgbBackend` trait is the maker-side abstraction; the taker is just a
+/// counterparty that owns BTC inputs and applies signatures.
+pub struct TakerGuard<'a> {
+    _guard: MutexGuard<'a, ()>,
+    stash_dir: PathBuf,
+    account_file: PathBuf,
+    electrum_url: String,
+    funding_outpoints: Vec<Outpoint>,
+}
+
+impl<'a> TakerGuard<'a> {
+    /// Read the taker's RGB inventory for `asset` via an internal
+    /// `LibRgbBackend`. `LibRgbBackend`'s read paths are role-agnostic;
+    /// the trait's *write* path (the swap-PSBT trio) is what's
+    /// conceptually maker-only and never called here. Used by the sell
+    /// round-trip to find which outpoint the bootstrap issuer→taker
+    /// transfer landed RGB on.
+    pub async fn inventory(
+        &self,
+        asset: &rfq_types::AssetId,
+    ) -> Result<Vec<rfq_types::RgbInventoryUtxo>, String> {
+        self.lib_backend()
+            .list_inventory_utxos(asset)
+            .await
+            .map_err(|e| format!("taker list_inventory_utxos: {e}"))
+    }
+
+    /// Mint a fresh RGB invoice on the taker's stash. The sell round-trip
+    /// uses this to produce an `rgb_change_invoice` for over-consigned
+    /// surplus (taker sends a consignment that drains 500 RGB but the
+    /// swap delivers only 200 — the remaining 300 routes back to the
+    /// taker via this invoice's blinded seal).
+    pub async fn create_invoice(
+        &self,
+        asset: &rfq_types::AssetId,
+        amount: u64,
+    ) -> Result<String, String> {
+        self.lib_backend()
+            .create_invoice(asset, amount)
+            .await
+            .map_err(|e| format!("taker create_invoice: {e}"))
+    }
+
+    fn lib_backend(&self) -> LibRgbBackend {
+        LibRgbBackend::new(
+            self.stash_dir.clone(),
+            "taker".to_owned(),
+            "regtest".to_owned(),
+            self.electrum_url.clone(),
+            self.account_file.clone(),
+            String::new(),
+        )
+    }
+
+    /// Look up a specific taker UTXO and return its (Outpoint, TxOut). Used
+    /// by the sell round-trip to build `taker_rgb_prevouts` from the
+    /// outpoints the validated consignment reports.
+    pub fn lookup_prevout(&self, want: &Outpoint) -> Result<(Outpoint, TxOut), String> {
+        let provider = FsTextStore::new(self.stash_dir.join("regtest").join("taker"))
+            .map_err(|e| format!("taker wallet provider: {e}"))?;
+        let wallet: BpWallet<XpubDerivable, RgbDescr> =
+            BpWallet::load(provider, true).map_err(|e| format!("taker wallet load: {e}"))?;
+        let utxo = wallet
+            .utxos()
+            .find(|u| {
+                u.outpoint.txid.to_string() == want.txid && u.outpoint.vout.into_u32() == want.vout
+            })
+            .ok_or_else(|| format!("taker outpoint {want} not in wallet"))?;
+        let derived = wallet
+            .descriptor()
+            .derive(utxo.terminal.keychain, utxo.terminal.index)
+            .next()
+            .ok_or_else(|| "descriptor produced no script".to_owned())?;
+        let spk: Vec<u8> = derived.to_script_pubkey().as_slice().to_vec();
+        Ok((
+            want.clone(),
+            TxOut {
+                value_sats: utxo.value.sats(),
+                script_pubkey: spk,
+            },
+        ))
+    }
+
+    /// A taker keychain-9 funding outpoint that does **not** carry an RGB
+    /// allocation, paired with its prevout `TxOut` (value + scriptPubkey).
+    /// Used as `taker_btc_inputs[0]` in `create_swap_psbt_buy` — must skip
+    /// the RGB-bearing outpoint (the one the bootstrap issuer→taker
+    /// transfer's blinded seal landed on), otherwise the swap tx would
+    /// consume the taker's RGB allocation at bitcoin layer without an
+    /// RGB transition accounting for it.
+    pub async fn spare_btc_input(
+        &self,
+        asset: &rfq_types::AssetId,
+    ) -> Result<(Outpoint, TxOut), String> {
+        let rgb_utxos = self.inventory(asset).await?;
+        let rgb_set: std::collections::HashSet<Outpoint> =
+            rgb_utxos.iter().map(|u| u.outpoint.clone()).collect();
+        let want = self
+            .funding_outpoints
+            .iter()
+            .find(|op| !rgb_set.contains(op))
+            .ok_or_else(|| {
+                "no spare taker BTC outpoint — bump taker funding in bootstrap".to_owned()
+            })?;
+        self.lookup_prevout(want)
+    }
+
+    /// Enrich every PSBT input whose `prev_output` belongs to the taker
+    /// wallet, then sign + finalize against the taker descriptor. Mirrors
+    /// what an external taker would do in its own wallet after receiving
+    /// the maker-built partial PSBT.
+    ///
+    /// Enrichment is mandatory: the buy/sell composition leaves taker
+    /// inputs with only `witness_utxo` + `sighash_type` (the maker doesn't
+    /// know the taker's descriptor), but `TestnetRefSigner` keys off
+    /// `bip32_derivation` to pick a key — without it, `psbt.sign` returns
+    /// 0 matched inputs. `rfq_rgb::enrich_psbt_input` populates the
+    /// missing fields the same way the maker side enriches its own.
+    ///
+    /// Inputs the taker doesn't own (the maker's RGB inputs, already
+    /// carrying `partial_sigs`) are left untouched for the maker's own
+    /// finalize step.
+    pub fn sign_and_finalize(&self, partial_psbt_b64: &str) -> Result<String, String> {
+        let provider = FsTextStore::new(self.stash_dir.join("regtest").join("taker"))
+            .map_err(|e| format!("taker wallet provider: {e}"))?;
+        let wallet: BpWallet<XpubDerivable, RgbDescr> =
+            BpWallet::load(provider, true).map_err(|e| format!("taker wallet load: {e}"))?;
+        let descriptor = wallet.descriptor().clone();
+        // Index the wallet's UTXOs by (txid, vout) so we can match against
+        // each PSBT input's prev_output in O(1).
+        let owned: std::collections::HashMap<(String, u32), (Terminal, Sats)> = wallet
+            .utxos()
+            .map(|u| {
+                (
+                    (u.outpoint.txid.to_string(), u.outpoint.vout.into_u32()),
+                    (u.terminal, u.value),
+                )
+            })
+            .collect();
+
+        let account = XprivAccount::read(&self.account_file, "")
+            .map_err(|e| format!("taker account read: {e}"))?;
+        let mut psbt =
+            Psbt::from_base64(partial_psbt_b64).map_err(|e| format!("decode partial PSBT: {e}"))?;
+
+        // Snapshot the prev_outs first — we need &mut psbt to enrich and
+        // can't borrow the inputs iterator across the mutation.
+        let prev_outs: Vec<(usize, String, u32)> = psbt
+            .inputs()
+            .enumerate()
+            .map(|(i, inp)| {
+                (
+                    i,
+                    inp.previous_outpoint.txid.to_string(),
+                    inp.previous_outpoint.vout.into_u32(),
+                )
+            })
+            .collect();
+        let mut enriched = 0usize;
+        for (i, txid, vout) in prev_outs {
+            if let Some((terminal, value)) = owned.get(&(txid, vout)).cloned() {
+                rfq_rgb::enrich_psbt_input(&mut psbt, i, &descriptor, terminal, value)
+                    .map_err(|e| format!("enrich taker input {i}: {e}"))?;
+                enriched += 1;
+            }
+        }
+        if enriched == 0 {
+            return Err("no PSBT input matched a taker UTXO; check funding".to_owned());
+        }
+
+        let signer = TestnetRefSigner::new(&account);
+        let sig_count = psbt.sign(&signer).map_err(|e| format!("taker sign: {e}"))?;
+        if sig_count == 0 {
+            return Err("taker signer matched no inputs after enrichment".to_owned());
+        }
+        psbt.finalize(&descriptor);
+        Ok(psbt.to_base64())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
@@ -220,11 +500,9 @@ impl RegtestStack {
             workspace_root.join("infra/regtest/tools"),
         );
 
-        let compose_dir = env_or_default(
-            "RGB_RFQ_COMPOSE_DIR",
-            workspace_root.join("infra/regtest"),
-        );
-        
+        let compose_dir =
+            env_or_default("RGB_RFQ_COMPOSE_DIR", workspace_root.join("infra/regtest"));
+
         let electrum_url =
             std::env::var("ELECTRUM_URL").unwrap_or_else(|_| "localhost:50001".to_owned());
 
@@ -232,25 +510,90 @@ impl RegtestStack {
         require_stack_up(&compose_dir, &electrum_url)?;
 
         let tempdir = TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
-        let schema_file = workspace_root
-            .join("crates/rfq-rgb/tests/fixtures/NonInflatableAsset.rgb");
+        let schema_file =
+            workspace_root.join("crates/rfq-rgb/tests/fixtures/NonInflatableAsset.rgb");
         let template_path = workspace_root.join("infra/regtest/artifacts/rfq-nia.yaml");
 
-        // Phase 1: per-role wallet creation (issuer + maker; taker deferred
-        // until the sell/validate tests migrate — see issue #23).
+        // Phase 1: per-role wallet creation (issuer + maker + taker).
         let issuer = create_role_wallet(&tools_dir, tempdir.path(), &electrum_url, "issuer")?;
         let maker = create_role_wallet(&tools_dir, tempdir.path(), &electrum_url, "maker")?;
+        let taker = create_role_wallet(&tools_dir, tempdir.path(), &electrum_url, "taker")?;
 
         // Phase 2: import the vendored NIA schema into each stash.
-        import_schema(&tools_dir, &issuer.stash_dir, "issuer", &electrum_url, &schema_file)?;
-        import_schema(&tools_dir, &maker.stash_dir, "maker", &electrum_url, &schema_file)?;
+        import_schema(
+            &tools_dir,
+            &issuer.stash_dir,
+            "issuer",
+            &electrum_url,
+            &schema_file,
+        )?;
+        import_schema(
+            &tools_dir,
+            &maker.stash_dir,
+            "maker",
+            &electrum_url,
+            &schema_file,
+        )?;
+        import_schema(
+            &tools_dir,
+            &taker.stash_dir,
+            "taker",
+            &electrum_url,
+            &schema_file,
+        )?;
 
-        // Phase 3: fund each role on a keychain-9 address. Maker gets two
-        // outpoints so the sell test has at least one spare BTC UTXO after
-        // the issuer→maker transfer claims one for RGB.
-        fund_role(&tools_dir, &compose_dir, &issuer.stash_dir, "issuer", &electrum_url)?;
-        fund_role(&tools_dir, &compose_dir, &maker.stash_dir, "maker", &electrum_url)?;
-        fund_role(&tools_dir, &compose_dir, &maker.stash_dir, "maker", &electrum_url)?;
+        // Phase 3: fund each role on a keychain-9 address. Issuer gets two:
+        // one is consumed as the genesis seal + spent by the first transfer,
+        // the second provides BTC change for the second transfer's anchor.
+        // Maker gets two so the sell test has a spare BTC UTXO after the
+        // issuer→maker transfer claims one for RGB. Taker also gets two —
+        // the issuer→taker bootstrap transfer commits RGB to one taker
+        // outpoint (via the taker's blinded seal), so the buy round-trip
+        // needs a *spare* (non-RGB) outpoint as its BTC input to avoid
+        // spending Y0's RGB allocation at bitcoin layer without an RGB
+        // transition accounting for it.
+        fund_role(
+            &tools_dir,
+            &compose_dir,
+            &issuer.stash_dir,
+            "issuer",
+            &electrum_url,
+        )?;
+        fund_role(
+            &tools_dir,
+            &compose_dir,
+            &issuer.stash_dir,
+            "issuer",
+            &electrum_url,
+        )?;
+        fund_role(
+            &tools_dir,
+            &compose_dir,
+            &maker.stash_dir,
+            "maker",
+            &electrum_url,
+        )?;
+        fund_role(
+            &tools_dir,
+            &compose_dir,
+            &maker.stash_dir,
+            "maker",
+            &electrum_url,
+        )?;
+        fund_role(
+            &tools_dir,
+            &compose_dir,
+            &taker.stash_dir,
+            "taker",
+            &electrum_url,
+        )?;
+        fund_role(
+            &tools_dir,
+            &compose_dir,
+            &taker.stash_dir,
+            "taker",
+            &electrum_url,
+        )?;
 
         // Phase 4: issue the NIA contract.
         let contract_id_str = issue_contract(
@@ -264,22 +607,55 @@ impl RegtestStack {
         let contract_id = ContractId::from_str(&contract_id_str)
             .map_err(|e| format!("parse contract id `{contract_id_str}`: {e}"))?;
 
-        // Phase 5: issuer→maker transfer so the maker has RGB allocations
+        // Phase 5a: issuer→maker transfer so the maker has RGB allocations
         // to list / spend. Cache the consignment + invoice so the validate
-        // / sell tests don't need their own transfer.
-        let artifacts = transfer_to_maker(
+        // / sell tests don't need their own transfer. Broadcasted so the
+        // issuer's RGB change lands at a real outpoint for phase 5b.
+        let maker_artifacts = transfer_rgb(
             &tools_dir,
             &compose_dir,
             &issuer.stash_dir,
-            &maker.stash_dir,
+            "issuer",
+            &issuer.account_file,
+            TransferRecipient {
+                stash: &maker.stash_dir,
+                role: "maker",
+            },
             &electrum_url,
             &contract_id_str,
+            1000,
             tempdir.path(),
+            "issuer-to-maker",
+        )?;
+
+        // Phase 5b: issuer→taker transfer so the taker has RGB to consign
+        // in the sell round-trip test. Requires phase 5a to have broadcast
+        // (the issuer's RGB change from 5a is what 5b spends).
+        let taker_artifacts = transfer_rgb(
+            &tools_dir,
+            &compose_dir,
+            &issuer.stash_dir,
+            "issuer",
+            &issuer.account_file,
+            TransferRecipient {
+                stash: &taker.stash_dir,
+                role: "taker",
+            },
+            &electrum_url,
+            &contract_id_str,
+            500,
+            tempdir.path(),
+            "issuer-to-taker",
         )?;
 
         // Phase 6: collect post-bootstrap state the tests consume.
-        let maker_utxos_out =
-            rgb_cmd(&tools_dir, &maker.stash_dir, "maker", &electrum_url, &["utxos"])?;
+        let maker_utxos_out = rgb_cmd(
+            &tools_dir,
+            &maker.stash_dir,
+            "maker",
+            &electrum_url,
+            &["utxos"],
+        )?;
         let maker_funding_outpoints = parse_all_keychain9_outpoints(&maker_utxos_out);
         if maker_funding_outpoints.len() < 2 {
             return Err(format!(
@@ -297,6 +673,31 @@ impl RegtestStack {
         let taker_payout_addr = last_word(&issuer_addr_out)
             .ok_or_else(|| format!("could not parse taker payout addr:\n{issuer_addr_out}"))?;
 
+        let taker_utxos_out = rgb_cmd(
+            &tools_dir,
+            &taker.stash_dir,
+            "taker",
+            &electrum_url,
+            &["utxos"],
+        )?;
+        let taker_funding_outpoints = parse_all_keychain9_outpoints(&taker_utxos_out);
+        if taker_funding_outpoints.len() < 2 {
+            return Err(format!(
+                "expected ≥2 taker keychain-9 outpoints after funding, got {}:\n{taker_utxos_out}",
+                taker_funding_outpoints.len()
+            ));
+        }
+        let taker_funding_addr_out = rgb_cmd(
+            &tools_dir,
+            &taker.stash_dir,
+            "taker",
+            &electrum_url,
+            &["address", "-k", "0"],
+        )?;
+        let taker_funding_addr = last_word(&taker_funding_addr_out).ok_or_else(|| {
+            format!("could not parse taker funding addr:\n{taker_funding_addr_out}")
+        })?;
+
         Ok(RegtestStack {
             _tempdir: tempdir,
             tools_dir,
@@ -306,16 +707,22 @@ impl RegtestStack {
             contract_id_str,
             issuer,
             maker,
-            consignment_bytes: artifacts.consignment_bytes,
-            maker_invoice: artifacts.maker_invoice,
+            taker,
+            consignment_bytes: maker_artifacts.consignment_bytes,
+            maker_invoice: maker_artifacts.maker_invoice,
+            taker_invoice: taker_artifacts.maker_invoice,
             maker_funding_outpoints,
+            taker_funding_outpoints,
+            taker_funding_addr,
             taker_payout_addr,
             backend_lock: Mutex::new(()),
         })
     }
 }
 
-/// Captured during the bootstrap issuer→maker transfer for later test use.
+/// Captured during a bootstrap RGB transfer for later test use. `maker_invoice`
+/// is the recipient's invoice (named for historical reasons; reused for both
+/// issuer→maker and issuer→taker transfers).
 struct TransferArtifacts {
     consignment_bytes: Vec<u8>,
     maker_invoice: String,
@@ -395,9 +802,14 @@ fn fund_role(
     electrum_url: &str,
 ) -> Result<(), String> {
     // Derive a keychain-9 address.
-    let addr_out = rgb_cmd(tools_dir, stash_dir, role, electrum_url, &["address", "-k", "9"])?;
-    let addr =
-        last_word(&addr_out).ok_or_else(|| format!("could not parse address for {role}"))?;
+    let addr_out = rgb_cmd(
+        tools_dir,
+        stash_dir,
+        role,
+        electrum_url,
+        &["address", "-k", "9"],
+    )?;
+    let addr = last_word(&addr_out).ok_or_else(|| format!("could not parse address for {role}"))?;
 
     ensure_miner_wallet(compose_dir)?;
     bitcoin_cli(
@@ -415,7 +827,13 @@ fn fund_role(
     )?;
 
     // Sync so electrs's new UTXO shows up in the stash.
-    rgb_cmd(tools_dir, stash_dir, role, electrum_url, &["utxos", "--sync"])?;
+    rgb_cmd(
+        tools_dir,
+        stash_dir,
+        role,
+        electrum_url,
+        &["utxos", "--sync"],
+    )?;
     Ok(())
 }
 
@@ -429,11 +847,23 @@ fn issue_contract(
 ) -> Result<String, String> {
     // Schema id is content-addressed; read it back from the stash rather
     // than hard-coding so updates to the schema fixture flow through.
-    let schemata_out = rgb_cmd(tools_dir, issuer_stash, issuer_role, electrum_url, &["schemata"])?;
+    let schemata_out = rgb_cmd(
+        tools_dir,
+        issuer_stash,
+        issuer_role,
+        electrum_url,
+        &["schemata"],
+    )?;
     let schema_id = parse_schema_id(&schemata_out)
         .ok_or_else(|| format!("could not parse schema id from:\n{schemata_out}"))?;
 
-    let utxos_out = rgb_cmd(tools_dir, issuer_stash, issuer_role, electrum_url, &["utxos"])?;
+    let utxos_out = rgb_cmd(
+        tools_dir,
+        issuer_stash,
+        issuer_role,
+        electrum_url,
+        &["utxos"],
+    )?;
     let outpoint = parse_keychain9_outpoint(&utxos_out)
         .ok_or_else(|| format!("could not find a keychain-9 outpoint in:\n{utxos_out}"))?;
 
@@ -463,8 +893,13 @@ fn issue_contract(
     }
     // Fallback: scan `rgb contracts` for the freshly issued id, same as
     // rgb-issue-asset:99-102.
-    let contracts_out =
-        rgb_cmd(tools_dir, issuer_stash, issuer_role, electrum_url, &["contracts"])?;
+    let contracts_out = rgb_cmd(
+        tools_dir,
+        issuer_stash,
+        issuer_role,
+        electrum_url,
+        &["contracts"],
+    )?;
     parse_contract_id(&contracts_out).ok_or_else(|| {
         format!(
             "could not parse contract id from `rgb issue`:\nstdout:\n{issue_stdout}\nstderr:\n{issue_stderr}\n\
@@ -473,32 +908,58 @@ fn issue_contract(
     })
 }
 
-fn transfer_to_maker(
+/// Recipient-side context for [`transfer_rgb`]. Bundles the path layout so
+/// the sender can resolve the recipient's wallet name for invoice/accept
+/// calls without the caller having to pass everything separately.
+struct TransferRecipient<'a> {
+    stash: &'a Path,
+    role: &'a str,
+}
+
+/// Issuer-style RGB transfer that signs + broadcasts the witness tx and
+/// confirms it (vs. the earlier stash-only flow). Concretely:
+///   1. Recipient creates an invoice for `amount`.
+///   2. Sender runs `rgb transfer` (rgb-api `pay`) → consignment + PSBT.
+///   3. Sender's PSBT is signed + finalized in-Rust via the sender's
+///      XprivAccount, then extracted and broadcast through bitcoind.
+///   4. A block is mined to confirm; both sides `utxos --sync` so the
+///      bp-wallet caches reflect the new on-chain state (sender's RGB
+///      change is now at a *real* outpoint, ready for the next transfer).
+///   5. Recipient accepts the consignment into its stash.
+///
+/// Broadcasting is essential for chained transfers: a stash-only transfer
+/// leaves the sender's RGB change at a tentative outpoint that
+/// `WalletUnspentFilter` excludes from the next `pay` call, so the second
+/// transfer would fail with "no allocations".
+fn transfer_rgb(
     tools_dir: &Path,
     compose_dir: &Path,
-    issuer_stash: &Path,
-    maker_stash: &Path,
+    sender_stash: &Path,
+    sender_role: &str,
+    sender_account_file: &Path,
+    recipient: TransferRecipient<'_>,
     electrum_url: &str,
     contract_id: &str,
+    amount: u64,
     tempdir: &Path,
+    label: &str,
 ) -> Result<TransferArtifacts, String> {
     let invoice_out = rgb_cmd(
         tools_dir,
-        maker_stash,
-        "maker",
+        recipient.stash,
+        recipient.role,
         electrum_url,
-        &["invoice", "--amount", "1000", contract_id],
+        &["invoice", "--amount", &amount.to_string(), contract_id],
     )?;
-
     let invoice = parse_invoice(&invoice_out)
         .ok_or_else(|| format!("could not parse invoice from:\n{invoice_out}"))?;
 
-    let consignment_path = tempdir.join("transfer.consignment.rgb");
-    let psbt_path = tempdir.join("transfer.psbt");
+    let consignment_path = tempdir.join(format!("{label}.consignment.rgb"));
+    let psbt_path = tempdir.join(format!("{label}.psbt"));
     rgb_cmd(
         tools_dir,
-        issuer_stash,
-        "issuer",
+        sender_stash,
+        sender_role,
         electrum_url,
         &[
             "transfer",
@@ -508,7 +969,17 @@ fn transfer_to_maker(
         ],
     )?;
 
-    // Confirm and sync both sides.
+    // Sign + finalize + broadcast the sender's witness tx.
+    sign_finalize_and_broadcast(
+        sender_stash,
+        sender_role,
+        sender_account_file,
+        &psbt_path,
+        compose_dir,
+    )?;
+
+    // Confirm and sync both sides so the witness tx + spent/created UTXOs
+    // are reflected in each wallet's cache.
     let miner_addr_out = bitcoin_cli(
         compose_dir,
         &["-rpcwallet=miner", "getnewaddress", "", "bech32"],
@@ -518,13 +989,25 @@ fn transfer_to_maker(
         compose_dir,
         &["-rpcwallet=miner", "generatetoaddress", "1", miner_addr],
     )?;
-    rgb_cmd(tools_dir, issuer_stash, "issuer", electrum_url, &["utxos", "--sync"])?;
-    rgb_cmd(tools_dir, maker_stash, "maker", electrum_url, &["utxos", "--sync"])?;
+    rgb_cmd(
+        tools_dir,
+        sender_stash,
+        sender_role,
+        electrum_url,
+        &["utxos", "--sync"],
+    )?;
+    rgb_cmd(
+        tools_dir,
+        recipient.stash,
+        recipient.role,
+        electrum_url,
+        &["utxos", "--sync"],
+    )?;
 
     rgb_cmd(
         tools_dir,
-        maker_stash,
-        "maker",
+        recipient.stash,
+        recipient.role,
         electrum_url,
         &["accept", &consignment_path.display().to_string()],
     )?;
@@ -535,6 +1018,58 @@ fn transfer_to_maker(
         consignment_bytes,
         maker_invoice: invoice,
     })
+}
+
+/// Load `psbt_path`, sign every input the role's account can satisfy,
+/// finalize against the role's wallet descriptor, extract the witness tx,
+/// and broadcast it via `bitcoin-cli sendrawtransaction`. Used by
+/// [`transfer_rgb`] to confirm chained transfers on-chain.
+///
+/// The rgb-api `pay` flow already enriches every input with full
+/// `bip32_derivation` (it built the PSBT against the sender's own
+/// descriptor), so no extra enrichment is needed — `psbt.sign` matches
+/// straight away.
+fn sign_finalize_and_broadcast(
+    stash_dir: &Path,
+    wallet_name: &str,
+    account_file: &Path,
+    psbt_path: &Path,
+    compose_dir: &Path,
+) -> Result<String, String> {
+    let provider = FsTextStore::new(stash_dir.join("regtest").join(wallet_name))
+        .map_err(|e| format!("{wallet_name} wallet provider: {e}"))?;
+    let wallet: BpWallet<XpubDerivable, RgbDescr> =
+        BpWallet::load(provider, true).map_err(|e| format!("{wallet_name} wallet load: {e}"))?;
+    let descriptor = wallet.descriptor().clone();
+
+    let account = XprivAccount::read(account_file, "")
+        .map_err(|e| format!("{wallet_name} account read: {e}"))?;
+    let psbt_bytes =
+        std::fs::read(psbt_path).map_err(|e| format!("read PSBT {psbt_path:?}: {e}"))?;
+    let mut psbt = Psbt::deserialize(&psbt_bytes)
+        .map_err(|e| format!("deserialize PSBT {psbt_path:?}: {e}"))?;
+
+    let signer = TestnetRefSigner::new(&account);
+    let sig_count = psbt
+        .sign(&signer)
+        .map_err(|e| format!("{wallet_name} sign: {e}"))?;
+    if sig_count == 0 {
+        return Err(format!("{wallet_name} signer matched no inputs"));
+    }
+    psbt.finalize(&descriptor);
+    if !psbt.is_finalized() {
+        return Err(format!("PSBT not finalized after {wallet_name} finalize"));
+    }
+    let tx = psbt
+        .extract()
+        .map_err(|e| format!("extract witness tx: {e}"))?;
+    let hex = tx
+        .consensus_serialize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let out = bitcoin_cli(compose_dir, &["sendrawtransaction", &hex])?;
+    Ok(out.trim().to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -560,7 +1095,13 @@ fn rgb_cmd(
         .arg("-w")
         .arg(wallet_name)
         .args(args);
-    run(&format!("rgb {} ({wallet_name})", args.first().copied().unwrap_or("")), &mut cmd)
+    run(
+        &format!(
+            "rgb {} ({wallet_name})",
+            args.first().copied().unwrap_or("")
+        ),
+        &mut cmd,
+    )
 }
 
 fn bitcoin_cli(compose_dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -575,7 +1116,10 @@ fn bitcoin_cli(compose_dir: &Path, args: &[&str]) -> Result<String, String> {
         "-datadir=/home/bitcoin/.bitcoin",
     ]);
     cmd.args(args);
-    run(&format!("bitcoin-cli {}", args.first().copied().unwrap_or("")), &mut cmd)
+    run(
+        &format!("bitcoin-cli {}", args.first().copied().unwrap_or("")),
+        &mut cmd,
+    )
 }
 
 fn run(label: &str, cmd: &mut Command) -> Result<String, String> {
@@ -652,11 +1196,9 @@ fn require_tools(tools_dir: &Path) -> Result<(), String> {
 
 fn require_stack_up(compose_dir: &Path, electrum_url: &str) -> Result<(), String> {
     if bitcoin_cli(compose_dir, &["getblockchaininfo"]).is_err() {
-        return Err(
-            "bitcoind not reachable via `docker compose exec` from \
+        return Err("bitcoind not reachable via `docker compose exec` from \
              {compose_dir:?}. Run: make -C infra/regtest regtest-up"
-                .to_owned(),
-        );
+            .to_owned());
     }
     let host_port = electrum_url
         .trim_start_matches("tcp://")
@@ -676,6 +1218,14 @@ fn require_stack_up(compose_dir: &Path, electrum_url: &str) -> Result<(), String
 }
 
 use std::net::ToSocketAddrs;
+
+/// Monotonic-per-process counter so multiple `taker_consignment_for` calls
+/// within a single test don't collide on the tempdir filename.
+fn uniq_label() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    format!("{}", N.fetch_add(1, Ordering::Relaxed))
+}
 
 fn last_word(s: &str) -> Option<String> {
     s.lines()
@@ -735,7 +1285,10 @@ fn parse_all_keychain9_outpoints(utxos_out: &str) -> Vec<Outpoint> {
 /// `txid:vout` anywhere in the output. Mirrors `rgb-issue-asset:62-70`.
 fn parse_keychain9_outpoint(utxos_out: &str) -> Option<String> {
     for line in utxos_out.lines() {
-        if line.contains("keychain=9") || line.contains("&9/") || line.trim_start().starts_with("9 ") {
+        if line.contains("keychain=9")
+            || line.contains("&9/")
+            || line.trim_start().starts_with("9 ")
+        {
             for tok in line.split_whitespace() {
                 if is_outpoint(tok) {
                     return Some(tok.to_owned());
