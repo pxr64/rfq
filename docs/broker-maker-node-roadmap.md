@@ -15,11 +15,16 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [x] Define broker-to-maker node protocol
 - [x] Define regtest RGB20 integration plan
 - [x] Validate end-to-end NIA issuance + issuer→maker transfer on regtest
-- [x] Issue #13: Library-backed `rfq-rgb` adapter — foundation, `create_invoice`, `validate_incoming_consignment`, the full swap-PSBT trio (B1–B5), and two-backend buy + sell round-trip tests all landed and regtest-verified. Group B follow-ups (validate-trait sig cleanup, maker-node BTC wallet bootstrap, seal-anchor change handling) tracked below.
+- [x] Issue #13: Library-backed `rfq-rgb` adapter — full swap-PSBT trio (B1–B5), validate semantics + trait-sig fix, maker-node electrum wiring, seal-anchor BTC routing (#25) all shipped. Closed.
 - [x] Issue #14: RGB maker UTXO inventory management (supersedes #11)
 - [x] Issue #15: Atomic swap settlement — buy side (BTC → RGB)
 - [x] Issue #16: Atomic swap settlement — sell side (RGB → BTC)
 - [x] Issue #9: Add RFQ settlement state machine
+- [x] Issue #23: Self-contained Rust e2e tests for rfq-rgb — in-Rust bootstrap landed; ephemeral docker stack split out as #26.
+- [x] Issue #25: Swap composition: route seal-anchor BTC value to a maker change output (don't burn as fee).
+- [ ] Issue #27: Maker-node runtime — post-broadcast wallet refresh + BTC inventory refresh + confirmation tracking. **Last critical gap before the daemon is fully operational on regtest** (today's state stops working after the first swap broadcasts).
+- [ ] Issue #24: Replace bp-hot + easy rgb-cmd commands in the e2e test harness — bp-hot slice landed; rgb-cmd commands (import/create/address/utxos/invoice/transfer/accept) still subprocess.
+- [ ] Issue #26: Run regtest stack ephemerally via testcontainers-rs so `cargo test` owns its bitcoind + electrs lifecycle.
 - [ ] Issue #6: Add OpenAPI spec for public RFQ API
 - [ ] Future work: RGB ↔ RGB atomic swap (asset-for-asset). Two RGB state transitions committed in one Bitcoin tx; design pass deferred until #15/#16 land so we know the final `SwapLeg` / `RgbBackend` surface to extend.
 
@@ -135,45 +140,31 @@ B5 tests).
 - B5 round-trip tests: `a6f8d81` — two-backend buy + sell, broadcasts
   through bitcoind
 
-### Open follow-ups (still under issue #13)
+### Resolved follow-ups (post-Group B)
 
-- **`validate_incoming_consignment` semantics** — currently returns
-  the consignment's *output* seals (recipient destinations). The B5
-  sell round-trip needed *input* outpoints (where to spend the
-  taker's RGB from); test works around this via a pre-consign
-  inventory snapshot — fragile. Long-term fix: either rename the
-  existing field (it's still useful for the validate-only path) and
-  add a typed inputs accessor, or pivot the field's semantics.
-- **`validate_incoming_consignment` trait-sig cleanup** — Drop the
-  `expected_invoice: &str` self-round-trip (same shape B3 lifted for
-  `create_swap_psbt_sell`). The maker created the invoice itself; the
-  parse only recovers `contract_id` for cross-checking. Change to
-  `expected_contract_id: ContractId` and have rfq-maker extract it
-  once at /sign time alongside the seal (via the `parse_maker_invoice`
-  trait method B3 added). Mock impl + rfq-maker call site are the
-  only ripple.
-- **Maker-node electrum + BTC wallet bootstrap** —
-  [`crates/maker-node/src/main.rs`](../crates/maker-node/src/main.rs)
-  hard-codes `MockBitcoinClient::new()`, seeds mock taker funding
-  (`seed_address_unspent("bcrt1qtaker", ...)`), and seeds mock BTC
-  inventory (`with_btc_inventory(mock_btc_inventory())`).
-  `ElectrumClient` exists at
-  [`crates/rfq-btc/src/electrum.rs`](../crates/rfq-btc/src/electrum.rs)
-  but isn't wired through config; `ElectrumClient::get_outpoint` is
-  also still a stub. Maker also needs a BTC wallet bootstrap (walk
-  the maker's wpkh descriptor against electrum) so the explicit
-  `with_btc_inventory` list can go away. Distinct from the
-  "Wallet UTXO-cache sync" follow-up under #14 (that one's about
-  freshness of the RGB-bearing wallet cache; this is about chain
-  access + maker BTC wallet plumbing).
-- **Seal-anchor BTC value handling** — Both buy and sell composition
-  implicitly burn the seal-anchor input's BTC value as fee (no
-  dedicated maker BTC change output for it). The B5 round-trip tests
-  pass `maxfeerate=0` to `sendrawtransaction` to bypass Core's default
-  cap; production won't want this. Either add an explicit maker BTC
-  change output for the RGB input's sats, or document the trade-off
-  (the seal-anchor sats are tiny relative to typical swap notional —
-  may be acceptable).
+All Group B follow-ups that surfaced during B3–B5 have shipped:
+
+- ✅ **`validate_incoming_consignment` semantics + trait-sig cleanup**
+  (`a6227b8`) — now returns *input* outpoints from terminal transitions
+  via a new `extract_input_outpoints` helper; trait sig takes typed
+  `expected_contract_id: ContractId` (rfq-maker threads it from
+  `parse_maker_invoice`). B5 sell test's pre-consign inventory
+  workaround removed.
+- ✅ **Maker-node electrum + BTC wallet bootstrap** (`5542da5`) —
+  `ElectrumClient::get_outpoint` wired through (uses electrum-client's
+  vendored `bitcoin` crate to parse the witness tx). New
+  `LibRgbBackend::list_btc_only_utxos` returns wallet UTXOs minus the
+  RGB-bearing ones. `build_maker` branches on `config.rgb`: Some →
+  real `ElectrumClient` + real BTC inventory; None → keeps mock for
+  tests + demo.
+- ✅ **Seal-anchor BTC value handling** (`fee3c6a`, closes #25) — buy
+  adds a `maker_btc_change` output for the consumed seal-anchor sats;
+  sell folds the taker's RGB-input BTC value into the taker payout.
+  Tests broadcast cleanly without `maxfeerate=0`.
+
+The remaining maker-node operational gap (post-broadcast wallet
+refresh + BTC inventory refresh + confirmation tracking) is tracked
+separately as #27.
 
 ## RGB Maker UTXO Inventory Management (Issue #14)
 
