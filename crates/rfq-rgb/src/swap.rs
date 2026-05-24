@@ -732,15 +732,14 @@ pub(crate) fn build_sell_transition(
             }
         }
     }
-    if sum_inputs != consignment_info.total_amount {
-        return Err(RgbError::TransferBuild(format!(
-            "stash allocations {sum_inputs} disagree with consignment total {}",
-            consignment_info.total_amount
-        )));
-    }
+    // No equality check against `consignment_info.total_amount`: that field
+    // sums *all* transition outputs (including blinded destinations the
+    // resolver can't surface as outpoints), so it overcounts whenever the
+    // consignment has a blinded recipient — the normal taker→maker case.
+    // Only sum_inputs is what's actually spendable here.
     if sum_inputs < inputs.deliver_amount {
         return Err(RgbError::TransferBuild(format!(
-            "consigned {sum_inputs} < deliver {}",
+            "stash allocations at consigned outpoints sum to {sum_inputs}, < deliver {}",
             inputs.deliver_amount
         )));
     }
