@@ -1,64 +1,24 @@
-//! Integration tests for [`LibRgbBackend`] against a live regtest Docker stack.
+//! Integration tests for [`LibRgbBackend`] against a live regtest stack.
 //!
-//! These tests are `#[ignore]` by default so `cargo test --workspace` stays
-//! fast and offline. Run them explicitly after bringing the stack up:
+//! All `#[ignore]`d tests run on top of the self-bootstrapping harness in
+//! [`common::stack`] (issue #23). One-time setup:
 //!
 //! ```bash
 //! make -C infra/regtest regtest-up
-//! make -C infra/regtest regtest-mine BLOCKS=103
-//! make -C infra/regtest rgb-fund-wallets
-//! # (manual rgb_issuer create + import + issue per docs/regtest-rgb20-nia-dev-infra.md)
-//!
-//! export REGTEST_DIR="$(git rev-parse --show-toplevel)/infra/regtest"
-//! export RGB_DATA_DIR="$REGTEST_DIR/data/maker"
-//! export RGB_CONTRACT_ID="rgb:<paste-from-rgb_issuer-contracts>"
+//! make -C infra/regtest rgb-tools-install
 //! cargo test -p rfq-rgb -- --ignored
 //! ```
+//!
+//! No `RGB_*` env vars. The harness creates wallets, funds them, issues the
+//! NIA contract, and runs an issuer→maker transfer — all inside a per-process
+//! tempdir that auto-cleans on exit.
 
 use std::path::PathBuf;
 
-use rfq_rgb::{LibRgbBackend, RgbBackend, RgbError};
-use rfq_types::{AssetId, AssetKind, BitcoinNetwork};
+use rfq_rgb::{ConsignmentInfo, LibRgbBackend, RgbBackend, RgbError, TxOut};
+use rfq_types::Outpoint;
 
-fn env_or_skip(key: &str) -> Option<String> {
-    match std::env::var(key) {
-        Ok(value) if !value.is_empty() => Some(value),
-        _ => {
-            eprintln!(
-                "skipping: {key} is not set. Export REGTEST_DIR, RGB_DATA_DIR, RGB_CONTRACT_ID \
-                 (and optionally ELECTRUM_URL, RGB_WALLET, RGB_NETWORK) per crates/rfq-rgb/tests/cli.rs."
-            );
-            None
-        }
-    }
-}
-
-fn lib_backend() -> Option<(LibRgbBackend, AssetId)> {
-    let data_dir = PathBuf::from(env_or_skip("RGB_DATA_DIR")?);
-    let contract_id = env_or_skip("RGB_CONTRACT_ID")?;
-    let electrum_url =
-        std::env::var("ELECTRUM_URL").unwrap_or_else(|_| "localhost:50001".to_owned());
-    let wallet_name = std::env::var("RGB_WALLET").unwrap_or_else(|_| "maker".to_owned());
-    let network = std::env::var("RGB_NETWORK").unwrap_or_else(|_| "regtest".to_owned());
-    let signer_account_file =
-        PathBuf::from(std::env::var("RGB_SIGNER_ACCOUNT_FILE").unwrap_or_default());
-    let signer_password = std::env::var("RGB_SIGNER_PASSWORD").unwrap_or_default();
-
-    let backend = LibRgbBackend::new(
-        data_dir,
-        wallet_name,
-        network,
-        electrum_url,
-        signer_account_file,
-        signer_password,
-    );
-    let asset = AssetId {
-        network: BitcoinNetwork::Regtest,
-        kind: AssetKind::Rgb20,
-        id: contract_id,
-    };
-    Some((backend, asset))
-}
+mod common;
 
 /// Pure parse test — no live stack required. NOT `#[ignore]`; runs as part of
 /// the default test suite.
@@ -88,26 +48,27 @@ async fn validate_invoice_rejects_garbage() {
 }
 
 #[tokio::test]
-#[ignore = "requires the regtest stack with a NIA contract issued; see file header"]
+#[ignore = "needs the regtest stack up + tools installed; see file header"]
 async fn list_inventory_utxos_returns_per_utxo_outpoints() {
-    let Some((backend, asset)) = lib_backend() else {
-        return;
-    };
+    let stack = common::stack().await;
+    let asset = stack.asset();
 
+    let backend = stack.maker_backend().await;
     let utxos = backend
         .list_inventory_utxos(&asset)
         .await
-        .expect("list_inventory_utxos should succeed against a live stash");
+        .expect("list_inventory_utxos should succeed against the bootstrapped stash");
 
     assert!(
         !utxos.is_empty(),
-        "expected at least one UTXO; is the contract issued and has the maker received any?"
+        "expected at least one UTXO; bootstrap should have transferred 1000 units to the maker"
     );
 
     let total: u64 = utxos.iter().map(|u| u.amount).sum();
     assert!(total > 0, "expected positive total amount; got {total}");
 
     let zero_txid = "0".repeat(64);
+    dbg!(&utxos);
     for utxo in &utxos {
         assert_eq!(utxo.asset_id, asset);
         assert_eq!(
@@ -124,16 +85,16 @@ async fn list_inventory_utxos_returns_per_utxo_outpoints() {
 }
 
 #[tokio::test]
-#[ignore = "requires the regtest stack with a NIA contract + a funded maker keychain-9 outpoint"]
+#[ignore = "needs the regtest stack up + tools installed; see file header"]
 async fn create_invoice_returns_rgb_invoice_referencing_the_contract() {
-    let Some((backend, asset)) = lib_backend() else {
-        return;
-    };
+    let stack = common::stack().await;
+    let asset = stack.asset();
 
+    let backend = stack.maker_backend().await;
     let invoice = backend
         .create_invoice(&asset, 100)
         .await
-        .expect("create_invoice should succeed against a live wallet");
+        .expect("create_invoice should succeed against the bootstrapped wallet");
 
     assert!(
         invoice.starts_with("rgb:"),
@@ -148,29 +109,19 @@ async fn create_invoice_returns_rgb_invoice_referencing_the_contract() {
 }
 
 #[tokio::test]
-#[ignore = "requires the regtest stack post-`make rgb-transfer-maker` (consignment + invoice on disk)"]
+#[ignore = "needs the regtest stack up + tools installed; see file header"]
 async fn validate_incoming_consignment_accepts_a_real_consignment() {
     use base64::Engine as _;
 
-    let Some((backend, _asset)) = lib_backend() else {
-        return;
-    };
-
-    // `rgb-transfer-maker` drops both files into the maker's data dir; the
-    // consignment is strict-encoded binary, the invoice is the plain rgb: URI.
-    let data_dir = PathBuf::from(std::env::var("RGB_DATA_DIR").expect("RGB_DATA_DIR"));
-    let consignment_bytes = std::fs::read(data_dir.join("consignment.rgb"))
-        .expect("run `make rgb-transfer-maker` first to produce consignment.rgb");
+    let stack = common::stack().await;
     let consignment_b64 =
-        base64::engine::general_purpose::STANDARD.encode(consignment_bytes);
-    let invoice = std::fs::read_to_string(data_dir.join("invoice.txt"))
-        .expect("run `make rgb-transfer-maker` first to produce invoice.txt");
-    let invoice = invoice.trim();
+        base64::engine::general_purpose::STANDARD.encode(stack.consignment_bytes());
 
+    let backend = stack.maker_backend().await;
     let info = backend
-        .validate_incoming_consignment(&consignment_b64, invoice)
+        .validate_incoming_consignment(&consignment_b64, stack.maker_invoice())
         .await
-        .expect("validate_incoming_consignment should accept a real consignment");
+        .expect("validate_incoming_consignment should accept the bootstrap transfer");
 
     assert!(
         info.total_amount > 0,
@@ -184,26 +135,25 @@ async fn validate_incoming_consignment_accepts_a_real_consignment() {
 }
 
 #[tokio::test]
-#[ignore = "requires the regtest stack with a NIA contract + a funded maker; see file header"]
+#[ignore = "needs the regtest stack up + tools installed; see file header"]
 async fn create_swap_psbt_buy_produces_psbt_and_consignment() {
-    let Some((backend, asset)) = lib_backend() else {
-        return;
-    };
+    let stack = common::stack().await;
+    let asset = stack.asset();
+    let backend = stack.maker_backend().await;
 
-    // Smoke test of the full RGB composition path: use a maker-minted invoice as
-    // the (stand-in) beneficiary and the maker's own inventory as the RGB
-    // inputs. taker_btc_inputs is empty here — the BTC side is exercised
-    // end-to-end at the rfq-maker layer; this asserts the RGB transition build +
-    // embed + commit + transfer + maker-sign all succeed and yield a stable
-    // witness txid.
+    // RGB composition smoke test: the maker mints an invoice against its own
+    // contract, the maker's own RGB inventory provides the inputs, taker BTC
+    // inputs are empty (BTC side is exercised at the rfq-maker layer). This
+    // asserts the RGB transition build + embed + commit + transfer +
+    // maker-sign path yields a stable witness txid.
     let invoice = backend
         .create_invoice(&asset, 100)
         .await
-        .expect("create_invoice should succeed against a live wallet");
+        .expect("create_invoice");
     let utxos = backend
         .list_inventory_utxos(&asset)
         .await
-        .expect("list_inventory_utxos should succeed");
+        .expect("list_inventory_utxos");
     let maker_outpoints: Vec<_> = utxos.iter().map(|u| u.outpoint.clone()).collect();
     assert!(
         !maker_outpoints.is_empty(),
@@ -230,59 +180,48 @@ async fn create_swap_psbt_buy_produces_psbt_and_consignment() {
 }
 
 #[tokio::test]
-#[ignore = "requires the regtest stack post-`make rgb-transfer-maker`; needs RGB_TAKER_PAYOUT_ADDR + RGB_MAKER_BTC_OUTPOINT=<txid>:<vout>; full two-backend round-trip is B5 work"]
+#[ignore = "needs the regtest stack up + tools installed; see file header"]
 async fn create_swap_psbt_sell_produces_psbt() {
-    use base64::Engine as _;
-    use rfq_rgb::TxOut;
-    use rfq_types::Outpoint;
+    let stack = common::stack().await;
+    let asset = stack.asset();
+    let backend = stack.maker_backend().await;
 
-    let Some((backend, asset)) = lib_backend() else {
-        return;
-    };
-    let Some(taker_payout_addr) = env_or_skip("RGB_TAKER_PAYOUT_ADDR") else {
-        return;
-    };
-    let Some(mb_outpoint_s) = env_or_skip("RGB_MAKER_BTC_OUTPOINT") else {
-        return;
-    };
-    let mb_outpoint: Outpoint = mb_outpoint_s
-        .parse()
-        .expect("RGB_MAKER_BTC_OUTPOINT must be <txid>:<vout>");
-
-    // 1. Validate + absorb a real taker→maker consignment from
-    //    `make rgb-transfer-maker`. Change 2 makes this also accept_transfer
-    //    so the taker's allocations land in the maker stash.
-    let data_dir = PathBuf::from(std::env::var("RGB_DATA_DIR").expect("RGB_DATA_DIR"));
-    let consignment_bytes = std::fs::read(data_dir.join("consignment.rgb"))
-        .expect("run `make rgb-transfer-maker` first to produce consignment.rgb");
-    let consignment_b64 =
-        base64::engine::general_purpose::STANDARD.encode(consignment_bytes);
-    let taker_invoice = std::fs::read_to_string(data_dir.join("invoice.txt"))
-        .expect("run `make rgb-transfer-maker` first to produce invoice.txt");
-    let taker_invoice = taker_invoice.trim();
-    let info = backend
-        .validate_incoming_consignment(&consignment_b64, taker_invoice)
+    // Build `ConsignmentInfo` synthetically from the maker's actual
+    // inventory: the bootstrap put 1000 units at a maker keychain-9 outpoint,
+    // and `list_inventory_utxos` surfaces it. Using these (rather than
+    // `validate_incoming_consignment` output) keeps sum-of-spendable ==
+    // deliver_amount, which is what `build_sell_transition` requires. A real
+    // taker→maker round-trip with chain-correct prevouts is B5 work.
+    let utxos = backend
+        .list_inventory_utxos(&asset)
         .await
-        .expect("validate_incoming_consignment");
+        .expect("list_inventory_utxos");
+    let total_amount: u64 = utxos.iter().map(|u| u.amount).sum();
+    let outpoints: Vec<Outpoint> = utxos.iter().map(|u| u.outpoint.clone()).collect();
+    assert!(
+        total_amount > 0 && !outpoints.is_empty(),
+        "bootstrap should have transferred RGB to the maker"
+    );
+    let info = ConsignmentInfo {
+        total_amount,
+        outpoints: outpoints.clone(),
+    };
 
-    // 2. Mint the maker's receive invoice and round-trip it to typed parts —
-    //    the same path rfq-maker takes at /sign time.
+    // Fresh maker invoice for the swap delivery, round-tripped into the typed
+    // components rfq-maker passes at /sign time.
     let maker_invoice = backend
-        .create_invoice(&asset, info.total_amount)
+        .create_invoice(&asset, total_amount)
         .await
         .expect("create_invoice");
     let parts = backend
         .parse_maker_invoice(&maker_invoice)
         .await
         .expect("parse_maker_invoice");
-    assert_eq!(parts.amount, Some(info.total_amount));
+    assert_eq!(parts.amount, Some(total_amount));
 
-    // 3. Synthesize taker_rgb_prevouts — cli.rs has no electrum to fetch
-    //    real prevouts. Composition only needs the outpoint at PSBT-input
-    //    time; witness_utxo bytes aren't validated until broadcast, which
-    //    this test doesn't do. (Full chain-correct round-trip is B5.)
-    let taker_rgb_prevouts: Vec<(Outpoint, TxOut)> = info
-        .outpoints
+    // Synthesize taker_rgb_prevouts — cli.rs has no electrum access to fetch
+    // real prevouts; composition only needs the outpoint at PSBT-input time.
+    let taker_rgb_prevouts: Vec<(Outpoint, TxOut)> = outpoints
         .iter()
         .map(|o| {
             (
@@ -295,15 +234,14 @@ async fn create_swap_psbt_sell_produces_psbt() {
         })
         .collect();
 
-    // 4. Drive the sell composition. resolve_maker_btc_inputs only reads the
-    //    outpoint from the supplied (Outpoint, TxOut) pair — the wallet
-    //    provides the real value + terminal — so an empty TxOut is fine here.
+    let maker_btc_outpoint = backend.spare_btc_outpoint().await;
+
     let transfer = backend
         .create_swap_psbt_sell(
             &info,
             &taker_rgb_prevouts,
             &[(
-                mb_outpoint,
+                maker_btc_outpoint,
                 TxOut {
                     value_sats: 0,
                     script_pubkey: vec![],
@@ -311,8 +249,8 @@ async fn create_swap_psbt_sell_produces_psbt() {
             )],
             parts.contract_id,
             parts.seal,
-            info.total_amount,
-            &taker_payout_addr,
+            total_amount,
+            stack.taker_payout_addr(),
             None,
             10_000,
             500,
@@ -337,12 +275,10 @@ async fn create_swap_psbt_sell_produces_psbt() {
 #[tokio::test]
 #[ignore = "blocked on LibRgbBackend::finalize_after_taker_sign (issue #13); flip when impl lands"]
 async fn finalize_after_taker_sign_returns_witness_txid() {
-    let Some((backend, _asset)) = lib_backend() else {
-        return;
-    };
+    let stack = common::stack().await;
 
-    // TODO(#13): plug in a real signed PSBT once create_swap_psbt_buy + an
-    // out-of-band sign step exist. For now we assert the stub error.
+    // TODO(#13): plug in a real signed PSBT once B4 lands.
+    let backend = stack.maker_backend().await;
     let result = backend
         .finalize_after_taker_sign("c2lnbmVk", "Y29uc2lnbm1lbnQ=")
         .await;

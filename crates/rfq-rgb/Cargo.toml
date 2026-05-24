@@ -22,3 +22,4 @@ rand = "0.9"
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = "3"
