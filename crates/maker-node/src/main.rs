@@ -8,7 +8,7 @@ use axum::{
     Json, Router,
 };
 use clap::{Parser, Subcommand};
-use rfq_btc::MockBitcoinClient;
+use rfq_btc::{BitcoinClient, ElectrumClient, MockBitcoinClient};
 use rfq_client::{RfqClient, Url};
 use rfq_maker::{Maker, RebalancePolicy};
 use rfq_rgb::{LibRgbBackend, MockRgbBackend, RgbBackend};
@@ -281,8 +281,10 @@ async fn build_maker(config: &MakerNodeConfig) -> Result<Maker, Box<dyn std::err
             .unwrap_or_else(|| "rgb-test-asset".to_owned()),
     };
 
-    let (utxos, rgb_backend): (Vec<RgbInventoryUtxo>, Arc<dyn RgbBackend>) = match &config.rgb {
+    match &config.rgb {
         Some(rgb_cfg) => {
+            // Production-ish path: real RGB stash + real electrum-backed
+            // chain access + real wallet-derived BTC inventory.
             let backend = LibRgbBackend::new(
                 rgb_cfg.data_dir.clone(),
                 rgb_cfg.wallet_name.clone(),
@@ -291,34 +293,41 @@ async fn build_maker(config: &MakerNodeConfig) -> Result<Maker, Box<dyn std::err
                 rgb_cfg.signer_account_file.clone(),
                 rgb_cfg.signer_password.clone(),
             );
-            let utxos = backend.list_inventory_utxos(&asset).await?;
-            (utxos, Arc::new(backend))
+            let rgb_utxos = backend.list_inventory_utxos(&asset).await?;
+            let now_ms = now_ms();
+            let btc_inventory = backend.list_btc_only_utxos(&asset, now_ms).await?;
+            let bitcoin_client: Arc<dyn BitcoinClient> =
+                Arc::new(ElectrumClient::connect(&rgb_cfg.electrum_url)?);
+            let rgb_backend: Arc<dyn RgbBackend> = Arc::new(backend);
+            Ok(Maker::new(maker_id, rgb_utxos, rgb_backend, bitcoin_client)
+                .with_btc_inventory(btc_inventory))
         }
         None => {
+            // Mock fallback: useful for tests + the `maker-node` demo runs
+            // without infra. Seeds a single RGB allocation and the
+            // deterministic mock BTC inventory the docs/swap-flows.md
+            // round trip walks through.
             let utxo = RgbInventoryUtxo {
                 outpoint: Outpoint::new(format!("{:064x}", 0u64), 0),
                 asset_id: asset,
                 amount: 1_000_000,
                 btc_sats: 0,
             };
-            let backend = MockRgbBackend::new(vec![utxo.clone()]);
-            (vec![utxo], Arc::new(backend))
+            let rgb_backend: Arc<dyn RgbBackend> = Arc::new(MockRgbBackend::new(vec![utxo.clone()]));
+            let bitcoin_client = Arc::new(MockBitcoinClient::new());
+            bitcoin_client.seed_address_unspent("bcrt1qtaker", mock_taker_funding());
+            Ok(Maker::new(maker_id, vec![utxo], rgb_backend, bitcoin_client)
+                .with_btc_inventory(mock_btc_inventory()))
         }
-    };
+    }
+}
 
-    // 15c wires a BitcoinClient into the maker for broadcast + feerate
-    // estimation. maker-node runs against a mock until the electrum-backed
-    // client is wired through config (#15b follow-up).
-    let bitcoin_client = Arc::new(MockBitcoinClient::new());
-    // Demo buy side: seed the taker's declared funding address so
-    // `list_unspent` returns spendable UTXOs. A real deployment uses an
-    // electrum-backed client that queries the chain instead.
-    bitcoin_client.seed_address_unspent("bcrt1qtaker", mock_taker_funding());
-    // 16c: seed mock BTC inventory so the node can also serve the sell side.
-    // A real maker resolves these from a wallet bootstrap; the demo round
-    // trip in docs/swap-flows.md uses these deterministic outpoints.
-    Ok(Maker::new(maker_id, utxos, rgb_backend, bitcoin_client)
-        .with_btc_inventory(mock_btc_inventory()))
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Demo buy side: a single large UTXO at the taker's declared funding address,

@@ -1,13 +1,11 @@
 //! Electrum-backed `BitcoinClient`. Gated behind the `electrum` feature so the
 //! default build doesn't pull rustls or any networking dep.
 //!
-//! `broadcast`, `estimate_feerate`, and `block_height` are wired through.
-//! `get_outpoint` is stubbed for 15b: the implementation needs a bitcoin tx
-//! parser to extract a single output's `(value_sats, script_pubkey)` from a
-//! raw transaction returned by `blockchain.transaction.get`. We deliberately
-//! don't pull `bitcoin` or `bp-std` into this crate (see crate-level doc); the
-//! parsing lands in 15c alongside the PSBT-build code that already imports
-//! bp-std.
+//! All five trait methods are wired through. `get_outpoint` reuses the
+//! `bitcoin` types already vendored by `electrum-client` (via
+//! `electrum_client::bitcoin::Transaction`) — we don't need a separate
+//! bp-std/bitcoin dep at the rfq-btc layer since electrum-client carries
+//! one transitively.
 //!
 //! The blocking `electrum-client` calls are wrapped in
 //! `tokio::task::spawn_blocking` so the trait's `async fn` contract is honored
@@ -18,10 +16,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use electrum_client::bitcoin::address::{Address, NetworkUnchecked};
+use electrum_client::bitcoin::Txid;
 use electrum_client::{Client, ConfigBuilder, ElectrumApi};
 use rfq_types::Outpoint;
 
-use crate::{BitcoinClient, BtcError, TxOut};
+use crate::{is_segwit_script, BitcoinClient, BtcError, TxOut};
 
 pub struct ElectrumClient {
     client: Arc<Client>,
@@ -43,13 +42,38 @@ impl ElectrumClient {
 
 #[async_trait]
 impl BitcoinClient for ElectrumClient {
-    async fn get_outpoint(&self, _outpoint: &Outpoint) -> Result<TxOut, BtcError> {
-        // 15c will implement: fetch raw tx via blockchain.transaction.get,
-        // parse output at vout, return (value_sats, script_pubkey). Needs a
-        // bitcoin-tx parser which lives behind the bp-std boundary in rfq-rgb.
-        Err(BtcError::Backend(
-            "ElectrumClient::get_outpoint not yet wired (#15c follow-up)".to_owned(),
-        ))
+    async fn get_outpoint(&self, outpoint: &Outpoint) -> Result<TxOut, BtcError> {
+        // `blockchain.transaction.get` returns the full witness tx; we just
+        // grab the requested output. Reuses the `bitcoin` crate already
+        // vendored by electrum-client (no new dep at this layer).
+        let txid = Txid::from_str(&outpoint.txid)
+            .map_err(|e| BtcError::Backend(format!("invalid txid {}: {e}", outpoint.txid)))?;
+        let vout = outpoint.vout;
+
+        let client = Arc::clone(&self.client);
+        let tx = tokio::task::spawn_blocking(move || client.transaction_get(&txid))
+            .await
+            .map_err(|e| BtcError::Backend(format!("blocking task join: {e}")))?
+            .map_err(|e| {
+                BtcError::Backend(format!("electrum transaction_get {}: {e}", outpoint.txid))
+            })?;
+
+        let txout = tx.output.get(vout as usize).ok_or_else(|| {
+            BtcError::OutpointNotFound(format!("vout {vout} out of bounds for {}", outpoint.txid))
+        })?;
+
+        let script_bytes = txout.script_pubkey.to_bytes();
+        if !is_segwit_script(&script_bytes) {
+            return Err(BtcError::NonSegwitOutpoint(format!(
+                "{}:{vout}",
+                outpoint.txid
+            )));
+        }
+
+        Ok(TxOut {
+            value_sats: txout.value.to_sat(),
+            script_pubkey: script_bytes,
+        })
     }
 
     async fn list_unspent(&self, address: &str) -> Result<Vec<(Outpoint, TxOut)>, BtcError> {

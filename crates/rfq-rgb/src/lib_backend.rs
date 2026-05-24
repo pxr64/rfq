@@ -124,6 +124,71 @@ impl LibRgbBackend {
             .map_err(|e| RgbError::TransferBuild(format!("load signer account: {e}")))
     }
 
+    /// Wallet-derived BTC inventory: every spendable wallet UTXO that is
+    /// **not** carrying an RGB allocation for `asset`. Replaces the hardcoded
+    /// `mock_btc_inventory()` in `maker-node/src/main.rs`. Each returned
+    /// [`BtcInventoryUtxo`] is `Available` (the maker's reservation state
+    /// machine assigns the other statuses).
+    ///
+    /// scriptPubkey is derived from the wallet descriptor + the UTXO's
+    /// terminal — same path `swap::enrich_psbt_input` uses on the maker
+    /// side, so the bytes round-trip cleanly into PSBT inputs.
+    pub async fn list_btc_only_utxos(
+        &self,
+        asset: &AssetId,
+        now_ms: u64,
+    ) -> Result<Vec<rfq_types::BtcInventoryUtxo>, RgbError> {
+        use bpstd::Derive as _;
+        let wallet = self.load_wallet()?;
+        let contract_id = ContractId::from_str(&asset.id)
+            .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
+
+        // Build the set of outpoints carrying RGB for `contract_id` in this
+        // maker's wallet (matches `list_inventory_utxos`'s filter).
+        let mut rgb_outpoints: std::collections::HashSet<(String, u32)> =
+            std::collections::HashSet::new();
+        if let Ok(contract) = wallet.stock().contract_data(contract_id) {
+            let filter = FilterIncludeAll;
+            for details in contract.schema.owned_types.values() {
+                if let Ok(allocs) = contract.fungible(details.name.clone(), &filter) {
+                    for alloc in allocs {
+                        let op = alloc.seal.to_outpoint();
+                        rgb_outpoints.insert((op.txid.to_string(), op.vout.into_u32()));
+                    }
+                }
+            }
+        }
+
+        let descriptor = wallet.wallet().descriptor().clone();
+        let mut btc = Vec::new();
+        for u in wallet.wallet().utxos() {
+            let key = (u.outpoint.txid.to_string(), u.outpoint.vout.into_u32());
+            if rgb_outpoints.contains(&key) {
+                continue;
+            }
+            let derived = descriptor
+                .derive(u.terminal.keychain, u.terminal.index)
+                .next()
+                .ok_or_else(|| {
+                    RgbError::TransferBuild("descriptor produced no script".to_owned())
+                })?;
+            let spk: Vec<u8> = derived.to_script_pubkey().as_slice().to_vec();
+            btc.push(rfq_types::BtcInventoryUtxo {
+                outpoint: Outpoint {
+                    txid: key.0,
+                    vout: key.1,
+                },
+                value_sats: u.value.sats(),
+                script_pubkey: spk,
+                status: rfq_types::BtcInventoryStatus::Available,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                pending_txid: None,
+            });
+        }
+        Ok(btc)
+    }
+
     #[allow(dead_code)]
     fn parse_network(&self) -> Result<Network, RgbError> {
         match self.network.as_str() {

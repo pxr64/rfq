@@ -7,7 +7,7 @@ version.workspace = true
 [dependencies]
 axum.workspace = true
 clap.workspace = true
-rfq-btc = { path = "../rfq-btc" }
+rfq-btc = { path = "../rfq-btc", features = ["electrum"] }
 rfq-client = { path = "../rfq-client" }
 rfq-maker = { path = "../rfq-maker" }
 rfq-rgb = { path = "../rfq-rgb" }
