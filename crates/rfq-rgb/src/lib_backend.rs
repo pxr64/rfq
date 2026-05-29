@@ -4,6 +4,7 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, SwapTransfer};
 
+use bpstd::psbt::Psbt;
 use bpstd::{Network, Sats, Txid, XprivAccount, XpubDerivable};
 use bpwallet::fs::FsTextStore;
 use bpwallet::hot::SecureIo;
@@ -745,5 +746,42 @@ impl RgbBackend for LibRgbBackend {
         // 6. Encode the partial PSBT for the wire (no consignment — taker's
         //    own consignment is already on the maker side).
         swap::encode_swap_transfer_sell(&psbt, witness_id)
+    }
+
+    async fn verify_signed_swap_psbt(
+        &self,
+        signed_psbt_base64: &str,
+        consigned_outpoints: &[Outpoint],
+        expected_witness_txid: &str,
+    ) -> Result<(), RgbError> {
+        // Decode the real PSBT and compare structurally — prevouts live as raw
+        // (byte-reversed) bytes, never the ASCII `txid:vout` string the mock
+        // embeds, so the maker's old substring scan never matched here.
+        let psbt = Psbt::from_base64(signed_psbt_base64)
+            .map_err(|e| RgbError::TransferBuild(format!("decode signed PSBT: {e}")))?;
+
+        let spent: std::collections::HashSet<(String, u32)> = psbt
+            .inputs()
+            .map(|inp| {
+                (
+                    inp.previous_outpoint.txid.to_string(),
+                    inp.previous_outpoint.vout.into_u32(),
+                )
+            })
+            .collect();
+        for outpoint in consigned_outpoints {
+            if !spent.contains(&(outpoint.txid.clone(), outpoint.vout)) {
+                return Err(RgbError::TransferBuild(
+                    "input set diverged from consignment".to_owned(),
+                ));
+            }
+        }
+
+        // The unsigned-tx txid is fixed at build time (every input was committed
+        // before signing — D3 invariant), so a divergent txid means tampering.
+        if psbt.txid().to_string() != expected_witness_txid {
+            return Err(RgbError::TransferBuild("txid mismatch".to_owned()));
+        }
+        Ok(())
     }
 }

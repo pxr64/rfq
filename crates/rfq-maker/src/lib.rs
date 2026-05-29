@@ -805,30 +805,25 @@ impl Maker {
             ));
         }
 
-        // Bait-and-switch guard: the signed PSBT must still spend every
-        // outpoint the validated consignment named.
-        for outpoint in &built.consigned_outpoints {
-            if !signed_psbt_base64.contains(&outpoint.to_string()) {
-                let _ = self
-                    .btc_store
-                    .mark_broadcast_failed(&btc_reservation_id, now_ms())
-                    .await;
-                self.pending.write().await.remove(&quote_id);
-                return Err(RouterError::PsbtInvalid(
-                    "input set diverged from consignment".to_owned(),
-                ));
-            }
-        }
-
-        // The witness txid was committed at PSBT-build time; a signed PSBT
-        // that no longer carries it has been tampered with.
-        if !signed_psbt_base64.contains(&built.expected_witness_txid) {
+        // Bait-and-switch + txid guard: the signed PSBT must still spend every
+        // outpoint the validated consignment named and still commit to the
+        // witness txid fixed at build time. Delegated to the backend so the
+        // check works on real (base64) PSBTs, not just the mock's plaintext.
+        if let Err(e) = self
+            .rgb_backend
+            .verify_signed_swap_psbt(
+                &signed_psbt_base64,
+                &built.consigned_outpoints,
+                &built.expected_witness_txid,
+            )
+            .await
+        {
             let _ = self
                 .btc_store
                 .mark_broadcast_failed(&btc_reservation_id, now_ms())
                 .await;
             self.pending.write().await.remove(&quote_id);
-            return Err(RouterError::PsbtInvalid("txid mismatch".to_owned()));
+            return Err(RouterError::PsbtInvalid(e.to_string()));
         }
 
         let finalized = match self

@@ -200,6 +200,21 @@ pub trait RgbBackend: Send + Sync {
         gross_btc_sats: u64,
         actual_fee_sats: u64,
     ) -> Result<SwapTransfer, RgbError>;
+
+    /// Sell-side `/sign` guard: confirm a taker-signed swap PSBT still spends
+    /// every RGB outpoint the validated consignment named (`consigned_outpoints`)
+    /// and still commits to the witness txid fixed at build time
+    /// (`expected_witness_txid`). Replaces the maker's old substring scan of the
+    /// PSBT string, which only worked against the mock backend's plaintext
+    /// PSBTs — a real base64 PSBT carries prevouts as raw (byte-reversed) bytes,
+    /// never as the ASCII `txid:vout` form. `Err(TransferBuild)` carries the
+    /// human-readable reason; the maker maps it to a 400.
+    async fn verify_signed_swap_psbt(
+        &self,
+        signed_psbt_base64: &str,
+        consigned_outpoints: &[Outpoint],
+        expected_witness_txid: &str,
+    ) -> Result<(), RgbError>;
 }
 
 #[derive(Debug, Clone)]
@@ -435,6 +450,28 @@ impl RgbBackend for MockRgbBackend {
             // none of its own to hand back.
             consignment: None,
         })
+    }
+
+    async fn verify_signed_swap_psbt(
+        &self,
+        signed_psbt_base64: &str,
+        consigned_outpoints: &[Outpoint],
+        expected_witness_txid: &str,
+    ) -> Result<(), RgbError> {
+        // Mock PSBTs are plaintext: the consigned outpoints appear as
+        // `txid:vout` inside `rgb_in=[...]` and the witness id after `:wt=`.
+        // This mirrors the substring guard that used to live in rfq-maker.
+        for outpoint in consigned_outpoints {
+            if !signed_psbt_base64.contains(&outpoint.to_string()) {
+                return Err(RgbError::TransferBuild(
+                    "input set diverged from consignment".to_owned(),
+                ));
+            }
+        }
+        if !signed_psbt_base64.contains(expected_witness_txid) {
+            return Err(RgbError::TransferBuild("txid mismatch".to_owned()));
+        }
+        Ok(())
     }
 }
 
