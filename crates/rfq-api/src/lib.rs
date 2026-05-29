@@ -121,6 +121,18 @@ pub fn app_with_state(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Build the broker router from a prebuilt set of maker connectors — e.g.
+/// `HttpMakerConnector`s pointed at remote `colorex maker up` daemons —
+/// instead of the in-process mock makers [`app`] seeds. The quote store
+/// starts empty. Routing is unchanged: handlers match each request's stored
+/// `quote.maker_id` against this list.
+pub fn app_with_makers(makers: Vec<Arc<dyn MakerConnector>>) -> Router {
+    app_with_state(AppState {
+        makers,
+        store: InMemoryQuoteStore::new(),
+    })
+}
+
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_owned(),

@@ -40,3 +40,5 @@ bp-std = { version = "=0.11.1-alpha.2", features = ["client-side-validation", "s
 bp-wallet = { version = "=0.11.1-alpha.2", features = ["fs", "signers", "electrum"] }
 # Reach into the maker_app via HTTP in the regtest integration test.
 reqwest.workspace = true
+# Spin up the broker in-process for the broker_round_trip test.
+rfq-api = { path = "../rfq-api" }

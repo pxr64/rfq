@@ -20,7 +20,7 @@ use rgb::resolvers::AnyResolver;
 use rgb::validation::{ResolveWitness, ValidationConfig, Validity};
 use rgb::{
     AssignmentsRef, BundleId, ChainNet, ContractId, Genesis, GraphSeal, Operation, OpId, RgbDescr,
-    RgbKeychain, RgbWallet, SecretSeal, StateType, Transition, TxoSeal,
+    RgbKeychain, RgbWallet, SecretSeal, StateType, Transition, TransferParams, TxoSeal,
 };
 
 use crate::swap;
@@ -156,6 +156,33 @@ impl LibRgbBackend {
             )));
         }
         Ok(())
+    }
+
+    /// Build a unilateral RGB transfer to `recipient_invoice`, returning the
+    /// base64 consignment. This is the taker's sell-side action: it hands the
+    /// maker a consignment that the maker validates and anchors into the swap
+    /// tx. The taker does NOT broadcast the PSBT `pay()` returns — only the
+    /// maker broadcasts, via its own swap composition. `wallet.pay` is the same
+    /// primitive `rgb transfer` (rgb-cmd) uses; the wallet records the
+    /// (tentative) transfer in its stash and autosaves on drop.
+    pub async fn create_transfer_to_invoice(
+        &self,
+        recipient_invoice: &str,
+        fee_sats: u64,
+    ) -> Result<String, RgbError> {
+        let invoice = RgbInvoice::from_str(recipient_invoice).map_err(|_| RgbError::InvalidInvoice)?;
+        // `min_amount` is the witness-vout beneficiary dust floor; maker swap
+        // invoices use blinded seals (no witness vout), so 546 is a safe nominal.
+        let params = TransferParams::with(Sats(fee_sats), Sats(546));
+        let mut wallet = self.load_wallet()?;
+        let (_psbt, _meta, transfer) = wallet
+            .pay(&invoice, params)
+            .map_err(|e| RgbError::TransferBuild(format!("pay: {e}")))?;
+        let mut bytes = Vec::new();
+        transfer
+            .save(&mut bytes)
+            .map_err(|e| RgbError::TransferBuild(format!("serialize consignment: {e}")))?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
     }
 
     /// Wallet-derived BTC inventory: every spendable wallet UTXO that is

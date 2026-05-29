@@ -1628,6 +1628,7 @@ dependencies = [
  "humantime-serde",
  "rand 0.8.6",
  "reqwest",
+ "rfq-api",
  "rfq-btc",
  "rfq-client",
  "rfq-maker",

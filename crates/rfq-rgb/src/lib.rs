@@ -9,8 +9,10 @@ use thiserror::Error;
 
 mod lib_backend;
 mod swap;
+mod taker;
 pub use lib_backend::LibRgbBackend;
 pub use swap::enrich_psbt_input;
+pub use taker::Taker;
 
 /// Self-bootstrapping regtest harness shared across rfq-rgb's own e2e
 /// tests and dependent crates' tests (e.g. maker-node's HTTP-layer

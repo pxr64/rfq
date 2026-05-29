@@ -24,7 +24,7 @@ use std::str::FromStr;
 
 use bpstd::psbt::Psbt;
 use bpstd::signers::TestnetRefSigner;
-use bpstd::{ConsensusEncode, Derive, HardenedIndex, Sats, Terminal, XprivAccount, XpubDerivable};
+use bpstd::{ConsensusEncode, HardenedIndex, XprivAccount, XpubDerivable};
 use bpwallet::fs::FsTextStore;
 use bpwallet::hot::{SecureIo, Seed, SeedType};
 use bpwallet::{Bip43, Wallet as BpWallet};
@@ -34,7 +34,7 @@ use rgb::RgbDescr;
 
 // Was `use rfq_rgb::{...}` when this file lived in tests/common/mod.rs;
 // it's now part of rfq-rgb's lib, so refer to siblings via `crate::`.
-use crate::{ContractId, LibRgbBackend, RgbBackend, TxOut};
+use crate::{ContractId, LibRgbBackend, RgbBackend, Taker, TxOut};
 use tempfile::TempDir;
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
 
@@ -377,10 +377,10 @@ impl<'a> TakerGuard<'a> {
         &self,
         asset: &rfq_types::AssetId,
     ) -> Result<Vec<rfq_types::RgbInventoryUtxo>, String> {
-        self.lib_backend()
-            .list_inventory_utxos(asset)
+        self.taker()
+            .inventory(asset)
             .await
-            .map_err(|e| format!("taker list_inventory_utxos: {e}"))
+            .map_err(|e| e.to_string())
     }
 
     /// Mint a fresh RGB invoice on the taker's stash. The sell round-trip
@@ -393,10 +393,10 @@ impl<'a> TakerGuard<'a> {
         asset: &rfq_types::AssetId,
         amount: u64,
     ) -> Result<String, String> {
-        self.lib_backend()
+        self.taker()
             .create_invoice(asset, amount)
             .await
-            .map_err(|e| format!("taker create_invoice: {e}"))
+            .map_err(|e| e.to_string())
     }
 
     /// Refresh the taker's bp-wallet UTXO cache against electrum so
@@ -404,14 +404,16 @@ impl<'a> TakerGuard<'a> {
     /// become visible to `spare_btc_input` / `lookup_prevout`. Mirrors
     /// `LibRgbBackend::sync_wallet` on the maker side.
     pub async fn sync_wallet(&self) -> Result<(), String> {
-        self.lib_backend()
+        self.taker()
             .sync_wallet()
             .await
-            .map_err(|e| format!("taker sync_wallet: {e}"))
+            .map_err(|e| e.to_string())
     }
 
-    fn lib_backend(&self) -> LibRgbBackend {
-        LibRgbBackend::new(
+    /// The production [`Taker`] backing this guard. Every op delegates here;
+    /// the guard only adds the shared-backend mutex (held in `_guard`).
+    fn taker(&self) -> Taker {
+        Taker::new(
             self.stash_dir.clone(),
             "taker".to_owned(),
             "regtest".to_owned(),
@@ -421,33 +423,25 @@ impl<'a> TakerGuard<'a> {
         )
     }
 
+    /// Build the taker's sell consignment in-process (unilateral RGB transfer
+    /// to the maker's invoice) — the counterpart to
+    /// `RegtestStack::taker_consignment_for`'s `rgb transfer` shell-out.
+    pub async fn create_transfer_to_invoice(
+        &self,
+        recipient_invoice: &str,
+        fee_sats: u64,
+    ) -> Result<String, String> {
+        self.taker()
+            .create_transfer_to_invoice(recipient_invoice, fee_sats)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// Look up a specific taker UTXO and return its (Outpoint, TxOut). Used
     /// by the sell round-trip to build `taker_rgb_prevouts` from the
     /// outpoints the validated consignment reports.
     pub fn lookup_prevout(&self, want: &Outpoint) -> Result<(Outpoint, TxOut), String> {
-        let provider = FsTextStore::new(self.stash_dir.join("regtest").join("taker"))
-            .map_err(|e| format!("taker wallet provider: {e}"))?;
-        let wallet: BpWallet<XpubDerivable, RgbDescr> =
-            BpWallet::load(provider, true).map_err(|e| format!("taker wallet load: {e}"))?;
-        let utxo = wallet
-            .utxos()
-            .find(|u| {
-                u.outpoint.txid.to_string() == want.txid && u.outpoint.vout.into_u32() == want.vout
-            })
-            .ok_or_else(|| format!("taker outpoint {want} not in wallet"))?;
-        let derived = wallet
-            .descriptor()
-            .derive(utxo.terminal.keychain, utxo.terminal.index)
-            .next()
-            .ok_or_else(|| "descriptor produced no script".to_owned())?;
-        let spk: Vec<u8> = derived.to_script_pubkey().as_slice().to_vec();
-        Ok((
-            want.clone(),
-            TxOut {
-                value_sats: utxo.value.sats(),
-                script_pubkey: spk,
-            },
-        ))
+        self.taker().lookup_prevout(want).map_err(|e| e.to_string())
     }
 
     /// Any taker-controlled UTXO that does **not** carry an RGB allocation
@@ -465,42 +459,10 @@ impl<'a> TakerGuard<'a> {
         &self,
         asset: &rfq_types::AssetId,
     ) -> Result<(Outpoint, TxOut), String> {
-        use bpstd::Derive as _;
-        let rgb_utxos = self.inventory(asset).await?;
-        let rgb_set: std::collections::HashSet<(String, u32)> = rgb_utxos
-            .iter()
-            .map(|u| (u.outpoint.txid.clone(), u.outpoint.vout))
-            .collect();
-
-        let provider = FsTextStore::new(self.stash_dir.join("regtest").join("taker"))
-            .map_err(|e| format!("taker wallet provider: {e}"))?;
-        let wallet: BpWallet<XpubDerivable, RgbDescr> =
-            BpWallet::load(provider, true).map_err(|e| format!("taker wallet load: {e}"))?;
-        let descriptor = wallet.descriptor().clone();
-        let utxo = wallet
-            .utxos()
-            .find(|u| {
-                let key = (u.outpoint.txid.to_string(), u.outpoint.vout.into_u32());
-                !rgb_set.contains(&key)
-            })
-            .ok_or_else(|| {
-                "no spare taker BTC outpoint — every wallet UTXO is RGB-bearing".to_owned()
-            })?;
-        let derived = descriptor
-            .derive(utxo.terminal.keychain, utxo.terminal.index)
-            .next()
-            .ok_or_else(|| "descriptor produced no script".to_owned())?;
-        let spk: Vec<u8> = derived.to_script_pubkey().as_slice().to_vec();
-        Ok((
-            Outpoint {
-                txid: utxo.outpoint.txid.to_string(),
-                vout: utxo.outpoint.vout.into_u32(),
-            },
-            TxOut {
-                value_sats: utxo.value.sats(),
-                script_pubkey: spk,
-            },
-        ))
+        self.taker()
+            .spare_btc_input(asset)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Enrich every PSBT input whose `prev_output` belongs to the taker
@@ -519,60 +481,9 @@ impl<'a> TakerGuard<'a> {
     /// carrying `partial_sigs`) are left untouched for the maker's own
     /// finalize step.
     pub fn sign_and_finalize(&self, partial_psbt_b64: &str) -> Result<String, String> {
-        let provider = FsTextStore::new(self.stash_dir.join("regtest").join("taker"))
-            .map_err(|e| format!("taker wallet provider: {e}"))?;
-        let wallet: BpWallet<XpubDerivable, RgbDescr> =
-            BpWallet::load(provider, true).map_err(|e| format!("taker wallet load: {e}"))?;
-        let descriptor = wallet.descriptor().clone();
-        // Index the wallet's UTXOs by (txid, vout) so we can match against
-        // each PSBT input's prev_output in O(1).
-        let owned: std::collections::HashMap<(String, u32), (Terminal, Sats)> = wallet
-            .utxos()
-            .map(|u| {
-                (
-                    (u.outpoint.txid.to_string(), u.outpoint.vout.into_u32()),
-                    (u.terminal, u.value),
-                )
-            })
-            .collect();
-
-        let account = XprivAccount::read(&self.account_file, "")
-            .map_err(|e| format!("taker account read: {e}"))?;
-        let mut psbt =
-            Psbt::from_base64(partial_psbt_b64).map_err(|e| format!("decode partial PSBT: {e}"))?;
-
-        // Snapshot the prev_outs first — we need &mut psbt to enrich and
-        // can't borrow the inputs iterator across the mutation.
-        let prev_outs: Vec<(usize, String, u32)> = psbt
-            .inputs()
-            .enumerate()
-            .map(|(i, inp)| {
-                (
-                    i,
-                    inp.previous_outpoint.txid.to_string(),
-                    inp.previous_outpoint.vout.into_u32(),
-                )
-            })
-            .collect();
-        let mut enriched = 0usize;
-        for (i, txid, vout) in prev_outs {
-            if let Some((terminal, value)) = owned.get(&(txid, vout)).cloned() {
-                crate::enrich_psbt_input(&mut psbt, i, &descriptor, terminal, value)
-                    .map_err(|e| format!("enrich taker input {i}: {e}"))?;
-                enriched += 1;
-            }
-        }
-        if enriched == 0 {
-            return Err("no PSBT input matched a taker UTXO; check funding".to_owned());
-        }
-
-        let signer = TestnetRefSigner::new(&account);
-        let sig_count = psbt.sign(&signer).map_err(|e| format!("taker sign: {e}"))?;
-        if sig_count == 0 {
-            return Err("taker signer matched no inputs after enrichment".to_owned());
-        }
-        psbt.finalize(&descriptor);
-        Ok(psbt.to_base64())
+        self.taker()
+            .sign_and_finalize(partial_psbt_b64)
+            .map_err(|e| e.to_string())
     }
 }
 
