@@ -15,13 +15,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use bpstd::psbt::Psbt;
+use bpstd::psbt::{Psbt, PsbtConstructor};
 use bpstd::signers::TestnetRefSigner;
-use bpstd::{Derive, Sats, Terminal, XprivAccount, XpubDerivable};
+use bpstd::{Derive, Keychain, Sats, Terminal, XprivAccount, XpubDerivable};
 use bpwallet::fs::FsTextStore;
 use bpwallet::hot::SecureIo;
 use bpwallet::Wallet as BpWallet;
-use psrgbt::PsbtConstructor;
 use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo};
 use rgb::RgbDescr;
 

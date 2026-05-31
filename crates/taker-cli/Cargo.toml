@@ -1,0 +1,18 @@
+[package]
+name = "taker-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "colorex-taker"
+path = "src/main.rs"
+
+[dependencies]
+rfq-types = { path = "../rfq-types" }
+rfq-rgb = { path = "../rfq-rgb" }
+rfq-client = { path = "../rfq-client" }
+tokio.workspace = true
+clap = { workspace = true, features = ["derive"] }
+serde.workspace = true
+toml.workspace = true

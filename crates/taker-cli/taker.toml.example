@@ -1,0 +1,17 @@
+broker_url = "http://127.0.0.1:3000"
+
+# The taker's own keychain-0 BTC address. Used as the buy-side funding address
+# (fund THIS address before `buy`) and the sell-side payout address. Get it via:
+#   rgb -n regtest -d <data_dir> -w taker address -k 0
+btc_address = "bcrt1q..."
+
+[rgb]
+network      = "regtest"
+data_dir     = "/path/to/rgb-rfq/infra/regtest/data/taker"
+wallet_name  = "taker"
+electrum_url = "localhost:50001"
+contract_id  = "rgb:..."
+
+[rgb.signer]
+account_file = "/path/to/rgb-rfq/infra/regtest/wallets/taker.account"
+password     = ""

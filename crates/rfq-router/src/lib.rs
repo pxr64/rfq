@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
-use reqwest::Url;
+pub use reqwest::Url;
 use rfq_core::{is_quote_expired, sort_quotes_best_price, validate_quote_request, RfqCoreError};
 use rfq_types::{AcceptQuoteRequest, MakerId, Quote, QuoteId, QuoteRequest, SettlementIntent};
 use thiserror::Error;
