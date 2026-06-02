@@ -88,6 +88,73 @@ impl LibRgbBackend {
         Stock::load(provider, true).map_err(|e| RgbError::StashLoad(e.to_string()))
     }
 
+    /// Validate an incoming consignment and absorb it into *this* wallet's
+    /// stash. The receiver-side counterpart of [`Self::validate_incoming_consignment`]
+    /// (which is maker/sender oriented and also extracts the sender's input
+    /// outpoints): a taker calls this to record RGB it just received — tokens
+    /// bought (buy: the maker→taker transfer) or change from a sell (the
+    /// maker-emitted transfer to the taker's change seal). It only needs the
+    /// transfer accepted, so it skips `extract_input_outpoints` entirely.
+    ///
+    /// The consignment self-carries its witness txes (`add_consignment_txes`),
+    /// so acceptance succeeds even before the swap tx confirms; the absorbed
+    /// allocation surfaces in `list_inventory_utxos` once the witness is mined
+    /// and `sync_wallet` has refreshed the UTXO cache. `Stock::load(_, true)`
+    /// autosaves on drop, so the accepted state persists.
+    pub async fn accept_incoming_transfer(
+        &self,
+        consignment_base64: &str,
+        expected_contract_id: ContractId,
+    ) -> Result<(), RgbError> {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(consignment_base64.trim())
+            .map_err(|e| {
+                RgbError::TransferBuild(format!("consignment is not valid base64: {e}"))
+            })?;
+
+        let consignment = Transfer::load(bytes.as_slice())
+            .map_err(|e| RgbError::TransferBuild(format!("consignment decode: {e}")))?;
+
+        if consignment.contract_id() != expected_contract_id {
+            return Err(RgbError::TransferBuild(format!(
+                "consignment contract {} does not match expected {}",
+                consignment.contract_id(),
+                expected_contract_id
+            )));
+        }
+
+        let mut stock = self.load_stock()?;
+        let mut resolver = self.resolver()?;
+        resolver.add_consignment_txes(&consignment);
+
+        let validation_config = ValidationConfig {
+            chain_net: chain_net_for(self.parse_network()?),
+            trusted_typesystem: stock
+                .as_stash_provider()
+                .type_system()
+                .map_err(|e| RgbError::StashLoad(format!("type system: {e}")))?
+                .clone(),
+            ..Default::default()
+        };
+
+        let validated = consignment
+            .validate(&resolver, &validation_config)
+            .map_err(|e| RgbError::TransferBuild(format!("consignment validation: {e:?}")))?;
+
+        if validated.validation_status().validity() != Validity::Valid {
+            return Err(RgbError::TransferBuild(format!(
+                "consignment invalid: {}",
+                validated.validation_status()
+            )));
+        }
+
+        stock
+            .accept_transfer(validated, &resolver)
+            .map_err(|e| RgbError::StashLoad(format!("accept_transfer: {e}")))?;
+
+        Ok(())
+    }
+
     /// Load the full RGB wallet: a `bp-wallet` `Wallet<XpubDerivable, RgbDescr>`
     /// wrapped with the maker's `Stock`. The wallet descriptor must already
     /// exist on disk (e.g. via `make rgb-wallets-init` + `rgb create --wpkh`).
@@ -726,26 +793,38 @@ impl RgbBackend for LibRgbBackend {
         // 3. Build the RGB transition: spend the taker's allocations (visible
         //    in the maker's stash since `validate_incoming_consignment` ran
         //    `accept_transfer`), deliver to the maker's seal, route any
-        //    over-consigned surplus to the taker's change seal.
-        let batch = swap::build_sell_transition(&wallet, &inputs, consignment_info)?;
+        //    over-consigned surplus to the taker's change seal. `has_change`
+        //    flags whether a change allocation was added.
+        let (batch, has_change) = swap::build_sell_transition(&wallet, &inputs, consignment_info)?;
 
-        // 4. Embed + commit the transition. The maker's emitted transfer is
-        //    discarded — the taker built and submitted its own at /consignment.
-        let (_transfer, witness_id) = swap::commit_and_consign(
+        // 4. Embed + commit the transition. Deliver the maker-emitted transfer to
+        //    the taker's CHANGE seal (anchored to the real swap witness) so the
+        //    taker can accept its RGB change post-broadcast. With no surplus there
+        //    is no change seal to address, so deliver to the maker's seal and emit
+        //    no taker consignment (the taker's input was fully spent to the maker).
+        let delivery_seal = if has_change {
+            inputs
+                .taker_change_seal
+                .expect("has_change implies a change seal")
+        } else {
+            inputs.maker_seal
+        };
+        let (transfer, witness_id) = swap::commit_and_consign(
             &mut wallet,
             &mut psbt,
             batch,
             inputs.contract_id,
-            inputs.maker_seal,
+            delivery_seal,
         )?;
 
         // 5. Sign the maker's BTC inputs (after commit — U4); taker RGB inputs
         //    stay open for /sign.
         swap::sign_maker_inputs(&mut psbt, &account)?;
 
-        // 6. Encode the partial PSBT for the wire (no consignment — taker's
-        //    own consignment is already on the maker side).
-        swap::encode_swap_transfer_sell(&psbt, witness_id)
+        // 6. Encode the partial PSBT for the wire, attaching the taker's
+        //    change consignment when there was surplus.
+        let change_consignment = has_change.then_some(&transfer);
+        swap::encode_swap_transfer_sell(&psbt, witness_id, change_consignment)
     }
 
     async fn verify_signed_swap_psbt(

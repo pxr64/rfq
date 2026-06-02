@@ -12,6 +12,7 @@ members = [
     "crates/rfq-wallet",
     "crates/maker-node",
     "crates/wallet-wasm",
+    "crates/taker-cli",
 ]
 resolver = "2"
 

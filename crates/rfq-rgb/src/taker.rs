@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use bpstd::psbt::{Psbt, PsbtConstructor};
 use bpstd::signers::TestnetRefSigner;
@@ -22,7 +23,7 @@ use bpwallet::fs::FsTextStore;
 use bpwallet::hot::SecureIo;
 use bpwallet::Wallet as BpWallet;
 use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo};
-use rgb::RgbDescr;
+use rgb::{ContractId, RgbDescr};
 
 use crate::{enrich_psbt_input, LibRgbBackend, RgbBackend, RgbError, TxOut};
 
@@ -96,6 +97,23 @@ impl Taker {
     /// `lookup_prevout` / `sign_and_finalize`.
     pub async fn sync_wallet(&self) -> Result<(), RgbError> {
         self.lib_backend().sync_wallet().await
+    }
+
+    /// Absorb a maker-returned consignment into the taker's stash so the RGB it
+    /// just received becomes visible: tokens bought (buy) or change from a sell.
+    /// The maker hands this back as `SettlementIntent.final_consignment` after
+    /// broadcasting the swap tx. The allocation surfaces in [`Self::inventory`]
+    /// once the witness confirms and [`Self::sync_wallet`] refreshes the cache.
+    pub async fn accept_consignment(
+        &self,
+        asset: &AssetId,
+        consignment_base64: &str,
+    ) -> Result<(), RgbError> {
+        let contract_id = ContractId::from_str(&asset.id)
+            .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
+        self.lib_backend()
+            .accept_incoming_transfer(consignment_base64, contract_id)
+            .await
     }
 
     /// Build the taker's sell consignment: a unilateral RGB transfer to the

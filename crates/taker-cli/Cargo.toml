@@ -15,4 +15,4 @@ rfq-client = { path = "../rfq-client" }
 tokio.workspace = true
 clap = { workspace = true, features = ["derive"] }
 serde.workspace = true
-toml.workspace = true
+toml = "0.8"

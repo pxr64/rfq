@@ -434,10 +434,12 @@ pub(crate) fn build_buy_transition(
 /// rewrites the host output's scriptPubkey, so the witness txid is stable from
 /// here on (and the maker must sign *after* this — U4). The committed fascia is
 /// consumed into the stash as [`WitnessOrd::Tentative`] (U5) and the
-/// witness-extended consignment is emitted, addressed to `delivery_seal` (the
-/// counterparty's blinded seal — taker on buy, maker on sell). Returns the
-/// consignment + witness id; the sell path discards the consignment because
-/// the taker built and submitted its own.
+/// witness-extended consignment is emitted, addressed to `delivery_seal` (a
+/// blinded seal — the taker's on buy, the taker's *change* seal on sell). Returns
+/// the consignment + witness id; both flows hand it back to the taker as
+/// `final_consignment` so it can record the RGB it received. (A sell with no
+/// surplus has no change seal, so it delivers to the maker seal and the caller
+/// drops the result.)
 pub(crate) fn commit_and_consign(
     wallet: &mut MakerWallet,
     psbt: &mut Psbt,
@@ -505,16 +507,29 @@ pub(crate) fn encode_swap_transfer_buy(
 }
 
 /// **Phase 6 (sell).** Serialize the (partially-signed) PSBT into the base64
-/// [`SwapTransfer`]. No consignment is attached — the taker built and shipped
-/// theirs at `/consignment`; the maker only needs the partial PSBT + the
-/// already-stable witness txid.
+/// [`SwapTransfer`]. When the taker over-consigned, `change_consignment` is the
+/// maker-emitted transfer addressed to the taker's change seal (anchored to the
+/// real swap witness); it rides along so the taker can accept its RGB change
+/// post-broadcast. With no surplus there's nothing for the taker to receive, so
+/// `consignment` stays `None`.
 pub(crate) fn encode_swap_transfer_sell(
     psbt: &Psbt,
     witness_id: Txid,
+    change_consignment: Option<&rgb::containers::Transfer>,
 ) -> Result<SwapTransfer, RgbError> {
+    let consignment = match change_consignment {
+        Some(transfer) => {
+            let mut bytes = Vec::new();
+            transfer
+                .save(&mut bytes)
+                .map_err(|e| RgbError::TransferBuild(format!("serialize change consignment: {e}")))?;
+            Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+        }
+        None => None,
+    };
     Ok(SwapTransfer {
         partial_psbt: base64::engine::general_purpose::STANDARD.encode(psbt.serialize(PsbtVer::V2)),
-        consignment: None,
+        consignment,
         expected_witness_txid: Some(witness_id.to_string()),
     })
 }
@@ -573,7 +588,7 @@ pub(crate) struct SellInputs {
     pub(crate) contract_id: ContractId,
     pub(crate) maker_seal: SecretSeal,
     deliver_amount: u64,
-    taker_change_seal: Option<SecretSeal>,
+    pub(crate) taker_change_seal: Option<SecretSeal>,
     maker_change_spk: ScriptPubkey,
     taker_payout_spk: ScriptPubkey,
     descriptor: RgbDescr,
@@ -733,7 +748,9 @@ pub(crate) fn assemble_sell_psbt(
 /// (now stash-resident, after `validate_incoming_consignment`'s `accept_transfer`)
 /// allocations, assigns `deliver_amount` to the maker's blinded seal, and
 /// routes any surplus to the taker's change seal. Returns the [`Batch`] ready
-/// to embed.
+/// to embed plus a bool that's `true` when a change allocation was added (i.e.
+/// the taker over-consigned) — the caller delivers the maker-emitted consignment
+/// to the taker's change seal only in that case.
 ///
 /// Unlike the buy side, this doesn't bind any seal to a post-sort PSBT vout —
 /// both RGB destinations are pre-existing `BlindedSeal`s — so the transition
@@ -742,7 +759,7 @@ pub(crate) fn build_sell_transition(
     wallet: &MakerWallet,
     inputs: &SellInputs,
     consignment_info: &ConsignmentInfo,
-) -> Result<Batch, RgbError> {
+) -> Result<(Batch, bool), RgbError> {
     let contract = wallet
         .stock()
         .contract_data(inputs.contract_id)
@@ -825,7 +842,7 @@ pub(crate) fn build_sell_transition(
         extras: Default::default(),
     };
     batch.set_priority(u64::MAX);
-    Ok(batch)
+    Ok((batch, surplus > 0))
 }
 
 // ---------------------------------------------------------------------------

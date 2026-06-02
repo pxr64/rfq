@@ -759,12 +759,19 @@ impl Maker {
             .await
             .map_err(|e| RouterError::Maker(e.to_string()))?;
 
-        // Record what `/sign` will re-check the taker's PSBT against.
+        // Record what `/sign` will re-check the taker's PSBT against, plus the
+        // consignment to echo back as `final_consignment`. When the taker
+        // over-consigned, `create_swap_psbt_sell` returns the maker-emitted
+        // change consignment (addressed to the taker's change seal, anchored to
+        // the real swap witness) — that's what lets the taker record its RGB
+        // change. Falls back to the taker's own consignment when there's no
+        // change (and for the mock backend, which emits none).
+        let final_consignment = transfer.consignment.clone().unwrap_or(consignment_base64);
         if let Some(PendingSettlement::Sell(p)) = self.pending.write().await.get_mut(&quote_id) {
             p.psbt_built = Some(SellPsbtBuilt {
                 consigned_outpoints: info.outpoints,
                 expected_witness_txid,
-                consignment: consignment_base64,
+                consignment: final_consignment,
             });
         }
 

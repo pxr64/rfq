@@ -37,6 +37,10 @@ enum Command {
     Buy { amount: u64 },
     /// Sell `amount` RGB, receiving BTC.
     Sell { amount: u64 },
+    /// Accept a swap consignment file into the taker's stash (records bought
+    /// RGB / sell change). Run this after the swap tx confirms — `buy`/`sell`
+    /// write the consignment to a file and print its path.
+    Accept { path: PathBuf },
     /// Print the taker's RGB inventory for the configured contract.
     Inventory,
 }
@@ -60,6 +64,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Command::Buy { amount } => buy(&client, &taker, &asset, amount, &config.btc_address).await,
         Command::Sell { amount } => {
             sell(&client, &taker, &asset, amount, &config.btc_address).await
+        }
+        Command::Accept { path } => {
+            let consignment = std::fs::read_to_string(&path)
+                .map_err(|e| format!("read consignment {}: {e}", path.display()))?;
+            taker.accept_consignment(&asset, consignment.trim()).await?;
+            println!("accepted consignment from {} into taker stash", path.display());
+            Ok(())
         }
         Command::Inventory => {
             let utxos = taker.inventory(&asset).await?;
@@ -123,6 +134,10 @@ async fn buy(
         .witness_txid
         .ok_or("buy settled intent carried no witness txid")?;
     println!("buy broadcast: {txid}");
+
+    if let Some(consignment) = settled.final_consignment {
+        persist_and_try_accept(taker, asset, &txid, &consignment, "bought RGB").await;
+    }
     Ok(())
 }
 
@@ -191,7 +206,36 @@ async fn sell(
         .witness_txid
         .ok_or("sell settled intent carried no witness txid")?;
     println!("sell broadcast: {txid}");
+
+    // Absent when the taker consigned its inputs exactly (no change to receive).
+    if let Some(consignment) = settled.final_consignment {
+        persist_and_try_accept(taker, asset, &txid, &consignment, "RGB change").await;
+    }
     Ok(())
+}
+
+/// Persist a swap consignment to a file and try to accept it now. The accept is
+/// best-effort: RGB acceptance needs the swap witness confirmed, so right after
+/// broadcast (still in mempool) it may not stick. The saved file lets the taker
+/// re-accept with `colorex-taker accept <path>` once the tx confirms.
+async fn persist_and_try_accept(
+    taker: &Taker,
+    asset: &AssetId,
+    txid: &str,
+    consignment: &str,
+    what: &str,
+) {
+    let path = format!("taker-consignment-{txid}.b64");
+    match std::fs::write(&path, consignment) {
+        Ok(()) => {
+            println!("consignment saved to {path} (accept after confirm: colorex-taker accept {path})")
+        }
+        Err(e) => eprintln!("warning: could not save consignment to {path}: {e}"),
+    }
+    match taker.accept_consignment(asset, consignment).await {
+        Ok(()) => println!("accepted {what} into taker stash"),
+        Err(e) => eprintln!("note: immediate accept failed (re-run accept after the swap confirms): {e}"),
+    }
 }
 
 /// Fee (sats) for the taker's in-process sell consignment transfer.

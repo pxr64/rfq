@@ -2691,6 +2691,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "taker-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rfq-client",
+ "rfq-rgb",
+ "rfq-types",
+ "serde",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
