@@ -52,6 +52,10 @@ fi
 cp "$consignment" "$taker_consignment"
 
 echo
+echo "[maker] signing + broadcasting the anchoring tx..."
+sign_and_publish rgb_maker maker "$psbt"
+
+echo
 echo "mining 1 confirmation block..."
 bcli -rpcwallet="$BITCOIN_WALLET" generatetoaddress 1 \
   "$(bcli -rpcwallet="$BITCOIN_WALLET" getnewaddress "" bech32)" >/dev/null

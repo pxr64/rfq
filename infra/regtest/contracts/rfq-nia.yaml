@@ -1,0 +1,19 @@
+schema: RWhwUfTMpuP2Zfx1~j4nswCANGeJrYOqDcKelaMV4zU#remote-digital-pegasus
+
+globals:
+  spec:
+    ticker: RFQ
+    name: RFQ Regtest Token
+    details: "RFQ regtest NIA asset for broker/maker integration testing. No value."
+    precision: 2
+  terms:
+    text: >
+      RFQ regtest test asset. Issued for broker/maker-node integration testing
+      against the local regtest stack. Carries no value and no warranties.
+    media: ~
+  issuedSupply: 100000000
+
+assignments:
+  assetOwner:
+    seal: 4780db746fa1a45f28a76bf1fcd3c81058132f367f1f91f6a44ee8be2937985f:0
+    amount: 100000000

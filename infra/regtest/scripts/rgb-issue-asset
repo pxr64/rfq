@@ -18,11 +18,16 @@ require_rgb_schemas
 ensure_dirs
 
 CONTRACT_ID_FILE="$ARTIFACTS_DIR/contract-id"
-YAML_TEMPLATE="$ARTIFACTS_DIR/rfq-nia.yaml"
+# Git-tracked template (survives regtest-reset, which wipes ARTIFACTS_DIR). Falls
+# back to the legacy artifacts copy if a local override still lives there.
+YAML_TEMPLATE="$NIA_TEMPLATE"
+if [[ ! -f "$YAML_TEMPLATE" && -f "$ARTIFACTS_DIR/rfq-nia.yaml" ]]; then
+  YAML_TEMPLATE="$ARTIFACTS_DIR/rfq-nia.yaml"
+fi
 YAML_RENDERED="$ARTIFACTS_DIR/rfq-nia.rendered.yaml"
 
 if [[ ! -f "$YAML_TEMPLATE" ]]; then
-  echo "missing template: $YAML_TEMPLATE" >&2
+  echo "missing NIA template: $NIA_TEMPLATE" >&2
   exit 1
 fi
 

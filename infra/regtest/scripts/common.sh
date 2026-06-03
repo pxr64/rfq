@@ -6,6 +6,9 @@ TOOLS_DIR="$ROOT_DIR/tools"
 ARTIFACTS_DIR="$ROOT_DIR/artifacts"
 WALLETS_DIR="$ROOT_DIR/wallets"
 DATA_DIR="$ROOT_DIR/data"
+# Git-tracked NIA contract template. Lives outside ARTIFACTS_DIR (which
+# regtest-reset wipes) so a reset stays re-bootstrappable.
+NIA_TEMPLATE="${NIA_TEMPLATE:-$ROOT_DIR/contracts/rfq-nia.yaml}"
 
 BITCOIN_WALLET="${BITCOIN_WALLET:-miner}"
 ELECTRUM_URL="${ELECTRUM_URL:-localhost:50001}"
@@ -74,6 +77,18 @@ rgb_maker() {
 
 rgb_taker() {
   "$TOOLS_DIR/rgb-cmd/bin/rgb" -n regtest --electrum="$ELECTRUM_URL" -d "$DATA_DIR/taker" -w taker "$@"
+}
+
+# Hot-sign a PSBT with a role's account file, then finalize + broadcast it.
+# `rgb transfer` produces an UNSIGNED PSBT; without this the anchoring tx never
+# hits the chain, leaving the RGB allocation on a never-mined (tentative)
+# witness that vanishes on any witness re-resolution. `-N` = empty password
+# (the bootstrap accounts are created password-less).
+#   sign_and_publish <sender_rgb_wrapper> <role> <psbt>
+sign_and_publish() {
+  local rgb_wrapper="$1" role="$2" psbt="$3"
+  "$TOOLS_DIR/bp-wallet/bin/bp-hot" sign "$psbt" "$WALLETS_DIR/$role.account" -N
+  "$rgb_wrapper" finalize "$psbt" -p
 }
 
 manual_step() {

@@ -8,6 +8,10 @@ require_rgb_tools
 ensure_dirs
 
 amount="${RGB_FUND_AMOUNT:-1}"
+# Number of keychain-9 seal-anchor UTXOs to fund per role. RGB binds one seal
+# per outpoint, and each invoice (buy-receive, sell-change) consumes one — a
+# single anchor starves the next invoice. Default 3 gives headroom.
+anchor_count="${RGB_ANCHOR_COUNT:-3}"
 
 # Make sure the miner wallet is available (mirrors regtest-mine).
 if ! bcli -rpcwallet="$BITCOIN_WALLET" getwalletinfo >/dev/null 2>&1; then
@@ -36,10 +40,15 @@ echo "  maker : $maker_addr"
 echo "  taker : $taker_addr"
 echo
 
-echo "funding from miner wallet (${amount} BTC each)..."
-bcli -rpcwallet="$BITCOIN_WALLET" sendtoaddress "$issuer_addr" "$amount" >/dev/null
-bcli -rpcwallet="$BITCOIN_WALLET" sendtoaddress "$maker_addr"  "$amount" >/dev/null
-bcli -rpcwallet="$BITCOIN_WALLET" sendtoaddress "$taker_addr"  "$amount" >/dev/null
+echo "funding from miner wallet (${anchor_count} x ${amount} BTC per role)..."
+# Send `anchor_count` separate UTXOs to each role's keychain-9 address. Each
+# distinct outpoint is an independent seal anchor, so several invoices can be
+# minted without starving one another.
+for _ in $(seq 1 "$anchor_count"); do
+  bcli -rpcwallet="$BITCOIN_WALLET" sendtoaddress "$issuer_addr" "$amount" >/dev/null
+  bcli -rpcwallet="$BITCOIN_WALLET" sendtoaddress "$maker_addr"  "$amount" >/dev/null
+  bcli -rpcwallet="$BITCOIN_WALLET" sendtoaddress "$taker_addr"  "$amount" >/dev/null
+done
 
 echo "mining 1 confirmation block..."
 bcli -rpcwallet="$BITCOIN_WALLET" generatetoaddress 1 \
