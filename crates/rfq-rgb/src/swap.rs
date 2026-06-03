@@ -42,6 +42,7 @@ use std::str::FromStr;
 use amplify::Wrapper as _;
 use base64::Engine as _;
 use bpstd::psbt::{Psbt, PsbtVer, UnsignedTx, UnsignedTxIn};
+use bpstd::dbc::tapret::TapretProof;
 use bpstd::seals::txout::CloseMethod;
 use bpstd::signers::TestnetRefSigner;
 use bpstd::{
@@ -57,8 +58,8 @@ use rgb::invoice::{Beneficiary, RgbInvoice};
 use rgb::validation::{WitnessOrdProvider, WitnessResolverError};
 use rgb::vm::WitnessOrd;
 use rgb::{
-    Amount, ContractId, ExposedSeal, GraphSeal, RgbDescr, RgbKeychain, RgbWallet, SecretSeal,
-    StateType,
+    Amount, ContractId, DescriptorRgb, ExposedSeal, GraphSeal, RgbDescr, RgbKeychain, RgbWallet,
+    SecretSeal, StateType,
 };
 
 use rfq_types::{Outpoint, SwapTransfer};
@@ -191,9 +192,15 @@ pub fn enrich_psbt_input(
     terminal: Terminal,
     value: Sats,
 ) -> Result<(), RgbError> {
+    // A tapret terminal derives `[base, tweaked...]`; take the LAST so a maker
+    // input that was a tapret host (its taproot key carries the commitment) is
+    // enriched with the tweaked scriptPubkey + merkle root the signer needs —
+    // otherwise it signs for the untweaked key and the witness is rejected
+    // ("Invalid Schnorr signature"). Untweaked terminals derive only `[base]`,
+    // so `.last()` matches `.next()` there.
     let derived = descriptor
         .derive(terminal.keychain, terminal.index)
-        .next()
+        .last()
         .ok_or_else(|| RgbError::TransferBuild("descriptor produced no script".to_owned()))?;
     let input = psbt
         .input_mut(index)
@@ -210,6 +217,59 @@ pub fn enrich_psbt_input(
     Ok(())
 }
 
+/// Cap on the address scan used to recover a freshly-derived host address's
+/// terminal (see [`next_tapret_host_addr`]). The host is always at the wallet's
+/// highest derived index, but `next_derivation_index` is private so we scan up
+/// from 0. 10k covers thousands of swaps on a regtest/signet wallet; a
+/// high-volume maker would want the index returned directly (upstream gap).
+const TAPRET_HOST_SCAN_LIMIT: usize = 10_000;
+
+/// Derive a fresh Tapret-keychain address for a tapret commitment host and
+/// recover its [`Terminal`] — which `next_address` discards — so the caller can
+/// enrich the host output with the `tap_internal_key` that `rgb_commit` needs to
+/// tweak it (and the `tap_bip32_derivation` Phase 2 needs to persist the tweak).
+fn next_tapret_host_addr(wallet: &mut MakerWallet) -> Result<(ScriptPubkey, Terminal), RgbError> {
+    let addr = wallet.wallet_mut().next_address(RgbKeychain::Tapret, true);
+    let terminal = wallet
+        .wallet()
+        .addresses(RgbKeychain::Tapret)
+        .take(TAPRET_HOST_SCAN_LIMIT)
+        .find(|da| da.addr == addr)
+        .map(|da| da.terminal)
+        .ok_or_else(|| {
+            RgbError::TransferBuild("could not recover tapret host terminal".to_owned())
+        })?;
+    Ok((addr.script_pubkey(), terminal))
+}
+
+/// Mark the maker-owned P2TR output at `host_spk` as the tapret commitment host,
+/// enriching it with the `tap_internal_key`/`tap_bip32_derivation` that
+/// `rgb_commit` tweaks to embed the commitment (mirrors [`enrich_psbt_input`],
+/// but for an output). Without the internal key `rgb_commit` errors with
+/// "taproot output doesn't specify internal key".
+fn enrich_tapret_host(
+    psbt: &mut Psbt,
+    host_spk: &ScriptPubkey,
+    descriptor: &RgbDescr,
+    terminal: Terminal,
+) -> Result<(), RgbError> {
+    let derived = descriptor
+        .derive(terminal.keychain, terminal.index)
+        .next()
+        .ok_or_else(|| RgbError::TransferBuild("descriptor produced no host script".to_owned()))?;
+    let host = psbt
+        .outputs_mut()
+        .find(|o| o.script == *host_spk)
+        .ok_or_else(|| {
+            RgbError::TransferBuild("tapret host output missing after assembly".to_owned())
+        })?;
+    host.tap_internal_key = derived.to_internal_pk();
+    host.tap_bip32_derivation = descriptor.xonly_keyset(terminal);
+    host.set_tapret_host()
+        .map_err(|e| RgbError::TransferBuild(format!("set tapret host: {e:?}")))?;
+    Ok(())
+}
+
 /// The maker-side data the buy composition is built from: the taker's target
 /// contract + blinded seal, the maker's BTC payout scriptPubkey, the wallet
 /// descriptor (for input enrichment), and the resolved RGB inputs. Produced by
@@ -218,6 +278,9 @@ pub(crate) struct BuyInputs {
     pub(crate) contract_id: ContractId,
     pub(crate) taker_seal: TakerSeal,
     maker_payout_spk: ScriptPubkey,
+    /// Terminal of `maker_payout_spk` — lets `assemble_unsigned_psbt` enrich the
+    /// tapret host output with the internal key `rgb_commit` tweaks.
+    maker_payout_terminal: Terminal,
     /// Fresh maker BTC change address for the seal-anchor BTC value of the
     /// maker's RGB inputs (issue #25). Without this, the consumed seal-anchor
     /// sats would be burned to fee — the maker's RGB-change *seal* is bound
@@ -254,11 +317,9 @@ pub(crate) fn prepare_buy_inputs(
     // Tapret keychain (10) — the RGB convention for tapret
     // (`RgbKeychain::for_method(TapretFirst)`), and the keychain bp-wallet
     // re-derives tapret-tweaked outputs from. It also carries the maker's
-    // RGB-change seal (bound post-sort in `build_buy_transition`).
-    let maker_payout_spk = wallet
-        .wallet_mut()
-        .next_address(RgbKeychain::Tapret, true)
-        .script_pubkey();
+    // RGB-change seal (bound post-sort in `build_buy_transition`). Its terminal
+    // is captured so the host output can be enriched with its internal key.
+    let (maker_payout_spk, maker_payout_terminal) = next_tapret_host_addr(wallet)?;
     let maker_btc_change_spk = wallet
         .wallet_mut()
         .next_address(Keychain::OUTER, true)
@@ -270,6 +331,7 @@ pub(crate) fn prepare_buy_inputs(
         contract_id,
         taker_seal,
         maker_payout_spk,
+        maker_payout_terminal,
         maker_btc_change_spk,
         descriptor,
         maker_inputs,
@@ -382,13 +444,12 @@ pub(crate) fn assemble_unsigned_psbt(
     // recognise and spend the tweaked output.
     psbt.set_rgb_close_method(CloseMethod::TapretFirst);
     psbt.set_rgb_tapret_host_on_change();
-    psbt.outputs_mut()
-        .find(|o| o.script == inputs.maker_payout_spk)
-        .ok_or_else(|| {
-            RgbError::TransferBuild("maker payout output missing for tapret host".to_owned())
-        })?
-        .set_tapret_host()
-        .map_err(|e| RgbError::TransferBuild(format!("set tapret host: {e:?}")))?;
+    enrich_tapret_host(
+        &mut psbt,
+        &inputs.maker_payout_spk,
+        &inputs.descriptor,
+        inputs.maker_payout_terminal,
+    )?;
     psbt.sort_outputs_by(|o| !o.is_tapret_host())
         .expect("PSBT outputs are modifiable");
     psbt.complete_construction();
@@ -523,6 +584,27 @@ pub(crate) fn commit_and_consign(
         .rgb_commit()
         .map_err(|e| RgbError::TransferBuild(format!("rgb_commit: {e}")))?;
     let witness_id = psbt.txid();
+
+    // Persist the tapret tweak so the maker's wallet recognises the host output
+    // whose taproot key `rgb_commit` just rewrote. Without it the maker loses
+    // track of the RGB it parks on the host (buy change / sell receive) — a
+    // tweaked output is no longer a plain derived address, so a UTXO scan misses
+    // it. Mirrors rgb-api's `pay.rs`; gated on the host-on-change flag set in
+    // `assemble_*`.
+    if psbt.rgb_tapret_host_on_change() {
+        let tweak = psbt
+            .dbc_output::<TapretProof>()
+            .and_then(|o| Some((o.terminal_derivation()?, o.tapret_commitment().ok()?)));
+        if let Some((terminal, commitment)) = tweak {
+            wallet.wallet_mut().descriptor_mut(|wd| {
+                let _ = wd.with_descriptor_mut::<()>(|descr| {
+                    descr.add_tapret_tweak(terminal, commitment);
+                    Ok(())
+                });
+            });
+        }
+    }
+
     wallet
         .stock_mut()
         .consume_fascia(fascia, FasciaResolver { witness_id })
@@ -673,6 +755,9 @@ pub(crate) struct SellInputs {
     /// `accept_transfer` the maker never does for itself), and no pre-funded
     /// keychain-10 anchor is required.
     maker_receive_spk: ScriptPubkey,
+    /// Terminal of `maker_receive_spk` — enriches the tapret host output with the
+    /// internal key `rgb_commit` tweaks.
+    maker_receive_terminal: Terminal,
     maker_change_spk: ScriptPubkey,
     taker_payout_spk: ScriptPubkey,
     descriptor: RgbDescr,
@@ -718,10 +803,7 @@ pub(crate) fn prepare_sell_inputs(
     // carries RGB, stays segregated from BTC payment UTXOs, composes with the
     // anchor-exclusion / `list_btc_only_utxos` logic, and is the output bp-wallet
     // re-derives once the tapret tweak rewrites its key.
-    let maker_receive_spk = wallet
-        .wallet_mut()
-        .next_address(RgbKeychain::Tapret, true)
-        .script_pubkey();
+    let (maker_receive_spk, maker_receive_terminal) = next_tapret_host_addr(wallet)?;
     // BTC change stays on keychain 0 (a payment output, no RGB).
     let maker_change_spk = wallet
         .wallet_mut()
@@ -735,6 +817,7 @@ pub(crate) fn prepare_sell_inputs(
         deliver_amount,
         taker_change_seal,
         maker_receive_spk,
+        maker_receive_terminal,
         maker_change_spk,
         taker_payout_spk,
         descriptor,
@@ -854,13 +937,12 @@ pub(crate) fn assemble_sell_psbt(
     // so the maker can recognise and spend the tweaked receive output.
     psbt.set_rgb_close_method(CloseMethod::TapretFirst);
     psbt.set_rgb_tapret_host_on_change();
-    psbt.outputs_mut()
-        .find(|o| o.script == inputs.maker_receive_spk)
-        .ok_or_else(|| {
-            RgbError::TransferBuild("maker receive output missing for tapret host".to_owned())
-        })?
-        .set_tapret_host()
-        .map_err(|e| RgbError::TransferBuild(format!("set tapret host: {e:?}")))?;
+    enrich_tapret_host(
+        &mut psbt,
+        &inputs.maker_receive_spk,
+        &inputs.descriptor,
+        inputs.maker_receive_terminal,
+    )?;
     psbt.sort_outputs_by(|o| !o.is_tapret_host())
         .expect("PSBT outputs are modifiable");
     psbt.complete_construction();
