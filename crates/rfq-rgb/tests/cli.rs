@@ -36,7 +36,7 @@ async fn validate_invoice_rejects_garbage() {
         PathBuf::from("/tmp/nonexistent-stash"),
         "irrelevant".to_owned(),
         "regtest".to_owned(),
-        "localhost:50001".to_owned(),
+        "localhost:60001".to_owned(),
         PathBuf::from("/tmp/nonexistent-signer"),
         String::new(),
     );

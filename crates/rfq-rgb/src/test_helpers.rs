@@ -548,7 +548,7 @@ impl RegtestStack {
             env_or_default("RGB_RFQ_COMPOSE_DIR", workspace_root.join("infra/regtest"));
 
         let electrum_url =
-            std::env::var("ELECTRUM_URL").unwrap_or_else(|_| "localhost:50001".to_owned());
+            std::env::var("ELECTRUM_URL").unwrap_or_else(|_| "localhost:60001".to_owned());
 
         require_tools(&tools_dir)?;
         require_stack_up(&compose_dir, &electrum_url)?;

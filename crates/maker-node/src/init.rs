@@ -196,11 +196,11 @@ fn prompt_network() -> Result<String, dialoguer::Error> {
 
 fn default_electrum_url(network: &str) -> &'static str {
     match network {
-        "regtest" => "localhost:50001",
+        "regtest" => "localhost:60001",
         "signet" => "electrum.blockstream.info:60002",
         "testnet" => "electrum.blockstream.info:60001",
         "mainnet" => "electrum.blockstream.info:50001",
-        _ => "localhost:50001",
+        _ => "localhost:60001",
     }
 }
 
@@ -316,7 +316,7 @@ mod tests {
     fn render_toml_with_rgb_block_round_trips_via_load_str() {
         let rgb = RgbAnswers {
             network: "regtest".into(),
-            electrum_url: "localhost:50001".into(),
+            electrum_url: "localhost:60001".into(),
             data_dir: "/tmp/data".into(),
             wallet_name: "maker".into(),
             contract_id: "rgb:abcd-1234".into(),

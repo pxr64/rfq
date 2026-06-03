@@ -15,10 +15,13 @@ services:
       - -zmqpubrawblock=tcp://0.0.0.0:28332
       - -zmqpubrawtx=tcp://0.0.0.0:28333
     ports:
-      - "18443:18443"
-      - "18444:18444"
-      - "28332:28332"
-      - "28333:28333"
+      # Host-side ports shifted off the standard regtest range to avoid
+      # colliding with another local bitcoind/electrs stack. Container ports
+      # stay standard, so the electrs<->bitcoind comms below are unaffected.
+      - "19443:18443"
+      - "19444:18444"
+      - "29332:28332"
+      - "29333:28333"
     volumes:
       - bitcoind-data:/home/bitcoin/.bitcoin
     healthcheck:
@@ -57,7 +60,8 @@ services:
       - --db-dir=/data
       - --log-filters=INFO
     ports:
-      - "50001:50001"
+      # Host-side electrum port shifted off 50001 (see the bitcoind note above).
+      - "60001:50001"
     volumes:
       - electrs-data:/data
       # Read-only share of bitcoind's data dir so electrs can read .cookie.

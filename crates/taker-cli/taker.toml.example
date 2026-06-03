@@ -9,7 +9,7 @@ btc_address = "bcrt1q..."
 network      = "regtest"
 data_dir     = "/path/to/rgb-rfq/infra/regtest/data/taker"
 wallet_name  = "taker"
-electrum_url = "localhost:50001"
+electrum_url = "localhost:60001"
 contract_id  = "rgb:..."
 
 [rgb.signer]

@@ -22,7 +22,7 @@ min_utxo_count          = 3
 network      = "regtest"
 data_dir     = "~/.local/share/colorex/rgb"
 wallet_name  = "maker"
-electrum_url = "localhost:50001"
+electrum_url = "localhost:60001"
 # Format is rgb:<base58-chunks>. Get yours from the issuance step or
 # `rgb contracts`. Leave empty if you haven't issued/imported one yet.
 contract_id  = "rgb:HvGfPj8l-7PK6bkl-WgWvEPH-_zV4VSZ-v2EPZ_p-6Wr7PvM---"
