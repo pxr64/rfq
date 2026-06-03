@@ -2,9 +2,11 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 use async_trait::async_trait;
+use rfq_btc::{BitcoinClient, ElectrumClient};
 use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, SwapTransfer};
 
 use bpstd::psbt::Psbt;
+use bpstd::signers::TestnetRefSigner;
 use bpstd::{HardenedIndex, Keychain, Network, Sats, Txid, XprivAccount, XpubDerivable};
 use bpwallet::fs::FsTextStore;
 use bpwallet::hot::{SecureIo, Seed, SeedType};
@@ -12,21 +14,31 @@ use bpwallet::{Bip43, Wallet};
 use psrgbt::PsbtConstructor;
 use amplify::Wrapper as _;
 use base64::Engine as _;
-use rgb::containers::{ConsignmentExt, FileContent, Transfer, ValidConsignment};
+use rgb::containers::{ConsignmentExt, FileContent, Kit, Transfer, ValidConsignment};
 use rgb::contract::FilterIncludeAll;
-use rgb::invoice::{Beneficiary, InvoiceState, Pay2Vout, RgbInvoice, RgbInvoiceBuilder, XChainNet};
+use rgb::invoice::{
+    Beneficiary, InvoiceState, Pay2Vout, Precision, RgbInvoice, RgbInvoiceBuilder, XChainNet,
+};
 use rgb::persistence::fs::FsBinStore;
 use rgb::persistence::{StashReadProvider, Stock};
-use rgb::resolvers::AnyResolver;
+use rgb::resolvers::{AnyResolver, ContractIssueResolver};
+use rgb::stl::{AssetSpec, ContractTerms, RicardianContract};
 use rgb::validation::{ResolveWitness, ValidationConfig, Validity};
 use rgb::{
-    AssignmentsRef, BundleId, ChainNet, ContractId, Genesis, GraphSeal, Operation, OpId, RgbDescr,
-    RgbKeychain, RgbWallet, StateType, TapretKey, Transition, TransferParams, TxoSeal,
+    Amount, AssignmentsRef, BundleId, ChainNet, ContractId, Genesis, GenesisSeal, GraphSeal,
+    Identity, Operation, OpId, OutputSeal, RgbDescr, RgbKeychain, RgbWallet, StateType, TapretKey,
+    Transition, TransferParams, TxoSeal,
 };
 
 use crate::swap;
 
 use crate::{ConsignmentInfo, FinalizedSwap, MakerInvoiceParts, RgbBackend, RgbError, TxOut};
+
+/// The Non-Inflatable Asset (NIA) schema kit, embedded so issuance has no runtime
+/// file dependency. The schema is network-agnostic (a fixed schema id); only the
+/// genesis seal's outpoint is network-specific, so the same binary issues on
+/// regtest/signet/mainnet. Source: rgb-schemata's NonInflatableAsset.
+const NIA_SCHEMA_KIT: &[u8] = include_bytes!("../schemas/NonInflatableAsset.rgb");
 
 /// Library-backed `RgbBackend` implementation. Talks directly to `rgb-api` /
 /// `rgb-ops` (the same libraries `rgb-cmd` is built on) — no subprocess.
@@ -158,6 +170,115 @@ impl LibRgbBackend {
     /// without clobbering an existing wallet.
     pub fn wallet_exists(&self) -> bool {
         self.wallet_path().exists()
+    }
+
+    /// Issue a Non-Inflatable Asset (NIA) RGB contract — the production "mint a
+    /// token" path, Rust-native (no rgb-cmd). Imports the embedded NIA schema,
+    /// builds the genesis (spec ticker/name/details/precision + total supply, all
+    /// allocated to the issuer's `genesis_outpoint` seal), and persists it into
+    /// the issuer's Stock. Returns the new contract id. `genesis_outpoint` must be
+    /// a real unspent UTXO the issuer owns on this network — the first
+    /// distribution transfer spends it. `issuer` is a label embedded in genesis
+    /// (e.g. `ssi:anonymous`); no signing happens at issuance.
+    pub fn issue_contract(
+        &self,
+        ticker: &str,
+        name: &str,
+        details: Option<&str>,
+        precision: u8,
+        supply: u64,
+        genesis_outpoint: &str,
+        issuer: &str,
+    ) -> Result<String, RgbError> {
+        let mut stock = self.load_stock()?;
+
+        // Import the (network-agnostic) NIA schema kit.
+        let kit = Kit::load(&mut &NIA_SCHEMA_KIT[..])
+            .map_err(|e| RgbError::StashLoad(format!("load NIA kit: {e}")))?
+            .validate()
+            .map_err(|e| RgbError::StashLoad(format!("validate NIA kit: {e:?}")))?;
+        let schema_id = kit
+            .schemata
+            .iter()
+            .next()
+            .ok_or_else(|| RgbError::StashLoad("NIA kit carries no schema".to_owned()))?
+            .schema_id();
+        stock
+            .import_kit(kit)
+            .map_err(|e| RgbError::StashLoad(format!("import kit: {e}")))?;
+
+        // Build the genesis state.
+        let spec = AssetSpec::with(
+            ticker,
+            name,
+            Precision::try_from(precision)
+                .map_err(|_| RgbError::TransferBuild(format!("bad precision {precision}")))?,
+            details,
+        )
+        .map_err(|e| RgbError::TransferBuild(format!("asset spec: {e}")))?;
+        let terms = ContractTerms {
+            text: RicardianContract::default(),
+            media: None,
+        };
+        let os = OutputSeal::from_str(genesis_outpoint).map_err(|e| {
+            RgbError::TransferBuild(format!("bad genesis outpoint {genesis_outpoint}: {e}"))
+        })?;
+        let seal = GenesisSeal::new_random(os.txid, os.vout);
+
+        let issuer_id = Identity::from_str(issuer)
+            .map_err(|e| RgbError::TransferBuild(format!("bad issuer identity {issuer}: {e}")))?;
+        let chain_net = chain_net_for(self.parse_network()?);
+        let contract = stock
+            .contract_builder(issuer_id, schema_id, chain_net)
+            .map_err(|e| RgbError::TransferBuild(format!("contract builder: {e}")))?
+            .add_global_state("spec", spec)
+            .map_err(|e| RgbError::TransferBuild(format!("spec state: {e}")))?
+            .add_global_state("terms", terms)
+            .map_err(|e| RgbError::TransferBuild(format!("terms state: {e}")))?
+            .add_global_state("issuedSupply", Amount::from(supply))
+            .map_err(|e| RgbError::TransferBuild(format!("supply state: {e}")))?
+            .add_fungible_state("assetOwner", seal, Amount::from(supply))
+            .map_err(|e| RgbError::TransferBuild(format!("owner state: {e}")))?
+            .issue_contract()
+            .map_err(|e| RgbError::TransferBuild(format!("issue contract: {e}")))?;
+
+        let id = contract.contract_id();
+        stock
+            .import_contract(contract, &ContractIssueResolver)
+            .map_err(|e| RgbError::StashLoad(format!("import contract: {e}")))?;
+        drop(stock); // autosave-on-drop persists the new contract
+        Ok(id.to_string())
+    }
+
+    /// List issued contracts in the stock as `<id>  issuer=<id> net=<chain>` —
+    /// for verifying `issue_contract` and discovering the contract id to put in
+    /// the maker/taker config.
+    pub fn list_contracts(&self) -> Result<Vec<String>, RgbError> {
+        let stock = self.load_stock()?;
+        let lines: Vec<String> = stock
+            .contracts()
+            .map_err(|e| RgbError::StashLoad(format!("list contracts: {e}")))?
+            .map(|info| format!("{}  issuer={} net={:?}", info.id, info.issuer, info.chain_net))
+            .collect();
+        Ok(lines)
+    }
+
+    /// Pick a funded keychain-10 (tapret) UTXO to bind a contract genesis to,
+    /// as `txid:vout`. The issuer wallet must be funded + synced first
+    /// (`wallet sync`); the first distribution transfer spends this UTXO.
+    pub fn pick_genesis_seal(&self) -> Result<String, RgbError> {
+        let wallet = self.load_wallet()?;
+        let seal = wallet
+            .wallet()
+            .utxos()
+            .find(|u| RgbKeychain::contains_rgb(u.terminal.keychain))
+            .map(|u| format!("{}:{}", u.outpoint.txid, u.outpoint.vout.into_u32()));
+        seal.ok_or_else(|| {
+            RgbError::TransferBuild(
+                "no funded keychain-10 UTXO to bind genesis; fund + sync the issuer wallet first"
+                    .to_owned(),
+            )
+        })
     }
 
     /// Stock lives at `<data_dir>/<network>/` — same layout rgb-cmd's
@@ -366,6 +487,54 @@ impl LibRgbBackend {
             .save(&mut bytes)
             .map_err(|e| RgbError::TransferBuild(format!("serialize consignment: {e}")))?;
         Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    /// Distribute RGB to a recipient invoice — the issuer's "send tokens" path.
+    /// Builds the transfer (`wallet.pay`), signs all the issuer's inputs,
+    /// finalizes, and **broadcasts** the anchoring tx (unlike
+    /// `create_transfer_to_invoice`, which only builds a swap consignment for the
+    /// maker to anchor). Returns `(witness_txid, base64 consignment)`; the
+    /// recipient accepts the consignment once the tx confirms. Needs the signing
+    /// account + a reachable electrum.
+    pub async fn distribute(
+        &self,
+        recipient_invoice: &str,
+        fee_sats: u64,
+    ) -> Result<(String, String), RgbError> {
+        let invoice =
+            RgbInvoice::from_str(recipient_invoice).map_err(|_| RgbError::InvalidInvoice)?;
+        let params = TransferParams::with(Sats(fee_sats), Sats(546));
+
+        let mut wallet = self.load_wallet()?;
+        let descriptor = wallet.wallet().descriptor().clone();
+        let (mut psbt, _meta, transfer) = wallet
+            .pay(&invoice, params)
+            .map_err(|e| RgbError::TransferBuild(format!("pay: {e}")))?;
+
+        // The issuer owns every input of a distribution tx, so it signs the whole
+        // PSBT; then reuse the swap finalize/extract to get the broadcast-ready tx.
+        let account = self.load_signer()?;
+        psbt.sign(&TestnetRefSigner::new(&account))
+            .map_err(|e| RgbError::TransferBuild(format!("sign: {e}")))?;
+        let (raw_tx, witness_id) = swap::finalize_signed_psbt(&descriptor, &psbt.to_base64())?;
+
+        ElectrumClient::connect(&self.electrum_url)
+            .map_err(|e| RgbError::TransferBuild(format!("electrum connect: {e}")))?
+            .broadcast(&raw_tx)
+            .await
+            .map_err(|e| RgbError::TransferBuild(format!("broadcast: {e}")))?;
+
+        // Drop the wallet so its updated stock/UTXO state autosaves, then hand the
+        // recipient the consignment.
+        drop(wallet);
+        let mut bytes = Vec::new();
+        transfer
+            .save(&mut bytes)
+            .map_err(|e| RgbError::TransferBuild(format!("serialize consignment: {e}")))?;
+        Ok((
+            witness_id.to_string(),
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        ))
     }
 
     /// Wallet-derived BTC inventory: every spendable wallet UTXO that is

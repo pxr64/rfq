@@ -34,6 +34,68 @@ enum TopCommand {
         #[command(subcommand)]
         cmd: WalletCmd,
     },
+    /// Issuer tooling: mint NIA tokens + list issued contracts (Rust-native).
+    Issuer {
+        #[command(subcommand)]
+        cmd: IssuerCmd,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+enum IssuerCmd {
+    /// Mint a new Non-Inflatable Asset (fixed-supply fungible token). Prints the
+    /// new contract id to put in the maker/taker config.
+    Issue {
+        #[command(flatten)]
+        common: WalletCommon,
+        /// Ticker, e.g. FOO.
+        #[arg(long)]
+        ticker: String,
+        /// Human-readable asset name.
+        #[arg(long)]
+        asset_name: String,
+        /// Decimal places (0–18).
+        #[arg(long)]
+        precision: u8,
+        /// Total supply (in the smallest unit), all allocated to the issuer.
+        #[arg(long)]
+        supply: u64,
+        /// Optional free-text details.
+        #[arg(long)]
+        details: Option<String>,
+        /// Genesis seal `txid:vout` (a funded keychain-10 UTXO). If omitted,
+        /// auto-picks one from the synced issuer wallet.
+        #[arg(long)]
+        seal: Option<String>,
+        /// Issuer identity label embedded in genesis (no signing).
+        #[arg(long, default_value = "ssi:anonymous")]
+        issuer: String,
+    },
+    /// List issued contracts in the issuer's stock.
+    Contracts {
+        #[command(flatten)]
+        common: WalletCommon,
+    },
+    /// Distribute tokens to a recipient's RGB invoice (signs + broadcasts the
+    /// anchoring tx; hand the printed consignment to the recipient).
+    Transfer {
+        #[command(flatten)]
+        common: WalletCommon,
+        /// Recipient RGB invoice string.
+        #[arg(long)]
+        invoice: String,
+        /// Electrum URL to broadcast the anchoring tx.
+        #[arg(long)]
+        electrum: String,
+        /// Encrypted signing-account file (the issuer's hot key).
+        #[arg(long)]
+        account_file: PathBuf,
+        #[arg(long, default_value = "")]
+        password: String,
+        /// Fee for the transfer tx, in sats.
+        #[arg(long, default_value_t = 1000)]
+        fee: u64,
+    },
 }
 
 #[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
@@ -118,6 +180,27 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             WalletCmd::Address { common, btc } => wallet_address(common, btc),
             WalletCmd::Sync { common, electrum } => wallet_sync(common, electrum).await,
         },
+        TopCommand::Issuer { cmd } => match cmd {
+            IssuerCmd::Issue {
+                common,
+                ticker,
+                asset_name,
+                precision,
+                supply,
+                details,
+                seal,
+                issuer,
+            } => issuer_issue(common, ticker, asset_name, precision, supply, details, seal, issuer),
+            IssuerCmd::Contracts { common } => issuer_contracts(common),
+            IssuerCmd::Transfer {
+                common,
+                invoice,
+                electrum,
+                account_file,
+                password,
+                fee,
+            } => issuer_transfer(common, invoice, electrum, account_file, password, fee).await,
+        },
     }
 }
 
@@ -175,6 +258,83 @@ async fn wallet_sync(
     );
     backend.sync_wallet().await?;
     println!("synced '{name}'");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn issuer_issue(
+    common: WalletCommon,
+    ticker: String,
+    asset_name: String,
+    precision: u8,
+    supply: u64,
+    details: Option<String>,
+    seal: Option<String>,
+    issuer: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let backend = LibRgbBackend::new(
+        common.data_dir,
+        common.name,
+        common.network,
+        String::new(),
+        PathBuf::new(),
+        String::new(),
+    );
+    let genesis_seal = match seal {
+        Some(s) => s,
+        None => backend.pick_genesis_seal()?,
+    };
+    let id = backend.issue_contract(
+        &ticker,
+        &asset_name,
+        details.as_deref(),
+        precision,
+        supply,
+        &genesis_seal,
+        &issuer,
+    )?;
+    println!("issued contract: {id}");
+    println!("  genesis seal: {genesis_seal}");
+    println!("  put this contract_id in maker.toml / taker.toml [rgb]");
+    Ok(())
+}
+
+fn issuer_contracts(common: WalletCommon) -> Result<(), Box<dyn std::error::Error>> {
+    let backend = LibRgbBackend::new(
+        common.data_dir,
+        common.name,
+        common.network,
+        String::new(),
+        PathBuf::new(),
+        String::new(),
+    );
+    for line in backend.list_contracts()? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn issuer_transfer(
+    common: WalletCommon,
+    invoice: String,
+    electrum: String,
+    account_file: PathBuf,
+    password: String,
+    fee: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let backend = LibRgbBackend::new(
+        common.data_dir,
+        common.name,
+        common.network,
+        electrum,
+        account_file,
+        password,
+    );
+    let (txid, consignment) = backend.distribute(&invoice, fee).await?;
+    println!("transfer broadcast: {txid}");
+    println!("hand this consignment to the recipient (they accept after the tx confirms):");
+    println!("{consignment}");
     Ok(())
 }
 
