@@ -26,6 +26,7 @@ rfq-types = { path = "../rfq-types" }
 rfq-wallet = { path = "../rfq-wallet" }
 secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
 serde.workspace = true
+serde_json.workspace = true
 shellexpand = "3"
 tokio.workspace = true
 toml = "0.8"

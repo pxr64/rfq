@@ -5,6 +5,7 @@
 
 pub mod init;
 pub mod node_key;
+pub mod orders;
 pub mod output;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -276,6 +277,36 @@ pub struct ChainObserverDeps {
 /// `inventory` CLI subcommand that don't need the chain-observer deps.
 pub async fn build_maker(config: &MakerNodeConfig) -> Result<Maker, Box<dyn std::error::Error>> {
     Ok(build_runtime(config).await?.maker)
+}
+
+/// Mint an RGB invoice for the maker's configured contract — the receive side
+/// of acquiring inventory from an issuer (`colorex maker invoice`). Requires an
+/// `[rgb]` section with a `contract_id`.
+pub async fn create_inventory_invoice(
+    config: &MakerNodeConfig,
+    amount: u64,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let rgb = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: a wallet is required to create an invoice")?;
+    if rgb.contract_id.is_empty() {
+        return Err("set contract_id in maker.toml [rgb] before creating an invoice".into());
+    }
+    let asset = AssetId {
+        network: rgb.network.parse::<BitcoinNetwork>()?,
+        kind: AssetKind::Rgb20,
+        id: rgb.contract_id.clone(),
+    };
+    let backend = LibRgbBackend::new(
+        rgb.data_dir.clone(),
+        rgb.wallet_name.clone(),
+        rgb.network.clone(),
+        rgb.electrum_url.clone(),
+        rgb.signer.account_file.clone(),
+        rgb.signer.password.clone(),
+    );
+    Ok(backend.create_invoice(&asset, amount).await?)
 }
 
 pub async fn build_runtime(

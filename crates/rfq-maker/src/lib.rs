@@ -23,6 +23,56 @@ use uuid::Uuid;
 mod coin_select;
 pub use coin_select::{CoinSelectionError, CoinSelector, GreedyExactFitSelector, Selection};
 
+/// Standing per-(asset, side) price the maker quotes at, replacing the flat
+/// [`DEFAULT_UNIT_PRICE_SATS`] markup. Built from the operator's saved orders
+/// (`colorex maker order ...`); empty by default, so a maker with no orders
+/// keeps the legacy flat price. Linear-scanned — an operator runs a handful of
+/// orders, not thousands.
+#[derive(Debug, Clone, Default)]
+pub struct PricePolicy {
+    entries: Vec<PriceEntry>,
+}
+
+/// One standing order's pricing terms: a unit price (sats per smallest RGB
+/// unit) and the largest single-quote amount it backs.
+#[derive(Debug, Clone)]
+pub struct PriceEntry {
+    pub asset_id: String,
+    pub side: Side,
+    pub price_sats_per_unit: u64,
+    pub max_size: u64,
+}
+
+/// Outcome of consulting the [`PricePolicy`] for a quote.
+pub enum PriceLookup {
+    /// Quote at this unit price (sats per smallest RGB unit).
+    Price(u64),
+    /// A matching order exists but the requested amount exceeds its size —
+    /// decline the quote rather than silently fall back to the flat price.
+    Decline,
+    /// No order for this (asset, side) — use the flat default price.
+    Fallback,
+}
+
+impl PricePolicy {
+    pub fn from_entries(entries: Vec<PriceEntry>) -> Self {
+        Self { entries }
+    }
+
+    /// Resolve the unit price for a quote of `amount` on (`asset`, `side`).
+    pub fn unit_price(&self, asset: &AssetId, side: &Side, amount: u64) -> PriceLookup {
+        match self
+            .entries
+            .iter()
+            .find(|e| e.asset_id == asset.id && &e.side == side)
+        {
+            None => PriceLookup::Fallback,
+            Some(e) if amount <= e.max_size => PriceLookup::Price(e.price_sats_per_unit),
+            Some(_) => PriceLookup::Decline,
+        }
+    }
+}
+
 /// Inputs to the periodic rebalance planner. Defaults are conservative — the
 /// loop should fire rarely under normal operation. See
 /// `docs/rebalancing-strategy.md` for the why behind these thresholds.
@@ -105,6 +155,11 @@ const RESERVE_RETRY_ATTEMPTS: u32 = 16;
 /// RGB consignment is a wallet operation, so the window is generous.
 const CONSIGNMENT_TTL_MS: u64 = 600_000;
 
+/// Flat fallback price (sats per smallest RGB unit) used when the maker has no
+/// standing order for an (asset, side) — a ~1% markup over a notional 100-sat
+/// par. Operators override per asset via `colorex maker order create`.
+const DEFAULT_UNIT_PRICE_SATS: u64 = 101;
+
 /// Maker-side state for a buy-side swap held between `accept_quote` and
 /// `submit_signed_psbt`. The settlement state machine (#9) will formalize
 /// this; for the mock a per-quote map keyed by `QuoteId` is enough.
@@ -160,6 +215,9 @@ pub struct Maker {
     rgb_backend: Arc<dyn RgbBackend>,
     bitcoin_client: Arc<dyn BitcoinClient>,
     pending: Arc<RwLock<HashMap<QuoteId, PendingSettlement>>>,
+    /// Standing-order prices. Empty unless seeded via [`Maker::with_price_policy`],
+    /// in which case quotes use the configured per-asset price.
+    price_policy: PricePolicy,
 }
 
 impl Maker {
@@ -214,7 +272,16 @@ impl Maker {
             rgb_backend,
             bitcoin_client,
             pending: Arc::new(RwLock::new(HashMap::new())),
+            price_policy: PricePolicy::default(),
         }
+    }
+
+    /// Seed the standing-order price policy (from the operator's saved orders).
+    /// Without it the maker quotes the flat [`DEFAULT_UNIT_PRICE_SATS`] for
+    /// every asset.
+    pub fn with_price_policy(mut self, policy: PricePolicy) -> Self {
+        self.price_policy = policy;
+        self
     }
 
     /// Seed the maker's plain-BTC inventory — the pool it pays sell-side takers
@@ -462,8 +529,17 @@ impl Maker {
     ) -> Result<Option<Quote>, RouterError> {
         let amount = request.amount;
         // Same pricing rule as the buy side; `price` is the gross BTC the
-        // maker pays out, before the network fee the taker covers.
-        let gross_btc_sats = amount.saturating_mul(101);
+        // maker pays out, before the network fee the taker covers. A standing
+        // order may decline (amount over its size) before we reserve BTC.
+        let gross_btc_sats =
+            match self
+                .price_policy
+                .unit_price(&request.base_asset, &request.side, amount)
+            {
+                PriceLookup::Price(p) => p.saturating_mul(amount),
+                PriceLookup::Fallback => amount.saturating_mul(DEFAULT_UNIT_PRICE_SATS),
+                PriceLookup::Decline => return Ok(None),
+            };
 
         let available = self.btc_store.list_available().await;
         let selection = match GreedyLargestFirstSelector.select(gross_btc_sats, &available) {
@@ -906,6 +982,18 @@ impl MakerConnector for Maker {
             return self.request_quote_sell(request, quote_id, expires_at_ms).await;
         }
 
+        // Resolve the unit price up front: a standing order may decline the
+        // quote (amount over its size) before we touch inventory.
+        let buy_unit_price =
+            match self
+                .price_policy
+                .unit_price(&request.base_asset, &request.side, request.amount)
+            {
+                PriceLookup::Price(p) => p,
+                PriceLookup::Fallback => DEFAULT_UNIT_PRICE_SATS,
+                PriceLookup::Decline => return Ok(None),
+            };
+
         // Exclusion-based retry: when a reservation fails because another
         // caller grabbed an outpoint between our list_available read and our
         // reserve_utxos write, we exclude the contested outpoint and re-select.
@@ -966,7 +1054,7 @@ impl MakerConnector for Maker {
             quote_asset: request.quote_asset,
             side: request.side,
             amount: selection.requested,
-            price: selection.requested.saturating_mul(101),
+            price: buy_unit_price.saturating_mul(selection.requested),
             expires_at_ms,
             estimated_fee_sats,
             // 20% slippage cap — the v0 default per docs/swap-flows.md.
@@ -1328,6 +1416,37 @@ mod tests {
             kind: AssetKind::Btc,
             id: "btc".to_owned(),
         }
+    }
+
+    #[test]
+    fn price_policy_resolves_match_decline_and_fallback() {
+        let policy = PricePolicy::from_entries(vec![PriceEntry {
+            asset_id: asset().id,
+            side: Side::Buy,
+            price_sats_per_unit: 250,
+            max_size: 1_000,
+        }]);
+
+        // Matching (asset, side) within size → the order's price.
+        assert!(matches!(
+            policy.unit_price(&asset(), &Side::Buy, 1_000),
+            PriceLookup::Price(250)
+        ));
+        // Over the order's size → decline (don't silently fall back).
+        assert!(matches!(
+            policy.unit_price(&asset(), &Side::Buy, 1_001),
+            PriceLookup::Decline
+        ));
+        // Order exists for Buy but not Sell → fall back to the flat price.
+        assert!(matches!(
+            policy.unit_price(&asset(), &Side::Sell, 10),
+            PriceLookup::Fallback
+        ));
+        // No order for this asset at all → fall back.
+        assert!(matches!(
+            policy.unit_price(&quote_asset(), &Side::Buy, 10),
+            PriceLookup::Fallback
+        ));
     }
 
     fn utxo_with_amount(idx: usize, amount: u64) -> RgbInventoryUtxo {

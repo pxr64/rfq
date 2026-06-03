@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use maker_node::{
-    build_maker, build_runtime, init, maker_app, spawn_chain_observer_loop, spawn_cleanup_loop,
-    spawn_rebalance_loop, MakerNodeConfig,
+    build_maker, build_runtime, create_inventory_invoice, init, maker_app, orders,
+    spawn_chain_observer_loop, spawn_cleanup_loop, spawn_rebalance_loop, MakerNodeConfig,
 };
 use rfq_client::{RfqClient, Url};
 use rfq_rgb::LibRgbBackend;
@@ -150,6 +150,43 @@ enum MakerCmd {
     Health,
     /// Print the maker's RGB inventory snapshot.
     Inventory,
+    /// Mint an RGB invoice to receive inventory from an issuer.
+    Invoice {
+        /// Amount (in smallest RGB units) the invoice requests.
+        #[arg(long)]
+        amount: u64,
+    },
+    /// Manage standing orders — the prices the maker quotes per (asset, side).
+    Order {
+        #[command(subcommand)]
+        cmd: OrderCmd,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+enum OrderCmd {
+    /// Create (or replace) the standing order for an (asset, side).
+    Create {
+        /// `buy` (taker buys RGB) or `sell` (taker sells RGB).
+        #[arg(long)]
+        side: String,
+        /// RGB contract id. Defaults to the config's `[rgb] contract_id`.
+        #[arg(long)]
+        asset: Option<String>,
+        /// Price in sats per smallest RGB unit.
+        #[arg(long)]
+        price: u64,
+        /// Max single-quote size (smallest RGB units) this order backs.
+        #[arg(long)]
+        size: u64,
+    },
+    /// List standing orders.
+    List,
+    /// Cancel a standing order by id.
+    Cancel {
+        /// Order id (from `order list`).
+        id: String,
+    },
 }
 
 #[tokio::main]
@@ -167,9 +204,20 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         TopCommand::Maker { cmd } => match cmd {
             MakerCmd::Init(args) => init::run(args, &config_path).await,
-            MakerCmd::Up => run(load_config(&config_path)?).await,
+            MakerCmd::Up => run(load_config(&config_path)?, &config_path).await,
             MakerCmd::Health => health(load_config(&config_path)?).await,
             MakerCmd::Inventory => inventory(load_config(&config_path)?).await,
+            MakerCmd::Invoice { amount } => maker_invoice(load_config(&config_path)?, amount).await,
+            MakerCmd::Order { cmd } => match cmd {
+                OrderCmd::Create {
+                    side,
+                    asset,
+                    price,
+                    size,
+                } => order_create(&config_path, side, asset, price, size),
+                OrderCmd::List => order_list(&config_path),
+                OrderCmd::Cancel { id } => order_cancel(&config_path, &id),
+            },
         },
         TopCommand::Wallet { cmd } => match cmd {
             WalletCmd::Create {
@@ -261,6 +309,72 @@ async fn wallet_sync(
     Ok(())
 }
 
+async fn maker_invoice(
+    config: MakerNodeConfig,
+    amount: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let invoice = create_inventory_invoice(&config, amount).await?;
+    println!("{invoice}");
+    Ok(())
+}
+
+fn order_create(
+    config_path: &Path,
+    side: String,
+    asset: Option<String>,
+    price: u64,
+    size: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if orders::parse_side(&side).is_none() {
+        return Err(format!("invalid --side '{side}': expected 'buy' or 'sell'").into());
+    }
+    let asset_id = match asset {
+        Some(a) => a,
+        None => load_config(config_path)?
+            .rgb
+            .map(|r| r.contract_id)
+            .filter(|id| !id.is_empty())
+            .ok_or("no --asset given and no [rgb] contract_id in config")?,
+    };
+    let path = orders::OrderBook::path_for(config_path);
+    let mut book = orders::OrderBook::load(&path)?;
+    let order = orders::new_order(&side, asset_id, price, size);
+    let id = order.id.clone();
+    match book.upsert(order) {
+        Some(old) => println!("created order {id} (replaced {old})"),
+        None => println!("created order {id}"),
+    }
+    book.save(&path)?;
+    Ok(())
+}
+
+fn order_list(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let path = orders::OrderBook::path_for(config_path);
+    let book = orders::OrderBook::load(&path)?;
+    if book.orders.is_empty() {
+        println!("no standing orders ({})", path.display());
+        return Ok(());
+    }
+    for o in &book.orders {
+        println!(
+            "{}  side={}  asset={}  price/unit={}  size={}",
+            o.id, o.side, o.asset_id, o.price, o.size
+        );
+    }
+    Ok(())
+}
+
+fn order_cancel(config_path: &Path, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = orders::OrderBook::path_for(config_path);
+    let mut book = orders::OrderBook::load(&path)?;
+    if !book.cancel(id) {
+        return Err(format!("no order with id '{id}'").into());
+    }
+    book.save(&path)?;
+    println!("cancelled order {id}");
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn issuer_issue(
     common: WalletCommon,
@@ -338,10 +452,19 @@ async fn issuer_transfer(
     Ok(())
 }
 
-async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    config: MakerNodeConfig,
+    config_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let _client = RfqClient::new(parse_broker_url(&config)?);
+
+    // Load the operator's standing orders and feed their prices into the maker.
+    let order_path = orders::OrderBook::path_for(config_path);
+    let book = orders::OrderBook::load(&order_path)?;
+    let order_count = book.orders.len();
+
     let runtime = build_runtime(&config).await?;
-    let maker = runtime.maker;
+    let maker = runtime.maker.with_price_policy(book.price_policy());
     let chain_observer_deps = runtime.chain_observer;
     let app = maker_app(maker.clone());
     let listener = TcpListener::bind(&config.maker.listen_addr).await?;
@@ -354,6 +477,10 @@ async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> 
     println!("listen_addr={}", config.maker.listen_addr);
     println!("cleanup_interval={:?}", config.intervals.cleanup);
     println!("rebalance_interval={:?}", config.intervals.rebalance);
+    println!(
+        "standing_orders={order_count} ({})",
+        order_path.display()
+    );
     println!(
         "chain_observer={}",
         if chain_observer_deps.is_some() {
