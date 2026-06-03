@@ -8,6 +8,21 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 
 ## Roadmap
 
+- [ ] **TOP PRIORITY — Switch the swap close method from opret to tapret.** Today
+  the swap composition is hard-wired to `CloseMethod::OpretFirst` (an `OP_RETURN`
+  output carries the RGB commitment), which flags every swap as an RGB tx on-chain.
+  Tapret tweaks the commitment into a Taproot output instead, so a swap is
+  indistinguishable from an ordinary P2TR spend — essential before going to a
+  public network (signet/mainnet). Scope: (a) switch maker/taker/issuer wallets
+  from `wpkh` to `tr(...)` descriptors (re-create wallets, re-issue the contract,
+  re-bootstrap — genesis is descriptor-bound); (b) replace the opret host
+  (`set_rgb_close_method(OpretFirst)` + the 0-value `OP_RETURN` host output) with
+  the tapret host on a maker-controlled Taproot output (typically its change);
+  (c) Schnorr/BIP340 key-path signing for the maker + taker inputs (partial
+  `tap_*` plumbing already exists in `enrich_psbt_input`); (d) RGB seal anchors
+  move keychain 9 → 10 (`RgbKeychain::Tapret`). ORTHOGONAL to the witness-vout /
+  blinded-seal work — those are about *where RGB lands*, tapret is about *where the
+  commitment is anchored*; the seal logic carries over unchanged.
 - [x] Issue #1: Add reservation-aware maker inventory
 - [x] Issue #2: Add maker inventory snapshot endpoint/helper
 - [x] Issue #3: Add quote expiry cleanup loop in maker-node

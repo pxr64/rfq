@@ -56,7 +56,8 @@ use rgb::invoice::{Beneficiary, RgbInvoice};
 use rgb::validation::{WitnessOrdProvider, WitnessResolverError};
 use rgb::vm::WitnessOrd;
 use rgb::{
-    Amount, ContractId, ExposedSeal, GraphSeal, RgbDescr, RgbWallet, SecretSeal, StateType,
+    Amount, ContractId, ExposedSeal, GraphSeal, RgbDescr, RgbKeychain, RgbWallet, SecretSeal,
+    StateType,
 };
 
 use rfq_types::{Outpoint, SwapTransfer};
@@ -695,10 +696,15 @@ pub(crate) fn prepare_sell_inputs(
         })?
         .script_pubkey();
 
+    // The maker's RGB receive goes on the dedicated RGB seal-anchor keychain (9),
+    // NOT keychain 0 — this output only carries RGB, so it stays segregated from
+    // BTC payment UTXOs (a naive spend can't burn it) and composes with the
+    // anchor-exclusion / `list_btc_only_utxos` logic that keys off k9 RGB UTXOs.
     let maker_receive_spk = wallet
         .wallet_mut()
-        .next_address(Keychain::OUTER, true)
+        .next_address(RgbKeychain::Rgb, true)
         .script_pubkey();
+    // BTC change stays on keychain 0 (a payment output, no RGB).
     let maker_change_spk = wallet
         .wallet_mut()
         .next_address(Keychain::OUTER, true)
