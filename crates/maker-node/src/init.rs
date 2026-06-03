@@ -219,9 +219,12 @@ fn prompt_network() -> Result<String, dialoguer::Error> {
 }
 
 fn default_electrum_url(network: &str) -> &'static str {
+    // Bare `host:port` — the maker daemon resolves via bp-electrum, which takes
+    // no scheme. Blockstream runs public testnet/mainnet servers but NO signet
+    // one, so signet defaults to a local electrs (the realistic signet setup).
     match network {
         "regtest" => "localhost:60001",
-        "signet" => "electrum.blockstream.info:60002",
+        "signet" => "127.0.0.1:60001",
         "testnet" => "electrum.blockstream.info:60001",
         "mainnet" => "electrum.blockstream.info:50001",
         _ => "localhost:60001",
