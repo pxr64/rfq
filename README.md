@@ -8,12 +8,14 @@ Rust workspace for an RGB↔BTC RFQ atomic-swap architecture. The RGB swap path 
 - `rfq-core`: request validation, quote expiry, and quote sorting helpers.
 - `rfq-router`: async maker connector trait and concurrent RFQ fanout.
 - `rfq-rgb`: RGB backend — the real `LibRgbBackend` (rgb-api/bp-wallet): tapret swaps, wallet creation, NIA issuance + distribution — plus a mock adapter for tests.
+- `rfq-btc`: Bitcoin client trait + an electrum-backed implementation (tx broadcast, UTXO + fee-rate queries).
 - `rfq-store`: in-memory quote storage.
 - `rfq-maker`: maker implementation — RFQ quoting (fixed 1% markup for now), inventory + reservation lifecycle, and real swap settlement.
 - `rfq-api`: Axum HTTP API exposing RFQ and quote acceptance endpoints.
 - `rfq-client`: thin public HTTP SDK over `rfq-api`.
 - `rfq-wallet`: browser-neutral wallet traits and mock wallet backend.
 - `maker-node`: the `colorex` operator binary — maker daemon + `wallet` + `issuer` tooling (see the colorex CLI section).
+- `taker-cli`: the `colorex-taker` binary — drives buy/sell atomic swaps through the broker.
 - `wallet-wasm`: wasm-bindgen wrapper around mocked wallet functions.
 
 ## Boundaries
@@ -49,9 +51,12 @@ binary (`crates/taker-cli`).
 | Command | Purpose |
 |---|---|
 | `maker init` | Interactive setup: writes the config + node key, **creates the RGB wallet + signing account**, and prints a keychain-10 address to fund. One-shot. |
-| `maker up` | Start the daemon: HTTP quote server + cleanup / rebalance / chain-observer loops. |
+| `maker up` | Start the daemon: HTTP quote server + cleanup / rebalance / chain-observer loops. Loads standing orders for pricing. |
 | `maker health` | Probe the broker. |
 | `maker inventory` | Print the RGB inventory snapshot. |
+| `maker invoice --amount` | Mint an RGB invoice to receive inventory from an issuer. |
+| `maker order create --side --price --size [--asset]` | Create/replace the standing order (price the maker quotes) for an (asset, side). |
+| `maker order list` / `maker order cancel <id>` | List / cancel standing orders (persisted to `orders.json` next to the config). |
 
 ### `colorex wallet` — taproot RGB wallets (any role)
 
@@ -69,32 +74,12 @@ binary (`crates/taker-cli`).
 | `issuer contracts --network --data-dir --name` | List issued contracts. |
 | `issuer transfer --invoice --electrum --account-file [--fee]` | Distribute tokens to a recipient's RGB invoice (signs + broadcasts; prints a consignment for the recipient to accept). |
 
-### Signet quickstart (no docker)
+### Guides
 
-```bash
-NET=signet; ELECTRUM=electrum.blockstream.info:60002; DIR=~/.colorex
-
-# 1. Maker: one-shot setup (creates wallet + config), then fund + sync.
-colorex maker init                 # pick signet; note the printed keychain-10 address
-#   ...fund that address from a signet faucet, wait ~10 min...
-colorex wallet sync --network $NET --data-dir <maker-data-dir> --name maker --electrum $ELECTRUM
-
-# 2. Issuer + taker wallets (fund + sync each, same as above).
-for role in issuer taker; do
-  colorex wallet create --network $NET --data-dir $DIR/$role --name $role --account-file $DIR/$role.account
-done
-
-# 3. Mint a token and distribute it to the maker.
-colorex issuer issue --network $NET --data-dir $DIR/issuer --name issuer \
-  --ticker FOO --asset-name "Foo" --precision 2 --supply 1000000
-colorex issuer transfer --network $NET --data-dir $DIR/issuer --name issuer \
-  --electrum $ELECTRUM --account-file $DIR/issuer.account --invoice <maker-rgb-invoice>
-
-# 4. Run broker + maker + taker (network=signet + the contract id in each config).
-cargo run -p rfq-api
-colorex maker up
-cargo run -p taker-cli -- --config taker.toml buy 100
-```
+- [docs/issuing-tokens.md](docs/issuing-tokens.md) — create a wallet, fund + sync,
+  mint a token, and distribute it to a recipient (any network).
+- [docs/running-a-maker.md](docs/running-a-maker.md) — run a maker from `init`
+  through inventory to standing orders.
 
 ## Regtest RGB Infra
 
@@ -107,4 +92,3 @@ make -C infra/regtest rgb-tools-install
 ```
 
 See `docs/regtest-rgb20-nia-dev-infra.md` for the manual issue and transfer checklist.
-# rfq
