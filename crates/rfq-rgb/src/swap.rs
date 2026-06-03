@@ -129,6 +129,11 @@ struct MakerRgbInput {
     outpoint: BpOutpoint,
     value: Sats,
     terminal: Terminal,
+    /// The UTXO's actual on-chain scriptPubkey, captured from the wallet's coin
+    /// cache so `enrich_psbt_input` picks the right derived (base vs tweaked)
+    /// script even when the terminal was reused for several differently-tweaked
+    /// outputs.
+    script: ScriptPubkey,
 }
 
 /// Convert an [`rfq_types::Outpoint`] (string txid + vout) into a bp-std
@@ -146,6 +151,15 @@ fn resolve_maker_inputs(
     wallet: &MakerWallet,
     maker_rgb_utxos: &[Outpoint],
 ) -> Result<Vec<MakerRgbInput>, RgbError> {
+    // Map each known coin to its actual on-chain scriptPubkey. A tapret host
+    // output's taproot key is tweaked, so its spk is NOT the base derived
+    // address — `enrich_psbt_input` needs the real one to pick the matching
+    // derived script and sign correctly.
+    let spk_by_outpoint: std::collections::HashMap<BpOutpoint, ScriptPubkey> = wallet
+        .wallet()
+        .coins()
+        .map(|c| (c.outpoint, c.address.addr.script_pubkey()))
+        .collect();
     let mut resolved = Vec::with_capacity(maker_rgb_utxos.len());
     for want in maker_rgb_utxos {
         let utxo = wallet
@@ -160,10 +174,16 @@ fn resolve_maker_inputs(
                     "reserved RGB outpoint {want} is not in the maker wallet"
                 ))
             })?;
+        let script = spk_by_outpoint.get(&utxo.outpoint).cloned().ok_or_else(|| {
+            RgbError::TransferBuild(format!(
+                "no cached scriptPubkey for reserved RGB outpoint {want}"
+            ))
+        })?;
         resolved.push(MakerRgbInput {
             outpoint: utxo.outpoint,
             value: utxo.value,
             terminal: utxo.terminal,
+            script,
         });
     }
     Ok(resolved)
@@ -191,17 +211,31 @@ pub fn enrich_psbt_input(
     descriptor: &RgbDescr,
     terminal: Terminal,
     value: Sats,
+    expected_script: Option<&ScriptPubkey>,
 ) -> Result<(), RgbError> {
-    // A tapret terminal derives `[base, tweaked...]`; take the LAST so a maker
-    // input that was a tapret host (its taproot key carries the commitment) is
-    // enriched with the tweaked scriptPubkey + merkle root the signer needs —
-    // otherwise it signs for the untweaked key and the witness is rejected
-    // ("Invalid Schnorr signature"). Untweaked terminals derive only `[base]`,
-    // so `.last()` matches `.next()` there.
-    let derived = descriptor
-        .derive(terminal.keychain, terminal.index)
-        .last()
-        .ok_or_else(|| RgbError::TransferBuild("descriptor produced no script".to_owned()))?;
+    // A tapret terminal derives `[base, tweaked...]`, and bp-wallet can reuse a
+    // terminal across differently-tweaked outputs (its `last_used` index doesn't
+    // survive a wallet reload, while the descriptor's tweaks do), so neither
+    // `.next()` nor `.last()` reliably picks the *specific* UTXO being spent.
+    // When the caller knows the on-chain scriptPubkey (maker RGB inputs — see
+    // `resolve_maker_inputs`), match it exactly so the signer uses the right
+    // (tweaked or base) key; otherwise fall back to the last derived script
+    // (untweaked taker inputs derive only `[base]`). Signing the wrong key gets
+    // the witness rejected with "Invalid Schnorr signature".
+    let derived = match expected_script {
+        Some(spk) => descriptor
+            .derive(terminal.keychain, terminal.index)
+            .find(|d| d.to_script_pubkey() == *spk)
+            .ok_or_else(|| {
+                RgbError::TransferBuild(format!(
+                    "no derived script at {terminal:?} matches the input scriptPubkey"
+                ))
+            })?,
+        None => descriptor
+            .derive(terminal.keychain, terminal.index)
+            .last()
+            .ok_or_else(|| RgbError::TransferBuild("descriptor produced no script".to_owned()))?,
+    };
     let input = psbt
         .input_mut(index)
         .ok_or_else(|| RgbError::TransferBuild(format!("missing PSBT input {index}")))?;
@@ -423,7 +457,14 @@ pub(crate) fn assemble_unsigned_psbt(
 
     let maker_count = inputs.maker_inputs.len();
     for (i, mi) in inputs.maker_inputs.iter().enumerate() {
-        enrich_psbt_input(&mut psbt, i, &inputs.descriptor, mi.terminal, mi.value)?;
+        enrich_psbt_input(
+            &mut psbt,
+            i,
+            &inputs.descriptor,
+            mi.terminal,
+            mi.value,
+            Some(&mi.script),
+        )?;
     }
     for (j, (_, txout)) in taker_btc_inputs.iter().enumerate() {
         let input = psbt
@@ -705,6 +746,10 @@ struct MakerBtcInput {
     outpoint: BpOutpoint,
     value: Sats,
     terminal: Terminal,
+    /// Actual on-chain scriptPubkey (from the wallet's coin cache) so
+    /// `enrich_psbt_input` picks the right derived script when this BTC input is
+    /// a reused/tweaked tapret output (e.g. a prior buy payout).
+    script: ScriptPubkey,
 }
 
 /// Match each maker-declared BTC outpoint against the wallet's UTXO set,
@@ -714,6 +759,14 @@ fn resolve_maker_btc_inputs(
     wallet: &MakerWallet,
     maker_btc_inputs: &[(Outpoint, TxOut)],
 ) -> Result<Vec<MakerBtcInput>, RgbError> {
+    // Authoritative on-chain spk per coin (the declared txout can be synthetic in
+    // tests, and the base derived address won't match a tweaked host) — same
+    // source as `resolve_maker_inputs`.
+    let spk_by_outpoint: std::collections::HashMap<BpOutpoint, ScriptPubkey> = wallet
+        .wallet()
+        .coins()
+        .map(|c| (c.outpoint, c.address.addr.script_pubkey()))
+        .collect();
     let mut resolved = Vec::with_capacity(maker_btc_inputs.len());
     for (want, _txout) in maker_btc_inputs {
         let utxo = wallet
@@ -728,10 +781,14 @@ fn resolve_maker_btc_inputs(
                     "maker BTC outpoint {want} is not in the maker wallet"
                 ))
             })?;
+        let script = spk_by_outpoint.get(&utxo.outpoint).cloned().ok_or_else(|| {
+            RgbError::TransferBuild(format!("no cached scriptPubkey for maker BTC outpoint {want}"))
+        })?;
         resolved.push(MakerBtcInput {
             outpoint: utxo.outpoint,
             value: utxo.value,
             terminal: utxo.terminal,
+            script,
         });
     }
     Ok(resolved)
@@ -927,6 +984,7 @@ pub(crate) fn assemble_sell_psbt(
             &inputs.descriptor,
             mi.terminal,
             mi.value,
+            Some(&mi.script),
         )?;
     }
 

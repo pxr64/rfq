@@ -236,7 +236,10 @@ impl Taker {
         let mut enriched = 0usize;
         for (i, txid, vout) in prev_outs {
             if let Some((terminal, value)) = owned.get(&(txid, vout)).cloned() {
-                enrich_psbt_input(&mut psbt, i, &descriptor, terminal, value)?;
+                // Taker inputs are its own untweaked receives/funding (only the
+                // maker hosts tapret commitments), so the base derived script is
+                // correct — no scriptPubkey match needed.
+                enrich_psbt_input(&mut psbt, i, &descriptor, terminal, value, None)?;
                 enriched += 1;
             }
         }
