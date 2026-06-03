@@ -76,7 +76,7 @@ async fn broker_routes_buy_and_sell_to_remote_maker() {
     let client = RfqClient::new(Url::parse(&broker_base_url).expect("broker url parses"));
 
     // Pre-fund the taker's keychain-0 funding address for the buy leg (the
-    // bootstrap only funds keychain-9). The maker's buy path scans this
+    // bootstrap only funds keychain-10). The maker's buy path scans this
     // address via `list_unspent`.
     stack
         .fund_address(stack.taker_funding_addr(), "0.5")

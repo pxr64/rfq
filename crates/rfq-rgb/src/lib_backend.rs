@@ -33,7 +33,7 @@ use crate::{ConsignmentInfo, FinalizedSwap, MakerInvoiceParts, RgbBackend, RgbEr
 ///
 /// Stashes follow the rgb-cmd convention: `<data_dir>/<network>/...`. So
 /// existing stashes created by `make rgb-wallets-init` + `rgb_<role> create
-/// --wpkh ...` are reusable without re-import.
+/// --tapret-key-only ...` are reusable without re-import.
 pub struct LibRgbBackend {
     data_dir: PathBuf,
     wallet_name: String,
@@ -182,7 +182,7 @@ impl LibRgbBackend {
 
     /// Load the full RGB wallet: a `bp-wallet` `Wallet<XpubDerivable, RgbDescr>`
     /// wrapped with the maker's `Stock`. The wallet descriptor must already
-    /// exist on disk (e.g. via `make rgb-wallets-init` + `rgb create --wpkh`).
+    /// exist on disk (e.g. via `make rgb-wallets-init` + `rgb create --tapret-key-only`).
     fn load_wallet(&self) -> Result<RgbWallet<Wallet<XpubDerivable, RgbDescr>>, RgbError> {
         let stock = self.load_stock()?;
         let provider = FsTextStore::new(self.wallet_path())
@@ -598,7 +598,7 @@ impl RgbBackend for LibRgbBackend {
 
     async fn create_invoice(&self, asset: &AssetId, amount: u64) -> Result<String, RgbError> {
         // Mirrors rgb-cmd's `Invoice` command for the fungible case: prefer a
-        // blinded seal on a pre-existing keychain-9 anchor; when none is
+        // blinded seal on a pre-existing keychain-10 anchor; when none is
         // available, fall back to a witness-vout "future seal" so the receiver
         // never runs out of anchors. Real cryptographic material — meaningful
         // only with a live regtest/electrum stack.
@@ -606,13 +606,13 @@ impl RgbBackend for LibRgbBackend {
         let contract_id = ContractId::from_str(&asset.id)
             .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
 
-        // Pick a FREE UTXO on the RGB seal-anchor chain (BIP-389 keychain 9 — the
-        // descriptor terminal is `/<0;1;9>/*`, with 0 = receive, 1 = change,
-        // 9 = anchors). `Sats::ZERO` because the seal *references* the UTXO; the
-        // invoice doesn't spend it.
+        // Pick a FREE UTXO on the RGB seal-anchor chain (BIP-389 keychain 10 —
+        // the tapret descriptor terminal is `/<0;1;10>/*`, with 0 = receive,
+        // 1 = change, 10 = tapret anchors). `Sats::ZERO` because the seal
+        // *references* the UTXO; the invoice doesn't spend it.
         let network = wallet.wallet().network();
 
-        // Exclude keychain-9 UTXOs that already carry an RGB allocation: a seal
+        // Exclude keychain-10 UTXOs that already carry an RGB allocation: a seal
         // anchor must be free, or it could be spent out from under the new seal
         // (e.g. the sell spends the very UTXO holding the RGB being sold, which
         // would orphan a change seal placed on it). Once every free anchor is
@@ -657,14 +657,15 @@ impl RgbBackend for LibRgbBackend {
                 Beneficiary::BlindedSeal(seal.to_secret_seal())
             }
             // Fallback: no anchor available → a witness-vout "future seal" on a
-            // fresh keychain-9 address. The RGB lands on a NEW output of the swap
-            // tx (bound by the sender against the post-sort vout), so no
-            // pre-funded anchor is needed. No secret to stash — we recognize the
-            // output by wallet ownership once the swap confirms.
+            // fresh keychain-10 (Tapret) address. The RGB lands on a NEW output
+            // of the swap tx (bound by the sender against the post-sort vout), so
+            // no pre-funded anchor is needed. This receive output is NOT the
+            // tapret host (only the sender's output is), so it isn't tweaked — we
+            // recognize it by plain wallet ownership once the swap confirms.
             None => {
                 let addr = wallet
                     .wallet_mut()
-                    .next_address(RgbKeychain::Rgb, true);
+                    .next_address(RgbKeychain::Tapret, true);
                 Beneficiary::WitnessVout(Pay2Vout::new(addr.payload), None)
             }
         };

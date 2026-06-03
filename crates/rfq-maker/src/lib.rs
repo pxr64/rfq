@@ -302,9 +302,9 @@ impl Maker {
     /// same witness tx; probing once per distinct witness_txid avoids
     /// duplicate electrum round-trips.
     ///
-    /// Confirmation probe: we ask for `(witness_txid, 0)`. Swap txes put
-    /// the opret commitment at vout 0, so a confirmed tx replies with
-    /// `NonSegwitOutpoint`; a still-missing tx replies with `Backend`
+    /// Confirmation probe: we ask for `(witness_txid, 0)`. Under tapret vout 0
+    /// is the maker's P2TR commitment-host output, so a confirmed tx replies
+    /// `Ok`/`OutpointNotFound`; a still-missing tx replies with `Backend`
     /// (typically "transaction not found"). Any "tx exists in some form"
     /// response counts as confirmed; everything else is "not yet."
     pub async fn sweep_confirmations(&self) -> usize {
@@ -1249,13 +1249,14 @@ fn now_ms() -> u64 {
 
 /// "Is this witness tx on chain?" probe used by `Maker::sweep_confirmations`
 /// without adding a new method to the `BitcoinClient` trait. Queries
-/// `(witness_txid, 0)` via `get_outpoint`: for our swap txes vout 0 is the
-/// opret commitment (non-segwit), so a confirmed tx replies with
-/// `NonSegwitOutpoint`; a still-missing tx replies with a `Backend` error
-/// (typically "transaction not found"). Real `Ok` would also count as
-/// confirmed (e.g. a non-swap tx with segwit at vout 0). Anything else
-/// (connection failure, etc.) reads as "not yet" — harmless, the next
-/// sweep tick retries.
+/// `(witness_txid, 0)` via `get_outpoint`: under tapret vout 0 is the maker's
+/// P2TR commitment-host output, so a confirmed tx replies `Ok` (its UTXO is
+/// live) or `OutpointNotFound` (already spent) — both mean "on chain". A
+/// still-missing tx replies with a `Backend` error (typically "transaction not
+/// found") and reads as "not yet". The legacy `NonSegwitOutpoint` arm still
+/// covers an opret `OP_RETURN` host, so the probe works under either close
+/// method. Anything else (connection failure, etc.) reads as "not yet" —
+/// harmless, the next sweep tick retries.
 async fn tx_confirmed(client: &dyn BitcoinClient, witness_txid: &str) -> bool {
     use rfq_btc::BtcError;
     use rfq_types::Outpoint;

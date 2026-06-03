@@ -195,7 +195,7 @@ async fn create_swap_psbt_sell_produces_psbt() {
     let backend = stack.maker_backend().await;
 
     // Build `ConsignmentInfo` synthetically from the maker's actual
-    // inventory: the bootstrap put 1000 units at a maker keychain-9 outpoint,
+    // inventory: the bootstrap put 1000 units at a maker keychain-10 outpoint,
     // and `list_inventory_utxos` surfaces it. Using these (rather than
     // `validate_incoming_consignment` output) keeps sum-of-spendable ==
     // deliver_amount, which is what `build_sell_transition` requires. A real

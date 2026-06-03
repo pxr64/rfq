@@ -83,11 +83,11 @@ pub struct RegtestStack {
     /// The sell round-trip uses it to figure out which taker outpoint(s)
     /// carry RGB after the second transfer broadcasts and confirms.
     taker_invoice: String,
-    /// All maker keychain-9 outpoints from the funding phase. The transfer
+    /// All maker keychain-10 outpoints from the funding phase. The transfer
     /// landed RGB on one of them; the others are pure BTC and usable as
     /// `maker_btc_inputs` in the sell composition.
     maker_funding_outpoints: Vec<Outpoint>,
-    /// Taker keychain-9 outpoints from the funding phase. Pure BTC (no RGB
+    /// Taker keychain-10 outpoints from the funding phase. Pure BTC (no RGB
     /// transfer ever lands on the taker in the bootstrap); the buy round-trip
     /// uses one as `taker_btc_inputs[0]`.
     taker_funding_outpoints: Vec<Outpoint>,
@@ -134,7 +134,7 @@ impl RegtestStack {
 
     /// Mint an ADDRESS-BASED (witness-vout / "future seal") invoice on the
     /// taker's stash via `rgb invoice -a`. The production `Taker::create_invoice`
-    /// only emits witness-vout when no free keychain-9 anchor is available, which
+    /// only emits witness-vout when no free keychain-10 anchor is available, which
     /// the funded harness never reproduces — this forces one so the maker's
     /// witness-vout swap composition can be exercised end-to-end.
     pub fn taker_witness_vout_invoice(&self, amount: u64) -> Result<String, String> {
@@ -497,7 +497,7 @@ impl<'a> TakerGuard<'a> {
     /// accounting for it.
     ///
     /// Scans the full bp-wallet UTXO cache (not just the bootstrap
-    /// keychain-9 funding outpoints), so post-broadcast BTC change from
+    /// keychain-10 funding outpoints), so post-broadcast BTC change from
     /// a prior swap — landing on keychain 1 (the change chain) — is also
     /// eligible. Required for consecutive-swap tests (issue #27/#28).
     pub async fn spare_btc_input(
@@ -596,7 +596,7 @@ impl RegtestStack {
             &schema_file,
         )?;
 
-        // Phase 3: fund each role on a keychain-9 address. Issuer gets two:
+        // Phase 3: fund each role on a keychain-10 address. Issuer gets two:
         // one is consumed as the genesis seal + spent by the first transfer,
         // the second provides BTC change for the second transfer's anchor.
         // Maker gets two so the sell test has a spare BTC UTXO after the
@@ -620,7 +620,7 @@ impl RegtestStack {
             "issuer",
             &electrum_url,
         )?;
-        // Maker gets several keychain-9 UTXOs: one is claimed by the issuer→maker
+        // Maker gets several keychain-10 UTXOs: one is claimed by the issuer→maker
         // transfer for RGB, and the rest serve as both seal anchors for the
         // buy-side maker invoices and spare BTC inputs for the broadcasting sell
         // round-trips — the full suite runs many of each against one bootstrap.
@@ -709,10 +709,10 @@ impl RegtestStack {
             &electrum_url,
             &["utxos"],
         )?;
-        let maker_funding_outpoints = parse_all_keychain9_outpoints(&maker_utxos_out);
+        let maker_funding_outpoints = parse_all_keychain10_outpoints(&maker_utxos_out);
         if maker_funding_outpoints.len() < 2 {
             return Err(format!(
-                "expected ≥2 maker keychain-9 outpoints after funding, got {}:\n{maker_utxos_out}",
+                "expected ≥2 maker keychain-10 outpoints after funding, got {}:\n{maker_utxos_out}",
                 maker_funding_outpoints.len()
             ));
         }
@@ -733,10 +733,10 @@ impl RegtestStack {
             &electrum_url,
             &["utxos"],
         )?;
-        let taker_funding_outpoints = parse_all_keychain9_outpoints(&taker_utxos_out);
+        let taker_funding_outpoints = parse_all_keychain10_outpoints(&taker_utxos_out);
         if taker_funding_outpoints.len() < 2 {
             return Err(format!(
-                "expected ≥2 taker keychain-9 outpoints after funding, got {}:\n{taker_utxos_out}",
+                "expected ≥2 taker keychain-10 outpoints after funding, got {}:\n{taker_utxos_out}",
                 taker_funding_outpoints.len()
             ));
         }
@@ -796,32 +796,33 @@ fn create_role_wallet(
     std::fs::create_dir_all(&stash_dir)
         .map_err(|e| format!("create stash dir {stash_dir:?}: {e}"))?;
 
-    // In-Rust replacement for `bp-hot seed` + `bp-hot derive -N --scheme bip84
+    // In-Rust replacement for `bp-hot seed` + `bp-hot derive -N --scheme bip86
     // --account 0h ...`. The seed itself stays in memory — `LibRgbBackend`
     // only needs the encrypted account file (loaded via `XprivAccount::read`
     // in `lib_backend.rs:122`). `derive(_, testnet=true, _)` mirrors the
     // shell's omission of `--mainnet`; the empty account password mirrors the
-    // shell's `-N` (`--no-password`) flag.
+    // shell's `-N` (`--no-password`) flag. Bip86 = taproot (P2TR), required by
+    // the tapret close method.
     let seed = Seed::random(SeedType::Bit128);
-    let account = seed.derive(Bip43::Bip84, true, HardenedIndex::hardened(0));
+    let account = seed.derive(Bip43::Bip86, true, HardenedIndex::hardened(0));
     account
         .write(&account_file, "")
         .map_err(|e| format!("write account file {account_file:?}: {e}"))?;
     // `to_xpub_account().to_string()` mirrors the `Account:` line bp-hot
-    // derive used to print: `[fingerprint/84h/1h/0h]tpubD...`. The
-    // `/<0;1;9>/*` terminal declares external (0), change (1), and RGB
-    // seal-anchor (9) keychains — `rgb address -k 9` needs keychain 9 in
-    // the descriptor or it can't derive anchor addresses.
+    // derive used to print: `[fingerprint/86h/1h/0h]tpubD...`. The
+    // `/<0;1;10>/*` terminal declares external (0), change (1), and the tapret
+    // RGB seal-anchor (10) keychain — `rgb address -k 10` needs keychain 10 in
+    // the descriptor or it can't derive tapret anchor addresses.
     let descriptor = account.to_xpub_account().to_string();
-    let descriptor_with_terminal = format!("{descriptor}/<0;1;9>/*");
+    let descriptor_with_terminal = format!("{descriptor}/<0;1;10>/*");
 
-    // rgb create --wpkh <descriptor> <role>
+    // rgb create --tapret-key-only <descriptor> <role>
     rgb_cmd(
         tools_dir,
         &stash_dir,
         role,
         electrum_url,
-        &["create", "--wpkh", &descriptor_with_terminal, role],
+        &["create", "--tapret-key-only", &descriptor_with_terminal, role],
     )?;
 
     Ok(RoleHandles {
@@ -854,13 +855,13 @@ fn fund_role(
     role: &str,
     electrum_url: &str,
 ) -> Result<(), String> {
-    // Derive a keychain-9 address.
+    // Derive a keychain-10 (tapret) address.
     let addr_out = rgb_cmd(
         tools_dir,
         stash_dir,
         role,
         electrum_url,
-        &["address", "-k", "9"],
+        &["address", "-k", "10"],
     )?;
     let addr = last_word(&addr_out).ok_or_else(|| format!("could not parse address for {role}"))?;
 
@@ -924,8 +925,8 @@ fn issue_contract(
         electrum_url,
         &["utxos"],
     )?;
-    let outpoint = parse_keychain9_outpoint(&utxos_out)
-        .ok_or_else(|| format!("could not find a keychain-9 outpoint in:\n{utxos_out}"))?;
+    let outpoint = parse_keychain10_outpoint(&utxos_out)
+        .ok_or_else(|| format!("could not find a keychain-10 outpoint in:\n{utxos_out}"))?;
 
     let template = std::fs::read_to_string(template_path)
         .map_err(|e| format!("read template {template_path:?}: {e}"))?;
@@ -1370,15 +1371,15 @@ fn parse_schema_id(schemata_out: &str) -> Option<String> {
     None
 }
 
-/// All keychain-9 outpoints in `rgb utxos` output. Entries span two lines —
-/// `<addr>    &9/<idx>` then `<height>    <amount>    <txid>:<vout>` — so we
-/// scan for a `&9/` marker and pull the outpoint from the following non-empty
-/// line.
-fn parse_all_keychain9_outpoints(utxos_out: &str) -> Vec<Outpoint> {
+/// All keychain-10 (tapret) outpoints in `rgb utxos` output. Entries span two
+/// lines — `<addr>    &10/<idx>` then `<height>    <amount>    <txid>:<vout>` —
+/// so we scan for a `&10/` marker and pull the outpoint from the following
+/// non-empty line.
+fn parse_all_keychain10_outpoints(utxos_out: &str) -> Vec<Outpoint> {
     let mut out = Vec::new();
     let mut lines = utxos_out.lines();
     while let Some(line) = lines.next() {
-        if !line.contains("&9/") {
+        if !line.contains("&10/") {
             continue;
         }
         for next in lines.by_ref() {
@@ -1399,13 +1400,13 @@ fn parse_all_keychain9_outpoints(utxos_out: &str) -> Vec<Outpoint> {
     out
 }
 
-/// First `txid:vout` on a line that mentions keychain 9, else the first
-/// `txid:vout` anywhere in the output. Mirrors `rgb-issue-asset:62-70`.
-fn parse_keychain9_outpoint(utxos_out: &str) -> Option<String> {
+/// First `txid:vout` on a line that mentions keychain 10, else the first
+/// `txid:vout` anywhere in the output. Mirrors `rgb-issue-asset`.
+fn parse_keychain10_outpoint(utxos_out: &str) -> Option<String> {
     for line in utxos_out.lines() {
-        if line.contains("keychain=9")
-            || line.contains("&9/")
-            || line.trim_start().starts_with("9 ")
+        if line.contains("keychain=10")
+            || line.contains("&10/")
+            || line.trim_start().starts_with("10 ")
         {
             for tok in line.split_whitespace() {
                 if is_outpoint(tok) {

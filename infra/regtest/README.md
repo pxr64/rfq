@@ -20,8 +20,8 @@ The manual RGB issue/transfer checklist is in `docs/regtest-rgb20-nia-dev-infra.
 - `regtest-mine [BLOCKS=N]`: create/load the miner wallet and mine `N` blocks (default `1`)
 - `rgb-tools-install`: install pinned `bp-wallet` and `rgb-cmd`
 - `rgb-schemas-fetch`: clone `RGB-WG/rgb-schemata` into `tools/rgb-schemas/` (idempotent; override with `RGB_SCHEMAS_REPO=`/`RGB_SCHEMAS_REF=`)
-- `rgb-wallets-init`: create bp-hot seeds and bip84 P2WPKH descriptors for issuer/maker/taker under `wallets/` (idempotent)
-- `rgb-fund-wallets`: derive a keychain-9 address per role, send 1 BTC each from the miner wallet, mine a confirmation, and sync the three RGB wallets (amount overridable via `RGB_FUND_AMOUNT=`)
+- `rgb-wallets-init`: create bp-hot seeds and bip86 P2TR (taproot) descriptors for issuer/maker/taker under `wallets/` (idempotent)
+- `rgb-fund-wallets`: derive a keychain-10 (tapret) address per role, send 1 BTC each from the miner wallet, mine a confirmation, and sync the three RGB wallets (amount overridable via `RGB_FUND_AMOUNT=`)
 - `rgb-issue-asset`: validate prerequisites and point to the issuance checklist
 - `rgb-transfer-maker`: validate prerequisites and point to the issuer-to-maker transfer checklist
 - `rgb-transfer-taker`: validate prerequisites and point to the maker-to-taker transfer checklist

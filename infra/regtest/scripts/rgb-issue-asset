@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Issue the regtest NIA test asset from the issuer wallet. Renders the contract
 # YAML from `artifacts/rfq-nia.yaml` (template) by substituting the issuer's
-# current keychain-9 outpoint and the imported NIA schema id, runs `rgb issue`,
+# current keychain-10 outpoint and the imported NIA schema id, runs `rgb issue`,
 # and captures the resulting contract id to `artifacts/contract-id`.
 #
 # Idempotent: if a previous run wrote `artifacts/contract-id` and the contract
@@ -60,12 +60,13 @@ if [[ -z "$schema_id" ]]; then
 fi
 echo "  schema_id=$schema_id"
 
-# Pick a keychain-9 outpoint from the issuer's wallet to bind the genesis seal.
-# `rgb utxos` prints a table; we look for a row whose keychain column is 9.
-echo "picking issuer keychain-9 outpoint..."
+# Pick a keychain-10 (tapret) outpoint from the issuer's wallet to bind the
+# genesis seal. `rgb utxos` prints a table; we look for a row whose keychain
+# column is 10.
+echo "picking issuer keychain-10 outpoint..."
 utxos_raw="$(rgb_issuer utxos 2>/dev/null || true)"
 outpoint="$(printf '%s\n' "$utxos_raw" \
-  | awk '/keychain=9|^9[[:space:]]/{ for(i=1;i<=NF;i++) if($i ~ /^[0-9a-f]{64}:[0-9]+$/){print $i; exit} }')"
+  | awk '/keychain=10|^10[[:space:]]/{ for(i=1;i<=NF;i++) if($i ~ /^[0-9a-f]{64}:[0-9]+$/){print $i; exit} }')"
 
 if [[ -z "$outpoint" ]]; then
   # Fall back to any txid:vout in the output and let the user verify.
@@ -75,7 +76,7 @@ if [[ -z "$outpoint" ]]; then
 fi
 
 if [[ -z "$outpoint" ]]; then
-  echo "could not find a keychain-9 outpoint in \`rgb_issuer utxos\`." >&2
+  echo "could not find a keychain-10 outpoint in \`rgb_issuer utxos\`." >&2
   echo "Raw output:" >&2
   printf '%s\n' "$utxos_raw" >&2
   echo "Have you run: make -C infra/regtest rgb-fund-wallets ?" >&2

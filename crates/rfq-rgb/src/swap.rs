@@ -26,9 +26,10 @@
 //!    can move outputs around — so the change vout is only known after the
 //!    outputs are final.
 //! 2. **Commit before signing (U4).** `rgb_commit` rewrites the host output's
-//!    scriptPubkey (the opret payload), which changes the txid. Signing must
-//!    happen *after* commit so the signatures cover the final output set; the
-//!    witness txid is stable from the moment `rgb_commit` returns.
+//!    scriptPubkey (the tapret tweak on the maker's P2TR host output), which
+//!    changes the txid. Signing must happen *after* commit so the signatures
+//!    cover the final output set; the witness txid is stable from the moment
+//!    `rgb_commit` returns.
 //! 3. **`consume_fascia` accepts the not-yet-broadcast witness (U5)** via a
 //!    [`FasciaResolver`] that reports [`WitnessOrd::Tentative`].
 //!
@@ -249,9 +250,14 @@ pub(crate) fn prepare_buy_inputs(
     // (issue #25 — keeps the payout output cleanly at `gross_btc_sats`
     // while routing the consumed seal-anchor sats back to the maker
     // instead of burning them to fee).
+    // The maker payout doubles as the tapret commitment host, so it lives on the
+    // Tapret keychain (10) — the RGB convention for tapret
+    // (`RgbKeychain::for_method(TapretFirst)`), and the keychain bp-wallet
+    // re-derives tapret-tweaked outputs from. It also carries the maker's
+    // RGB-change seal (bound post-sort in `build_buy_transition`).
     let maker_payout_spk = wallet
         .wallet_mut()
-        .next_address(Keychain::OUTER, true)
+        .next_address(RgbKeychain::Tapret, true)
         .script_pubkey();
     let maker_btc_change_spk = wallet
         .wallet_mut()
@@ -274,9 +280,10 @@ pub(crate) fn prepare_buy_inputs(
 /// with every input enriched and the commitment host in place.
 ///
 /// Inputs are the maker's RGB outpoints followed by the taker's BTC outpoints;
-/// outputs are the maker's BTC payout, the taker's change (back to its funding
-/// address, dropped if below dust), and an opret `OP_RETURN` commitment host.
-/// Maker inputs get full descriptor data so the maker signer recognizes them;
+/// outputs are the maker's BTC payout (which doubles as the tapret commitment
+/// host) and the taker's change (back to its funding address, dropped if below
+/// dust). The tapret commitment rides the payout output's taproot tweak — there
+/// is no `OP_RETURN`. Maker inputs get full descriptor data so the signer recognizes them;
 /// taker inputs get only `witness_utxo` + sighash (the taker fills the rest at
 /// `/sign`). After the output sort the txid is final.
 pub(crate) fn assemble_unsigned_psbt(
@@ -367,12 +374,22 @@ pub(crate) fn assemble_unsigned_psbt(
         input.sighash_type = Some(SighashType::all());
     }
 
-    // Opret OP_RETURN host (the wpkh maker's close method) + canonical ordering.
-    psbt.set_rgb_close_method(CloseMethod::OpretFirst);
-    psbt.construct_output_expect(ScriptPubkey::op_return(&[]), Sats::ZERO)
-        .set_opret_host()
-        .expect("freshly created opret output");
-    psbt.sort_outputs_by(|o| !o.is_opret_host())
+    // Tapret host + canonical ordering. The RGB MPC commitment tweaks the
+    // maker's payout output (P2TR, on the Tapret keychain) rather than riding a
+    // dedicated `OP_RETURN`, so the swap is indistinguishable from an ordinary
+    // Taproot spend on-chain. `set_rgb_tapret_host_on_change` lets
+    // `commit_and_consign` persist the resulting tweak so the maker can still
+    // recognise and spend the tweaked output.
+    psbt.set_rgb_close_method(CloseMethod::TapretFirst);
+    psbt.set_rgb_tapret_host_on_change();
+    psbt.outputs_mut()
+        .find(|o| o.script == inputs.maker_payout_spk)
+        .ok_or_else(|| {
+            RgbError::TransferBuild("maker payout output missing for tapret host".to_owned())
+        })?
+        .set_tapret_host()
+        .map_err(|e| RgbError::TransferBuild(format!("set tapret host: {e:?}")))?;
+    psbt.sort_outputs_by(|o| !o.is_tapret_host())
         .expect("PSBT outputs are modifiable");
     psbt.complete_construction();
 
@@ -654,7 +671,7 @@ pub(crate) struct SellInputs {
     /// own receive here instead of the blinded invoice seal — `consume_fascia`
     /// surfaces revealed seals directly (a blinded receive would need an
     /// `accept_transfer` the maker never does for itself), and no pre-funded
-    /// keychain-9 anchor is required.
+    /// keychain-10 anchor is required.
     maker_receive_spk: ScriptPubkey,
     maker_change_spk: ScriptPubkey,
     taker_payout_spk: ScriptPubkey,
@@ -696,13 +713,14 @@ pub(crate) fn prepare_sell_inputs(
         })?
         .script_pubkey();
 
-    // The maker's RGB receive goes on the dedicated RGB seal-anchor keychain (9),
-    // NOT keychain 0 — this output only carries RGB, so it stays segregated from
-    // BTC payment UTXOs (a naive spend can't burn it) and composes with the
-    // anchor-exclusion / `list_btc_only_utxos` logic that keys off k9 RGB UTXOs.
+    // The maker's RGB receive lives on the Tapret keychain (10) — the RGB
+    // convention for tapret — and doubles as the tapret commitment host: it only
+    // carries RGB, stays segregated from BTC payment UTXOs, composes with the
+    // anchor-exclusion / `list_btc_only_utxos` logic, and is the output bp-wallet
+    // re-derives once the tapret tweak rewrites its key.
     let maker_receive_spk = wallet
         .wallet_mut()
-        .next_address(RgbKeychain::Rgb, true)
+        .next_address(RgbKeychain::Tapret, true)
         .script_pubkey();
     // BTC change stays on keychain 0 (a payment output, no RGB).
     let maker_change_spk = wallet
@@ -731,8 +749,9 @@ pub(crate) fn prepare_sell_inputs(
 /// taker will sign these at `/sign`) followed by the maker's BTC funding
 /// outpoints (full descriptor enrichment so the maker signer recognizes them).
 /// Outputs are the taker's BTC payout (gross minus fee), the maker's BTC
-/// change (dropped if dust), and the opret `OP_RETURN` commitment host. After
-/// the output sort the txid is final.
+/// change (dropped if dust), and the maker's RGB-receive output — which doubles
+/// as the tapret commitment host (taproot tweak, no `OP_RETURN`). After the
+/// output sort the txid is final.
 pub(crate) fn assemble_sell_psbt(
     inputs: &SellInputs,
     taker_rgb_prevouts: &[(Outpoint, TxOut)],
@@ -828,12 +847,21 @@ pub(crate) fn assemble_sell_psbt(
         )?;
     }
 
-    // Opret OP_RETURN host (the wpkh maker's close method) + canonical ordering.
-    psbt.set_rgb_close_method(CloseMethod::OpretFirst);
-    psbt.construct_output_expect(ScriptPubkey::op_return(&[]), Sats::ZERO)
-        .set_opret_host()
-        .expect("freshly created opret output");
-    psbt.sort_outputs_by(|o| !o.is_opret_host())
+    // Tapret host + canonical ordering. The maker's RGB-receive output (P2TR, on
+    // the Tapret keychain) hosts the RGB MPC commitment in its taproot tweak —
+    // no `OP_RETURN`, so the swap looks like an ordinary Taproot spend.
+    // `set_rgb_tapret_host_on_change` lets `commit_and_consign` persist the tweak
+    // so the maker can recognise and spend the tweaked receive output.
+    psbt.set_rgb_close_method(CloseMethod::TapretFirst);
+    psbt.set_rgb_tapret_host_on_change();
+    psbt.outputs_mut()
+        .find(|o| o.script == inputs.maker_receive_spk)
+        .ok_or_else(|| {
+            RgbError::TransferBuild("maker receive output missing for tapret host".to_owned())
+        })?
+        .set_tapret_host()
+        .map_err(|e| RgbError::TransferBuild(format!("set tapret host: {e:?}")))?;
+    psbt.sort_outputs_by(|o| !o.is_tapret_host())
         .expect("PSBT outputs are modifiable");
     psbt.complete_construction();
 

@@ -58,7 +58,7 @@ async fn http_two_consecutive_buys_via_chain_observer() {
     let (maker, observer_handle, base_url) = spawn_maker_node(&mut config).await;
 
     // --- Pre-fund the taker's btc_funding_addr (keychain-0). The bootstrap
-    //     only funds keychain-9 via `fund_role`; the maker's HTTP path
+    //     only funds keychain-10 via `fund_role`; the maker's HTTP path
     //     calls `list_unspent(funding_addr)` and would otherwise see an
     //     empty UTXO set + reject the accept with "insufficient BTC".
     stack

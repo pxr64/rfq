@@ -28,7 +28,7 @@ create_one_wallet() {
     echo "[$role] wallet already exists, skipping create"
   else
     echo "[$role] creating wallet from $descriptor_file"
-    "$rgb_alias" create --wpkh "$(cat "$descriptor_file")" "$role"
+    "$rgb_alias" create --tapret-key-only "$(cat "$descriptor_file")" "$role"
   fi
 }
 

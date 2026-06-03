@@ -29,7 +29,7 @@ for role in "${roles[@]}"; do
   if [[ ! -f "$descriptor_file" ]]; then
     derive_output="$(
       "$TOOLS_DIR/bp-wallet/bin/bp-hot" derive -N \
-        --scheme bip84 --account 0h \
+        --scheme bip86 --account 0h \
         "$seed_file" "$account_file"
     )"
     descriptor="$(printf '%s\n' "$derive_output" | awk '/^Account:/ { print $2 }')"
@@ -38,10 +38,11 @@ for role in "${roles[@]}"; do
       printf '%s\n' "$derive_output" >&2
       exit 1
     fi
-    # /<0;1;9>/* terminal declares external (0), change (1), and the
-    # RGB seal-anchor keychain (9). rgb address -k 9 needs keychain 9 in
-    # the descriptor or it can't derive anchor addresses.
-    printf '%s/<0;1;9>/*\n' "$descriptor" > "$descriptor_file"
+    # /<0;1;10>/* terminal declares external (0), change (1), and the tapret RGB
+    # seal-anchor keychain (10) — the RGB convention for tapret. rgb address
+    # -k 10 needs keychain 10 in the descriptor or it can't derive tapret anchor
+    # addresses.
+    printf '%s/<0;1;10>/*\n' "$descriptor" > "$descriptor_file"
     echo "created $descriptor_file"
   fi
 done
