@@ -132,6 +132,29 @@ impl RegtestStack {
         &self.electrum_url
     }
 
+    /// Mint an ADDRESS-BASED (witness-vout / "future seal") invoice on the
+    /// taker's stash via `rgb invoice -a`. The production `Taker::create_invoice`
+    /// only emits witness-vout when no free keychain-9 anchor is available, which
+    /// the funded harness never reproduces — this forces one so the maker's
+    /// witness-vout swap composition can be exercised end-to-end.
+    pub fn taker_witness_vout_invoice(&self, amount: u64) -> Result<String, String> {
+        let out = rgb_cmd(
+            &self.tools_dir,
+            &self.taker.stash_dir,
+            "taker",
+            &self.electrum_url,
+            &[
+                "invoice",
+                "-a",
+                "--amount",
+                &amount.to_string(),
+                &self.contract_id_str,
+            ],
+        )?;
+        parse_invoice(&out)
+            .ok_or_else(|| format!("could not parse witness-vout invoice from:\n{out}"))
+    }
+
     /// Acquire the shared backend lock and return a maker-side backend
     /// handle. Held until the guard drops — keeps `Stock::load` /
     /// autosave-on-drop from racing across parallel tests.
@@ -511,7 +534,17 @@ impl RegtestStack {
         let tempdir = TempDir::new().map_err(|e| format!("tempdir: {e}"))?;
         let schema_file =
             workspace_root.join("crates/rfq-rgb/tests/fixtures/NonInflatableAsset.rgb");
-        let template_path = workspace_root.join("infra/regtest/artifacts/rfq-nia.yaml");
+        // Git-tracked template (regtest-reset wipes artifacts/); falls back to a
+        // legacy artifacts copy if one still exists locally.
+        let template_path = {
+            let tracked = workspace_root.join("infra/regtest/contracts/rfq-nia.yaml");
+            let legacy = workspace_root.join("infra/regtest/artifacts/rfq-nia.yaml");
+            if tracked.exists() {
+                tracked
+            } else {
+                legacy
+            }
+        };
 
         // Phase 1: per-role wallet creation (issuer + maker + taker).
         let issuer = create_role_wallet(&tools_dir, tempdir.path(), &electrum_url, "issuer")?;

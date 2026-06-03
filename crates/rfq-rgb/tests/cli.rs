@@ -6,8 +6,12 @@
 //! ```bash
 //! make -C infra/regtest regtest-up
 //! make -C infra/regtest rgb-tools-install
-//! cargo test -p rfq-rgb -- --ignored
+//! cargo test -p rfq-rgb -- --ignored --test-threads=1
 //! ```
+//!
+//! Run with `--test-threads=1`: tests that shell out to `rgb` against the shared
+//! taker/maker stash (the consignment + witness-vout-invoice round-trips) bypass
+//! the in-process backend mutex, so concurrent runs can race a half-written stash.
 //!
 //! No `RGB_*` env vars. The harness creates wallets, funds them, issues the
 //! NIA contract, and runs an issuer→maker transfer — all inside a per-process
@@ -737,4 +741,191 @@ async fn sell_round_trip_two_backends_broadcasts() {
         broadcast_txid, expected_wt,
         "bitcoind's echoed txid should match the PSBT-committed witness id"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs the regtest stack up + tools installed; see file header"]
+async fn buy_round_trip_witness_vout_invoice_broadcasts() {
+    // Witness-vout variant of `buy_round_trip_two_backends_broadcasts`: the
+    // taker's receive invoice is address-based (a "future seal"), so the maker
+    // adds a fresh output to the taker's address and binds the bought RGB to its
+    // post-sort vout — no pre-funded taker anchor involved. Proves the maker's
+    // witness-vout buy composition parses, finalizes, and broadcasts.
+    let stack = common::stack().await;
+    let asset = stack.asset();
+
+    let invoice = stack
+        .taker_witness_vout_invoice(100)
+        .expect("address-based (witness-vout) invoice");
+
+    let maker_outpoints = {
+        let maker = stack.maker_backend().await;
+        let utxos = maker
+            .list_inventory_utxos(&asset)
+            .await
+            .expect("list_inventory_utxos");
+        let outpoints: Vec<Outpoint> = utxos.iter().map(|u| u.outpoint.clone()).collect();
+        assert!(!outpoints.is_empty(), "maker needs RGB to spend");
+        outpoints
+    };
+
+    let (partial_psbt, consignment, expected_wt) = {
+        let taker_btc_input = {
+            let taker = stack.taker_backend().await;
+            taker
+                .spare_btc_input(&asset)
+                .await
+                .expect("taker spare BTC input")
+        };
+        let maker = stack.maker_backend().await;
+        let transfer = maker
+            .create_swap_psbt_buy(
+                &invoice,
+                100,
+                &maker_outpoints,
+                std::slice::from_ref(&taker_btc_input),
+                stack.taker_funding_addr(),
+                1_000,
+                500,
+            )
+            .await
+            .expect("create_swap_psbt_buy (witness-vout)");
+        let consignment = transfer.consignment.expect("buy emits consignment");
+        let expected_wt = transfer
+            .expected_witness_txid
+            .clone()
+            .expect("declared-funding buy commits a stable witness txid");
+        (transfer.partial_psbt, consignment, expected_wt)
+    };
+
+    let signed_psbt = {
+        let taker = stack.taker_backend().await;
+        taker
+            .sign_and_finalize(&partial_psbt)
+            .expect("taker sign+finalize")
+    };
+
+    let finalized = {
+        let maker = stack.maker_backend().await;
+        maker
+            .finalize_after_taker_sign(&signed_psbt, &consignment)
+            .await
+            .expect("finalize_after_taker_sign")
+    };
+    assert_eq!(finalized.witness_txid, expected_wt);
+    assert!(!finalized.raw_tx.is_empty());
+
+    let broadcast_txid = stack
+        .broadcast(&finalized.raw_tx)
+        .expect("bitcoind accepts the witness-vout buy swap tx");
+    assert_eq!(broadcast_txid, expected_wt);
+}
+
+#[tokio::test]
+#[ignore = "needs the regtest stack up + tools installed; see file header"]
+async fn sell_round_trip_witness_vout_change_broadcasts() {
+    // Witness-vout variant of `sell_round_trip_two_backends_broadcasts`: the
+    // taker's over-consigned surplus routes to an ADDRESS-BASED change invoice,
+    // so the maker binds the taker's RGB change to a fresh post-sort swap output
+    // instead of a pre-existing anchor. Proves the maker's witness-vout sell
+    // composition (assemble + sorted-vout binding) finalizes and broadcasts.
+    let stack = common::stack().await;
+    let asset = stack.asset();
+
+    let (maker_invoice, maker_parts, maker_btc_input, maker_payout_addr) = {
+        let maker = stack.maker_backend().await;
+        let maker_invoice = maker.create_invoice(&asset, 200).await.expect("create_invoice");
+        let parts = maker
+            .parse_maker_invoice(&maker_invoice)
+            .await
+            .expect("parse_maker_invoice");
+        let maker_btc_op = maker.spare_btc_outpoint().await;
+        let maker_btc_input = (
+            maker_btc_op,
+            TxOut { value_sats: 0, script_pubkey: vec![] },
+        );
+        (
+            maker_invoice,
+            parts,
+            maker_btc_input,
+            stack.taker_payout_addr().to_owned(),
+        )
+    };
+
+    // The taker's change invoice is witness-vout (future seal) for the surplus.
+    let taker_change_invoice = stack
+        .taker_witness_vout_invoice(300)
+        .expect("witness-vout change invoice");
+
+    let consignment_b64 = {
+        use base64::Engine as _;
+        let bytes = stack
+            .taker_consignment_for(&maker_invoice)
+            .expect("taker_consignment_for");
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    };
+
+    let consignment_info = {
+        let maker = stack.maker_backend().await;
+        maker
+            .validate_incoming_consignment(&consignment_b64, maker_parts.contract_id)
+            .await
+            .expect("validate_incoming_consignment")
+    };
+    assert!(!consignment_info.outpoints.is_empty());
+
+    let taker_rgb_prevouts = {
+        let taker = stack.taker_backend().await;
+        let mut prevouts = Vec::with_capacity(consignment_info.outpoints.len());
+        for op in &consignment_info.outpoints {
+            prevouts.push(taker.lookup_prevout(op).expect("lookup_prevout"));
+        }
+        prevouts
+    };
+
+    let (partial_psbt, expected_wt) = {
+        let maker = stack.maker_backend().await;
+        let transfer = maker
+            .create_swap_psbt_sell(
+                &consignment_info,
+                &taker_rgb_prevouts,
+                std::slice::from_ref(&maker_btc_input),
+                maker_parts.contract_id,
+                maker_parts.seal,
+                200,
+                &maker_payout_addr,
+                Some(&taker_change_invoice),
+                50_000_000,
+                500,
+            )
+            .await
+            .expect("create_swap_psbt_sell (witness-vout change)");
+        let expected_wt = transfer
+            .expected_witness_txid
+            .clone()
+            .expect("declared-funding sell commits a stable witness txid");
+        (transfer.partial_psbt, expected_wt)
+    };
+
+    let signed_psbt = {
+        let taker = stack.taker_backend().await;
+        taker
+            .sign_and_finalize(&partial_psbt)
+            .expect("taker sign+finalize")
+    };
+
+    let finalized = {
+        let maker = stack.maker_backend().await;
+        maker
+            .finalize_after_taker_sign(&signed_psbt, &consignment_b64)
+            .await
+            .expect("finalize_after_taker_sign")
+    };
+    assert_eq!(finalized.witness_txid, expected_wt);
+    assert!(!finalized.raw_tx.is_empty());
+
+    let broadcast_txid = stack
+        .broadcast(&finalized.raw_tx)
+        .expect("bitcoind accepts the witness-vout sell swap tx");
+    assert_eq!(broadcast_txid, expected_wt);
 }

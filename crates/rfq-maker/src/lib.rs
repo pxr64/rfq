@@ -1436,6 +1436,39 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn quote_fee_floors_at_min_feerate_when_estimate_is_zero() {
+        // Low-activity networks (regtest, signet) return no electrum fee
+        // estimate. The maker must floor the feerate at MIN_SWAP_FEERATE_SAT_VB
+        // so the swap tx clears bitcoind's `minrelaytxfee`, rather than quoting a
+        // 0-sat fee that gets rejected at broadcast.
+        let client = Arc::new(MockBitcoinClient::new().with_feerate(0));
+        let maker = maker_with_btc(vec![utxo()], client);
+        let quote = maker
+            .request_quote(quote_request("rfq-fee-floor"))
+            .await
+            .unwrap()
+            .expect("maker quotes the buy");
+        assert_eq!(
+            quote.estimated_fee_sats,
+            MIN_SWAP_FEERATE_SAT_VB * ESTIMATED_SWAP_VBYTES,
+            "a 0 electrum estimate must floor to the minimum feerate"
+        );
+    }
+
+    #[tokio::test]
+    async fn quote_fee_uses_electrum_estimate_when_above_floor() {
+        // Sanity counterpart: a real estimate above the floor passes through.
+        let client = Arc::new(MockBitcoinClient::new().with_feerate(5));
+        let maker = maker_with_btc(vec![utxo()], client);
+        let quote = maker
+            .request_quote(quote_request("rfq-fee-real"))
+            .await
+            .unwrap()
+            .expect("maker quotes the buy");
+        assert_eq!(quote.estimated_fee_sats, 5 * ESTIMATED_SWAP_VBYTES);
+    }
+
     // --- sell-side helpers (16c) ---
 
     /// P2WPKH script — the swap PSBT is segwit-only, so `get_outpoint` rejects
