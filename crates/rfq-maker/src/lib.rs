@@ -91,6 +91,10 @@ const BROADCAST_CONFIRM_TTL_MS: u64 = 7_200_000;
 /// feerate estimate to turn it into an absolute fee on the quote. A real
 /// estimate would size the actual PSBT; this is a deliberate v0 placeholder.
 const ESTIMATED_SWAP_VBYTES: u64 = 200;
+/// Floor for the swap feerate (sat/vByte). Low-activity networks (regtest,
+/// signet) return no electrum estimate, which would yield a 0-fee tx that
+/// bitcoind rejects under `minrelaytxfee`. 1 sat/vByte clears the default floor.
+const MIN_SWAP_FEERATE_SAT_VB: u64 = 1;
 /// Upper bound on reservation retries under contention. With outpoint
 /// exclusion on each retry, the effective bound is `min(this, available_utxo_count)`
 /// — the loop exits via the selector's Insufficient branch once exclusions
@@ -520,7 +524,12 @@ impl Maker {
     /// settlement (no baseline to compare against) rather than rejecting the
     /// quote outright.
     async fn estimate_swap_fee(&self) -> u64 {
-        let feerate = self.bitcoin_client.estimate_feerate(3).await.unwrap_or(0);
+        let feerate = self
+            .bitcoin_client
+            .estimate_feerate(3)
+            .await
+            .unwrap_or(0)
+            .max(MIN_SWAP_FEERATE_SAT_VB);
         feerate.saturating_mul(ESTIMATED_SWAP_VBYTES)
     }
 

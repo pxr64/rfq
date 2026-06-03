@@ -96,11 +96,17 @@ impl LibRgbBackend {
     /// maker-emitted transfer to the taker's change seal). It only needs the
     /// transfer accepted, so it skips `extract_input_outpoints` entirely.
     ///
-    /// The consignment self-carries its witness txes (`add_consignment_txes`),
-    /// so acceptance succeeds even before the swap tx confirms; the absorbed
-    /// allocation surfaces in `list_inventory_utxos` once the witness is mined
-    /// and `sync_wallet` has refreshed the UTXO cache. `Stock::load(_, true)`
-    /// autosaves on drop, so the accepted state persists.
+    /// MUST be called after the swap tx confirms. Two phases: (1) validate +
+    /// `accept_transfer` using a resolver seeded with the consignment's txes so
+    /// the full witness graph is available; (2) `update_witnesses` with a fresh
+    /// chain-only resolver to re-resolve each absorbed witness against electrum.
+    /// Phase 2 is essential: the phase-1 resolver forces every consignment tx to
+    /// `WitnessOrd::Tentative` (`AnyResolver` short-circuits `add_consignment_txes`,
+    /// rgb-ops `indexers/any.rs`), and a Tentative allocation shows in
+    /// `list_inventory_utxos` but is unspendable by `wallet.pay` and is dropped
+    /// when contract state is recomputed on the next `sync_wallet`. Re-resolving
+    /// promotes the mined swap tx to `WitnessOrd::Mined`, making the allocation
+    /// spendable and durable. `Stock::load(_, true)` autosaves on drop.
     pub async fn accept_incoming_transfer(
         &self,
         consignment_base64: &str,
@@ -124,6 +130,12 @@ impl LibRgbBackend {
         }
 
         let mut stock = self.load_stock()?;
+        // Validation needs the full witness graph, so seed the resolver with the
+        // consignment's own txes. Caveat: `AnyResolver` then short-circuits every
+        // such txid to `WitnessOrd::Tentative` (rgb-ops `indexers/any.rs`) — a
+        // Tentative allocation is unspendable by `wallet.pay` and gets dropped
+        // when contract state is recomputed on the next `sync_wallet`. Step 2
+        // (`update_witnesses`) fixes that.
         let mut resolver = self.resolver()?;
         resolver.add_consignment_txes(&consignment);
 
@@ -151,6 +163,19 @@ impl LibRgbBackend {
         stock
             .accept_transfer(validated, &resolver)
             .map_err(|e| RgbError::StashLoad(format!("accept_transfer: {e}")))?;
+
+        // Step 2: promote the just-absorbed witnesses from the forced Tentative
+        // to their real chain ord. A FRESH chain-only resolver (no consignment
+        // txes) re-resolves each witness against electrum, so the mined swap tx
+        // becomes `WitnessOrd::Mined` — making the allocation spendable and
+        // durable across re-syncs. Witnesses electrum can't resolve land in
+        // `UpdateRes.failed` without aborting, so a not-yet-deep ancestor doesn't
+        // block promotion of the rest. `after_height = 0` re-checks every
+        // non-Ignored witness.
+        let chain_resolver = self.resolver()?;
+        stock
+            .update_witnesses(chain_resolver, 0, vec![])
+            .map_err(|e| RgbError::StashLoad(format!("update_witnesses: {e}")))?;
 
         Ok(())
     }
