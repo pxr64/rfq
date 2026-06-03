@@ -18,7 +18,7 @@ use std::str::FromStr;
 
 use bpstd::psbt::{Psbt, PsbtConstructor};
 use bpstd::signers::TestnetRefSigner;
-use bpstd::{Derive, Keychain, Sats, Terminal, XprivAccount, XpubDerivable};
+use bpstd::{Derive, Sats, Terminal, XprivAccount, XpubDerivable};
 use bpwallet::fs::FsTextStore;
 use bpwallet::hot::SecureIo;
 use bpwallet::Wallet as BpWallet;

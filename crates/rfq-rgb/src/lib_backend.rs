@@ -14,7 +14,7 @@ use amplify::Wrapper as _;
 use base64::Engine as _;
 use rgb::containers::{ConsignmentExt, FileContent, Transfer, ValidConsignment};
 use rgb::contract::FilterIncludeAll;
-use rgb::invoice::{Beneficiary, InvoiceState, RgbInvoice, RgbInvoiceBuilder, XChainNet};
+use rgb::invoice::{Beneficiary, InvoiceState, Pay2Vout, RgbInvoice, RgbInvoiceBuilder, XChainNet};
 use rgb::persistence::fs::FsBinStore;
 use rgb::persistence::{StashReadProvider, Stock};
 use rgb::resolvers::AnyResolver;
@@ -554,16 +554,18 @@ impl RgbBackend for LibRgbBackend {
         let mut psbt =
             swap::assemble_unsigned_psbt(&inputs, taker_btc_inputs, gross_btc_sats, actual_fee_sats)?;
        
-        // 3. Build the RGB transition: pay the taker's seal, change back to the maker.
-        let batch = swap::build_buy_transition(&wallet, &inputs, &psbt, amount)?;
-       
+        // 3. Build the RGB transition: pay the taker's seal (blinded or
+        //    witness-vout), change back to the maker. `delivery` carries how to
+        //    address the taker's consignment.
+        let (batch, delivery) = swap::build_buy_transition(&wallet, &inputs, &psbt, amount)?;
+
         // 4. Embed + commit the transition and emit the witness-extended consignment.
         let (transfer, witness_id) = swap::commit_and_consign(
             &mut wallet,
             &mut psbt,
             batch,
             inputs.contract_id,
-            inputs.taker_seal,
+            delivery,
         )?;
 
         // 5. Sign the maker's inputs (after commit — U4); taker BTC inputs stay open.
@@ -595,48 +597,77 @@ impl RgbBackend for LibRgbBackend {
     }
 
     async fn create_invoice(&self, asset: &AssetId, amount: u64) -> Result<String, RgbError> {
-        // Mirrors rgb-cmd's `Invoice` command for the blinded-seal / fungible
-        // case: coin-select a seal-anchor outpoint (keychain 9), bind a fresh
-        // graph seal to it, store it in the maker's stash, and emit an
-        // `RgbInvoice` against the contract for `amount`. Real cryptographic
-        // material — meaningful only with a live regtest/electrum stack.
+        // Mirrors rgb-cmd's `Invoice` command for the fungible case: prefer a
+        // blinded seal on a pre-existing keychain-9 anchor; when none is
+        // available, fall back to a witness-vout "future seal" so the receiver
+        // never runs out of anchors. Real cryptographic material — meaningful
+        // only with a live regtest/electrum stack.
         let mut wallet = self.load_wallet()?;
         let contract_id = ContractId::from_str(&asset.id)
             .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
 
-        // Pick a UTXO on the RGB seal-anchor chain (BIP-389 keychain 9 — the
+        // Pick a FREE UTXO on the RGB seal-anchor chain (BIP-389 keychain 9 — the
         // descriptor terminal is `/<0;1;9>/*`, with 0 = receive, 1 = change,
-        // 9 = anchors). `Sats::ZERO` because the seal *references* the UTXO;
-        // the invoice doesn't spend it. With ZERO the iterator yields every
-        // eligible UTXO and we take the first.
-        let outpoint = wallet
+        // 9 = anchors). `Sats::ZERO` because the seal *references* the UTXO; the
+        // invoice doesn't spend it.
+        let network = wallet.wallet().network();
+
+        // Exclude keychain-9 UTXOs that already carry an RGB allocation: a seal
+        // anchor must be free, or it could be spent out from under the new seal
+        // (e.g. the sell spends the very UTXO holding the RGB being sold, which
+        // would orphan a change seal placed on it). Once every free anchor is
+        // used, no UTXO qualifies and `create_invoice` falls back to witness-vout.
+        let allocated: std::collections::HashSet<(String, u32)> = {
+            let mut set = std::collections::HashSet::new();
+            if let Ok(contract) = wallet.stock().contract_data(contract_id) {
+                let filter = FilterIncludeAll;
+                for details in contract.schema.owned_types.values() {
+                    if let Ok(allocs) = contract.fungible(details.name.clone(), &filter) {
+                        for alloc in allocs {
+                            let op = alloc.seal.to_outpoint();
+                            set.insert((op.txid.to_string(), op.vout.into_u32()));
+                        }
+                    }
+                }
+            }
+            set
+        };
+        let anchor = wallet
             .wallet()
             .coinselect(Sats::ZERO, |utxo| {
                 RgbKeychain::contains_rgb(utxo.terminal.keychain)
+                    && !allocated.contains(&(
+                        utxo.outpoint.txid.to_string(),
+                        utxo.outpoint.vout.into_u32(),
+                    ))
             })
-            .next()
-            .ok_or_else(|| {
-                RgbError::TransferBuild(
-                    "no seal-anchor outpoint available; fund a keychain-9 address \
-                     (see docs/regtest-rgb20-nia-dev-infra.md)"
-                        .to_owned(),
-                )
-            })?;
+            .next();
 
-        // Mint a fresh single-use seal bound to that outpoint. `new_random`
-        // generates the blinding factor — the receiver-side secret that hides
-        // which UTXO the invoice is for from anyone seeing the blinded form.
-        // Stashing it via `store_secret_seal` is what lets us *open* the seal
-        // later when accepting the sender's consignment.
-        let network = wallet.wallet().network();
-        let seal = GraphSeal::new_random(outpoint.txid, outpoint.vout);
-        wallet
-            .stock_mut()
-            .store_secret_seal(seal)
-            .map_err(|e| RgbError::TransferBuild(format!("store seal: {e}")))?;
-        // Publish only the blinded commitment in the invoice — the sender
-        // can't recover the underlying outpoint from this on its own.
-        let beneficiary = Beneficiary::BlindedSeal(seal.to_secret_seal());
+        let beneficiary = match anchor {
+            // Preferred: a blinded seal bound to an existing anchor. Hides the
+            // UTXO from the sender and needs no extra swap output. Mint a fresh
+            // single-use seal and stash its secret so we can *open* it when
+            // accepting the sender's consignment.
+            Some(outpoint) => {
+                let seal = GraphSeal::new_random(outpoint.txid, outpoint.vout);
+                wallet
+                    .stock_mut()
+                    .store_secret_seal(seal)
+                    .map_err(|e| RgbError::TransferBuild(format!("store seal: {e}")))?;
+                Beneficiary::BlindedSeal(seal.to_secret_seal())
+            }
+            // Fallback: no anchor available → a witness-vout "future seal" on a
+            // fresh keychain-9 address. The RGB lands on a NEW output of the swap
+            // tx (bound by the sender against the post-sort vout), so no
+            // pre-funded anchor is needed. No secret to stash — we recognize the
+            // output by wallet ownership once the swap confirms.
+            None => {
+                let addr = wallet
+                    .wallet_mut()
+                    .next_address(RgbKeychain::Rgb, true);
+                Beneficiary::WitnessVout(Pay2Vout::new(addr.payload), None)
+            }
+        };
 
         // Pin the invoice to (network, beneficiary, contract, amount). The
         // resulting `RgbInvoice` string is what the taker passes to the
@@ -815,31 +846,24 @@ impl RgbBackend for LibRgbBackend {
             actual_fee_sats,
         )?;
 
-        // 3. Build the RGB transition: spend the taker's allocations (visible
-        //    in the maker's stash since `validate_incoming_consignment` ran
+        // 3. Build the RGB transition against the sorted PSBT: spend the taker's
+        //    allocations (visible since `validate_incoming_consignment` ran
         //    `accept_transfer`), deliver to the maker's seal, route any
-        //    over-consigned surplus to the taker's change seal. `has_change`
-        //    flags whether a change allocation was added.
-        let (batch, has_change) = swap::build_sell_transition(&wallet, &inputs, consignment_info)?;
+        //    over-consigned surplus to the taker's change seal (blinded or
+        //    witness-vout). `delivery` is how the taker's change consignment is
+        //    addressed; `has_change` flags whether there's any.
+        let (batch, delivery, has_change) =
+            swap::build_sell_transition(&wallet, &inputs, &psbt, consignment_info)?;
 
-        // 4. Embed + commit the transition. Deliver the maker-emitted transfer to
-        //    the taker's CHANGE seal (anchored to the real swap witness) so the
-        //    taker can accept its RGB change post-broadcast. With no surplus there
-        //    is no change seal to address, so deliver to the maker's seal and emit
-        //    no taker consignment (the taker's input was fully spent to the maker).
-        let delivery_seal = if has_change {
-            inputs
-                .taker_change_seal
-                .expect("has_change implies a change seal")
-        } else {
-            inputs.maker_seal
-        };
+        // 4. Embed + commit the transition and emit the witness-extended
+        //    consignment to the taker's change seal so it can accept its RGB
+        //    change post-broadcast (with no surplus the consignment is dropped).
         let (transfer, witness_id) = swap::commit_and_consign(
             &mut wallet,
             &mut psbt,
             batch,
             inputs.contract_id,
-            delivery_seal,
+            delivery,
         )?;
 
         // 5. Sign the maker's BTC inputs (after commit — U4); taker RGB inputs

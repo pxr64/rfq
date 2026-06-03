@@ -55,7 +55,9 @@ use rgb::contract::AllocatedState;
 use rgb::invoice::{Beneficiary, RgbInvoice};
 use rgb::validation::{WitnessOrdProvider, WitnessResolverError};
 use rgb::vm::WitnessOrd;
-use rgb::{Amount, ContractId, GraphSeal, RgbDescr, RgbWallet, SecretSeal, StateType};
+use rgb::{
+    Amount, ContractId, ExposedSeal, GraphSeal, RgbDescr, RgbWallet, SecretSeal, StateType,
+};
 
 use rfq_types::{Outpoint, SwapTransfer};
 
@@ -69,6 +71,32 @@ pub(crate) type MakerWallet = RgbWallet<Wallet<XpubDerivable, RgbDescr>>;
 /// P2WPKH/P2WSH/P2TR dust threshold. Outputs at or below this are dropped
 /// rather than created (they'd be unspendable / non-standard).
 const DUST_LIMIT_SATS: u64 = 546;
+
+/// BTC value parked on a witness-vout RGB output (the taker's "future seal").
+/// Comfortably above the dust limit so the output is standard and, crucially,
+/// still spendable later: `wallet.pay` funds a transfer only from the RGB
+/// input's own sats, so this must cover a future transfer fee + change output.
+/// The receiver recovers these sats when it spends the RGB-bearing UTXO.
+const SEAL_ANCHOR_SATS: u64 = 2_000;
+
+/// How the counterparty's incoming RGB binds. A [`Beneficiary::BlindedSeal`]
+/// invoice rides on a pre-existing anchor UTXO (hidden from the sender); a
+/// [`Beneficiary::WitnessVout`] "future seal" is an address the sender pays into
+/// a fresh swap-tx output, binding the RGB to that output's post-sort vout — so
+/// the receiver never needs a pre-funded anchor.
+pub(crate) enum TakerSeal {
+    Blinded(SecretSeal),
+    Witness(ScriptPubkey),
+}
+
+/// Where [`commit_and_consign`] addresses the emitted consignment. A blinded
+/// recipient is consigned via `secret_seals`; a witness-vout recipient via
+/// `outputs` (the graph seal resolves to an `OutputSeal` once the witness id is
+/// known).
+pub(crate) enum DeliverySeal {
+    Secret(SecretSeal),
+    WitnessVout(GraphSeal),
+}
 
 /// `nSequence` for every swap input: final (no RBF, no relative timelock). The
 /// swap either confirms as built or is abandoned; we don't fee-bump in place.
@@ -186,7 +214,7 @@ pub fn enrich_psbt_input(
 /// [`prepare_buy_inputs`] and threaded through the remaining phases.
 pub(crate) struct BuyInputs {
     pub(crate) contract_id: ContractId,
-    pub(crate) taker_seal: SecretSeal,
+    pub(crate) taker_seal: TakerSeal,
     maker_payout_spk: ScriptPubkey,
     /// Fresh maker BTC change address for the seal-anchor BTC value of the
     /// maker's RGB inputs (issue #25). Without this, the consumed seal-anchor
@@ -211,12 +239,8 @@ pub(crate) fn prepare_buy_inputs(
         .contract
         .ok_or_else(|| RgbError::TransferBuild("invoice carries no contract id".to_owned()))?;
     let taker_seal = match invoice.beneficiary.into_inner() {
-        Beneficiary::BlindedSeal(seal) => seal,
-        Beneficiary::WitnessVout(..) => {
-            return Err(RgbError::TransferBuild(
-                "buy swap requires a blinded-seal invoice".to_owned(),
-            ));
-        }
+        Beneficiary::BlindedSeal(seal) => TakerSeal::Blinded(seal),
+        Beneficiary::WitnessVout(pay2vout, _) => TakerSeal::Witness(pay2vout.script_pubkey()),
     };
 
     // Fresh external key for the maker's BTC payout (receives the price)
@@ -261,9 +285,17 @@ pub(crate) fn assemble_unsigned_psbt(
     actual_fee_sats: u64,
 ) -> Result<Psbt, RgbError> {
     let taker_btc_total: u64 = taker_btc_inputs.iter().map(|(_, t)| t.value_sats).sum();
+    // A witness-vout taker receives its RGB on a fresh swap output we fund with
+    // SEAL_ANCHOR_SATS; the taker pays for it out of its own change. A blinded
+    // taker reuses an existing anchor, so no extra output.
+    let taker_anchor_sats = match inputs.taker_seal {
+        TakerSeal::Witness(_) => SEAL_ANCHOR_SATS,
+        TakerSeal::Blinded(_) => 0,
+    };
     let taker_change = taker_btc_total
         .saturating_sub(gross_btc_sats)
-        .saturating_sub(actual_fee_sats);
+        .saturating_sub(actual_fee_sats)
+        .saturating_sub(taker_anchor_sats);
     let funding_spk = ScriptPubkey::from_unsafe(
         taker_btc_inputs
             .first()
@@ -302,6 +334,11 @@ pub(crate) fn assemble_unsigned_psbt(
             inputs.maker_btc_change_spk.clone(),
             Sats(maker_rgb_btc_total),
         ));
+    }
+    // Witness-vout receive output: carries the taker's bought RGB (the seal binds
+    // to this output's post-sort vout in `build_buy_transition`).
+    if let TakerSeal::Witness(spk) = &inputs.taker_seal {
+        tx_outputs.push(BpTxOut::new(spk.clone(), Sats(taker_anchor_sats)));
     }
     if taker_change > DUST_LIMIT_SATS {
         tx_outputs.push(BpTxOut::new(funding_spk, Sats(taker_change)));
@@ -350,7 +387,7 @@ pub(crate) fn build_buy_transition(
     inputs: &BuyInputs,
     psbt: &Psbt,
     amount: u64,
-) -> Result<Batch, RgbError> {
+) -> Result<(Batch, DeliverySeal), RgbError> {
     // The maker's RGB change binds to the payout output's vout, which is only
     // known after Phase 2's commitment-host sort.
     let payout_vout = psbt
@@ -401,12 +438,28 @@ pub(crate) fn build_buy_transition(
         )));
     }
 
+    // Pay the taker. A blinded invoice rides on its pre-existing anchor
+    // (concealed); a witness-vout invoice binds to the taker's fresh swap output
+    // (revealed against its post-sort vout). The matching delivery seal is what
+    // `commit_and_consign` addresses the consignment to.
+    let (taker_builder_seal, delivery) = match &inputs.taker_seal {
+        TakerSeal::Blinded(seal) => (BuilderSeal::Concealed(*seal), DeliverySeal::Secret(*seal)),
+        TakerSeal::Witness(spk) => {
+            let taker_vout = psbt
+                .outputs()
+                .find(|o| o.script == *spk)
+                .map(|o| o.vout())
+                .ok_or_else(|| {
+                    RgbError::TransferBuild(
+                        "taker witness-vout output missing after sort".to_owned(),
+                    )
+                })?;
+            let seal = GraphSeal::with_blinded_vout(taker_vout, rand::random());
+            (BuilderSeal::Revealed(seal), DeliverySeal::WitnessVout(seal))
+        }
+    };
     builder = builder
-        .add_fungible_state_raw(
-            assignment_type,
-            BuilderSeal::Concealed(inputs.taker_seal),
-            Amount::from(amount),
-        )
+        .add_fungible_state_raw(assignment_type, taker_builder_seal, Amount::from(amount))
         .map_err(|e| RgbError::TransferBuild(format!("add beneficiary state: {e}")))?;
     if sum_inputs > amount {
         let change_seal = GraphSeal::with_blinded_vout(payout_vout, rand::random());
@@ -427,25 +480,24 @@ pub(crate) fn build_buy_transition(
         extras: Default::default(),
     };
     batch.set_priority(u64::MAX);
-    Ok(batch)
+    Ok((batch, delivery))
 }
 
 /// **Phase 4.** Embed the transition into the PSBT and commit it. `rgb_commit`
 /// rewrites the host output's scriptPubkey, so the witness txid is stable from
 /// here on (and the maker must sign *after* this — U4). The committed fascia is
 /// consumed into the stash as [`WitnessOrd::Tentative`] (U5) and the
-/// witness-extended consignment is emitted, addressed to `delivery_seal` (a
-/// blinded seal — the taker's on buy, the taker's *change* seal on sell). Returns
-/// the consignment + witness id; both flows hand it back to the taker as
-/// `final_consignment` so it can record the RGB it received. (A sell with no
-/// surplus has no change seal, so it delivers to the maker seal and the caller
-/// drops the result.)
+/// witness-extended consignment is emitted, addressed to `delivery` — a blinded
+/// recipient via `secret_seals`, or a witness-vout recipient via `outputs` (its
+/// graph seal resolves to an `OutputSeal` against the now-known witness id).
+/// Returns the consignment + witness id; both flows hand it back to the taker as
+/// `final_consignment` so it can record the RGB it received.
 pub(crate) fn commit_and_consign(
     wallet: &mut MakerWallet,
     psbt: &mut Psbt,
     batch: Batch,
     contract_id: ContractId,
-    delivery_seal: SecretSeal,
+    delivery: DeliverySeal,
 ) -> Result<(rgb::containers::Transfer, Txid), RgbError> {
     psbt.rgb_embed(batch)
         .map_err(|e| RgbError::TransferBuild(format!("rgb_embed: {e}")))?;
@@ -457,10 +509,18 @@ pub(crate) fn commit_and_consign(
         .stock_mut()
         .consume_fascia(fascia, FasciaResolver { witness_id })
         .map_err(|e| RgbError::TransferBuild(format!("consume_fascia: {e}")))?;
-    let transfer = wallet
-        .stock_mut()
-        .transfer(contract_id, [], [delivery_seal], [], Some(witness_id))
-        .map_err(|e| RgbError::TransferBuild(format!("transfer: {e}")))?;
+    let stock = wallet.stock_mut();
+    let transfer = match delivery {
+        DeliverySeal::Secret(seal) => stock
+            .transfer(contract_id, [], [seal], [], Some(witness_id))
+            .map_err(|e| RgbError::TransferBuild(format!("transfer: {e}")))?,
+        DeliverySeal::WitnessVout(graph_seal) => {
+            let output_seal = graph_seal.to_output_seal_or_default(witness_id);
+            stock
+                .transfer(contract_id, [output_seal], [], [], Some(witness_id))
+                .map_err(|e| RgbError::TransferBuild(format!("transfer: {e}")))?
+        }
+    };
     Ok((transfer, witness_id))
 }
 
@@ -588,7 +648,7 @@ pub(crate) struct SellInputs {
     pub(crate) contract_id: ContractId,
     pub(crate) maker_seal: SecretSeal,
     deliver_amount: u64,
-    pub(crate) taker_change_seal: Option<SecretSeal>,
+    pub(crate) taker_change_seal: Option<TakerSeal>,
     maker_change_spk: ScriptPubkey,
     taker_payout_spk: ScriptPubkey,
     descriptor: RgbDescr,
@@ -615,11 +675,9 @@ pub(crate) fn prepare_sell_inputs(
         Some(inv) => {
             let invoice = RgbInvoice::from_str(inv).map_err(|_| RgbError::InvalidInvoice)?;
             let seal = match invoice.beneficiary.into_inner() {
-                Beneficiary::BlindedSeal(seal) => seal,
-                Beneficiary::WitnessVout(..) => {
-                    return Err(RgbError::TransferBuild(
-                        "rgb_change_invoice must carry a blinded-seal beneficiary".to_owned(),
-                    ));
+                Beneficiary::BlindedSeal(seal) => TakerSeal::Blinded(seal),
+                Beneficiary::WitnessVout(pay2vout, _) => {
+                    TakerSeal::Witness(pay2vout.script_pubkey())
                 }
             };
             Some(seal)
@@ -677,9 +735,17 @@ pub(crate) fn assemble_sell_psbt(
     // explicit fee, plus the seal-anchor sats from the outpoints it
     // consigned. Bundling into one output keeps tx size minimal.
     let taker_rgb_btc_total: u64 = taker_rgb_prevouts.iter().map(|(_, t)| t.value_sats).sum();
+    // A witness-vout change recipient gets its surplus RGB on a fresh output we
+    // fund with SEAL_ANCHOR_SATS, paid out of the taker's own payout (net wash —
+    // the taker owns that output too). A blinded change reuses an anchor.
+    let taker_change_anchor_sats = match &inputs.taker_change_seal {
+        Some(TakerSeal::Witness(_)) => SEAL_ANCHOR_SATS,
+        _ => 0,
+    };
     let payout = gross_btc_sats
         .saturating_sub(actual_fee_sats)
-        .saturating_add(taker_rgb_btc_total);
+        .saturating_add(taker_rgb_btc_total)
+        .saturating_sub(taker_change_anchor_sats);
     let maker_change = maker_btc_total.saturating_sub(gross_btc_sats);
 
     let seq = SeqNo::from_consensus_u32(SEQ_FINAL);
@@ -702,6 +768,11 @@ pub(crate) fn assemble_sell_psbt(
             inputs.maker_change_spk.clone(),
             Sats(maker_change),
         ));
+    }
+    // Witness-vout change output: carries the taker's surplus RGB (the change
+    // seal binds to its post-sort vout in `build_sell_transition`).
+    if let Some(TakerSeal::Witness(spk)) = &inputs.taker_change_seal {
+        tx_outputs.push(BpTxOut::new(spk.clone(), Sats(taker_change_anchor_sats)));
     }
     let unsigned_tx = UnsignedTx {
         version: TxVer::V2,
@@ -747,19 +818,20 @@ pub(crate) fn assemble_sell_psbt(
 /// **Phase 3 (sell).** Build the RGB state transition that spends the taker's
 /// (now stash-resident, after `validate_incoming_consignment`'s `accept_transfer`)
 /// allocations, assigns `deliver_amount` to the maker's blinded seal, and
-/// routes any surplus to the taker's change seal. Returns the [`Batch`] ready
-/// to embed plus a bool that's `true` when a change allocation was added (i.e.
-/// the taker over-consigned) — the caller delivers the maker-emitted consignment
-/// to the taker's change seal only in that case.
+/// routes any surplus to the taker's change seal. Returns the [`Batch`], the
+/// [`DeliverySeal`] the caller consigns to (the change seal when the taker
+/// over-consigned, else the maker seal), and a bool that's `true` when a change
+/// allocation was added.
 ///
-/// Unlike the buy side, this doesn't bind any seal to a post-sort PSBT vout —
-/// both RGB destinations are pre-existing `BlindedSeal`s — so the transition
-/// is independent of PSBT output ordering.
+/// A blinded change seal is order-independent; a witness-vout change binds to a
+/// post-sort PSBT vout (`psbt` is the already-sorted sell PSBT), exactly like the
+/// buy side.
 pub(crate) fn build_sell_transition(
     wallet: &MakerWallet,
     inputs: &SellInputs,
+    psbt: &Psbt,
     consignment_info: &ConsignmentInfo,
-) -> Result<(Batch, bool), RgbError> {
+) -> Result<(Batch, DeliverySeal, bool), RgbError> {
     let contract = wallet
         .stock()
         .contract_data(inputs.contract_id)
@@ -819,20 +891,40 @@ pub(crate) fn build_sell_transition(
         )
         .map_err(|e| RgbError::TransferBuild(format!("add beneficiary state: {e}")))?;
     let surplus = sum_inputs - inputs.deliver_amount;
-    if surplus > 0 {
-        let change_seal = inputs.taker_change_seal.ok_or_else(|| {
+    // Route surplus back to the taker's change seal (blinded or witness-vout) and
+    // remember how to address its consignment. With no surplus there's nothing to
+    // hand back, so we deliver the (dropped) consignment to the maker's seal.
+    let delivery = if surplus > 0 {
+        let change_seal = inputs.taker_change_seal.as_ref().ok_or_else(|| {
             RgbError::TransferBuild(format!(
                 "taker over-consigned by {surplus}; rgb_change_invoice required"
             ))
         })?;
+        let (change_builder_seal, delivery) = match change_seal {
+            TakerSeal::Blinded(seal) => {
+                (BuilderSeal::Concealed(*seal), DeliverySeal::Secret(*seal))
+            }
+            TakerSeal::Witness(spk) => {
+                let change_vout = psbt
+                    .outputs()
+                    .find(|o| o.script == *spk)
+                    .map(|o| o.vout())
+                    .ok_or_else(|| {
+                        RgbError::TransferBuild(
+                            "taker witness-vout change output missing after sort".to_owned(),
+                        )
+                    })?;
+                let seal = GraphSeal::with_blinded_vout(change_vout, rand::random());
+                (BuilderSeal::Revealed(seal), DeliverySeal::WitnessVout(seal))
+            }
+        };
         builder = builder
-            .add_fungible_state_raw(
-                assignment_type,
-                BuilderSeal::Concealed(change_seal),
-                Amount::from(surplus),
-            )
+            .add_fungible_state_raw(assignment_type, change_builder_seal, Amount::from(surplus))
             .map_err(|e| RgbError::TransferBuild(format!("add change state: {e}")))?;
-    }
+        delivery
+    } else {
+        DeliverySeal::Secret(inputs.maker_seal)
+    };
 
     let main = builder
         .complete_transition()
@@ -842,7 +934,7 @@ pub(crate) fn build_sell_transition(
         extras: Default::default(),
     };
     batch.set_priority(u64::MAX);
-    Ok((batch, surplus > 0))
+    Ok((batch, delivery, surplus > 0))
 }
 
 // ---------------------------------------------------------------------------

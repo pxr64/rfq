@@ -238,8 +238,11 @@ async fn persist_and_try_accept(
     }
 }
 
-/// Fee (sats) for the taker's in-process sell consignment transfer.
-const SELL_RGB_FEE_SATS: u64 = 1_000;
+/// Fee (sats) for the taker's in-process sell consignment transfer. This tx is
+/// a phantom: the maker discards it and rebuilds the real swap tx (with its own
+/// fee), so this only has to let `wallet.pay` balance — keep it small so a
+/// minimally-funded witness-vout RGB input still leaves room for a change output.
+const SELL_RGB_FEE_SATS: u64 = 200;
 
 fn btc_asset() -> AssetId {
     AssetId {
