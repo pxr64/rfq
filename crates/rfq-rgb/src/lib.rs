@@ -61,15 +61,15 @@ pub struct FinalizedSwap {
 
 /// What the maker needs back from its own invoice string at sell-side /sign
 /// time. The maker minted the invoice via `create_invoice`, shipped the wire
-/// string to the taker on the `Quote`, and now needs the typed components to
-/// call `create_swap_psbt_sell` without re-parsing the wire string inside the
-/// backend (the abstraction needs the typed `ContractId` + `SecretSeal`, but
-/// rfq-maker doesn't want to depend on `rgb` directly to do the parse itself).
-/// `amount` mirrors the invoice's optional assignment amount.
+/// string to the taker on the `Quote`, and now needs the typed contract id (so
+/// rfq-maker doesn't depend on `rgb` to parse the wire string itself) plus the
+/// optional assignment amount. The invoice's beneficiary seal is NOT needed: the
+/// maker rebuilds the transition and routes its own receive to a fresh
+/// witness-vout output, so the handshake seal (blinded or witness-vout) is just
+/// the taker's consignment target.
 #[derive(Debug, Clone)]
 pub struct MakerInvoiceParts {
     pub contract_id: ContractId,
-    pub seal: SecretSeal,
     pub amount: Option<u64>,
 }
 
@@ -193,7 +193,6 @@ pub trait RgbBackend: Send + Sync {
         taker_rgb_prevouts: &[(Outpoint, TxOut)],
         maker_btc_inputs: &[(Outpoint, TxOut)],
         contract_id: ContractId,
-        maker_seal: SecretSeal,
         deliver_amount: u64,
         btc_payout_addr: &str,
         rgb_change_invoice: Option<&str>,
@@ -339,7 +338,6 @@ impl RgbBackend for MockRgbBackend {
             .map_err(|_| RgbError::TransferBuild("mock invoice: bad amount".to_owned()))?;
         Ok(MakerInvoiceParts {
             contract_id: ContractId::from(mock_bytes32(&format!("{invoice}|contract"))),
-            seal: SecretSeal::from(mock_bytes32(&format!("{invoice}|seal"))),
             amount: Some(amount),
         })
     }
@@ -419,7 +417,6 @@ impl RgbBackend for MockRgbBackend {
         taker_rgb_prevouts: &[(Outpoint, TxOut)],
         maker_btc_inputs: &[(Outpoint, TxOut)],
         contract_id: ContractId,
-        maker_seal: SecretSeal,
         deliver_amount: u64,
         btc_payout_addr: &str,
         rgb_change_invoice: Option<&str>,
@@ -434,7 +431,7 @@ impl RgbBackend for MockRgbBackend {
         // confirm the signed PSBT still spends them. `maker-signed` stands in
         // for the maker's signatures over its own BTC inputs.
         let body = format!(
-            "mock-psbt:sell:contract={contract_id}:maker_seal={maker_seal}\
+            "mock-psbt:sell:contract={contract_id}\
              :deliver={deliver_amount}:payout_addr={btc_payout_addr}\
              :gross={gross_btc_sats}:fee={actual_fee_sats}:payout={payout}\
              :rgb_amount={}:rgb_in=[{rgb_in}]:btc_in=[{btc_in}]:rgb_change={}:maker-signed",

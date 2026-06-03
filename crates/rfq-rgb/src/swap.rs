@@ -646,9 +646,15 @@ fn resolve_maker_btc_inputs(
 /// threaded through the remaining phases.
 pub(crate) struct SellInputs {
     pub(crate) contract_id: ContractId,
-    pub(crate) maker_seal: SecretSeal,
     deliver_amount: u64,
     pub(crate) taker_change_seal: Option<TakerSeal>,
+    /// Fresh maker address that receives the bought RGB on a witness-vout
+    /// (revealed) output. The maker rebuilds the transition, so it routes its
+    /// own receive here instead of the blinded invoice seal — `consume_fascia`
+    /// surfaces revealed seals directly (a blinded receive would need an
+    /// `accept_transfer` the maker never does for itself), and no pre-funded
+    /// keychain-9 anchor is required.
+    maker_receive_spk: ScriptPubkey,
     maker_change_spk: ScriptPubkey,
     taker_payout_spk: ScriptPubkey,
     descriptor: RgbDescr,
@@ -664,7 +670,6 @@ pub(crate) struct SellInputs {
 pub(crate) fn prepare_sell_inputs(
     wallet: &mut MakerWallet,
     contract_id: ContractId,
-    maker_seal: SecretSeal,
     deliver_amount: u64,
     btc_payout_addr: &str,
     rgb_change_invoice: Option<&str>,
@@ -690,6 +695,10 @@ pub(crate) fn prepare_sell_inputs(
         })?
         .script_pubkey();
 
+    let maker_receive_spk = wallet
+        .wallet_mut()
+        .next_address(Keychain::OUTER, true)
+        .script_pubkey();
     let maker_change_spk = wallet
         .wallet_mut()
         .next_address(Keychain::OUTER, true)
@@ -699,9 +708,9 @@ pub(crate) fn prepare_sell_inputs(
 
     Ok(SellInputs {
         contract_id,
-        maker_seal,
         deliver_amount,
         taker_change_seal,
+        maker_receive_spk,
         maker_change_spk,
         taker_payout_spk,
         descriptor,
@@ -746,7 +755,11 @@ pub(crate) fn assemble_sell_psbt(
         .saturating_sub(actual_fee_sats)
         .saturating_add(taker_rgb_btc_total)
         .saturating_sub(taker_change_anchor_sats);
-    let maker_change = maker_btc_total.saturating_sub(gross_btc_sats);
+    // The maker receives the bought RGB on its own witness-vout output, funded
+    // with SEAL_ANCHOR_SATS out of the maker's BTC change.
+    let maker_change = maker_btc_total
+        .saturating_sub(gross_btc_sats)
+        .saturating_sub(SEAL_ANCHOR_SATS);
 
     let seq = SeqNo::from_consensus_u32(SEQ_FINAL);
     let mut tx_inputs: Vec<UnsignedTxIn> = Vec::new();
@@ -769,6 +782,12 @@ pub(crate) fn assemble_sell_psbt(
             Sats(maker_change),
         ));
     }
+    // Maker receive output: carries the maker's bought RGB on a witness-vout
+    // seal (bound to its post-sort vout in `build_sell_transition`).
+    tx_outputs.push(BpTxOut::new(
+        inputs.maker_receive_spk.clone(),
+        Sats(SEAL_ANCHOR_SATS),
+    ));
     // Witness-vout change output: carries the taker's surplus RGB (the change
     // seal binds to its post-sort vout in `build_sell_transition`).
     if let Some(TakerSeal::Witness(spk)) = &inputs.taker_change_seal {
@@ -883,17 +902,30 @@ pub(crate) fn build_sell_transition(
         )));
     }
 
+    // Maker receives on a witness-vout (revealed) seal bound to its fresh receive
+    // output's post-sort vout. `consume_fascia` surfaces revealed seals directly
+    // — a blinded receive would need an `accept_transfer` the maker never does
+    // for itself, so the bought RGB would never show in `list_inventory_utxos`.
+    let maker_receive_vout = psbt
+        .outputs()
+        .find(|o| o.script == inputs.maker_receive_spk)
+        .map(|o| o.vout())
+        .ok_or_else(|| {
+            RgbError::TransferBuild("maker receive output missing after sort".to_owned())
+        })?;
+    let maker_receive_seal = GraphSeal::with_blinded_vout(maker_receive_vout, rand::random());
     builder = builder
         .add_fungible_state_raw(
             assignment_type,
-            BuilderSeal::Concealed(inputs.maker_seal),
+            BuilderSeal::Revealed(maker_receive_seal),
             Amount::from(inputs.deliver_amount),
         )
         .map_err(|e| RgbError::TransferBuild(format!("add beneficiary state: {e}")))?;
     let surplus = sum_inputs - inputs.deliver_amount;
     // Route surplus back to the taker's change seal (blinded or witness-vout) and
     // remember how to address its consignment. With no surplus there's nothing to
-    // hand back, so we deliver the (dropped) consignment to the maker's seal.
+    // hand to the taker, so we deliver the (dropped) consignment to the maker's
+    // own receive seal — a valid revealed seal for `stock.transfer`.
     let delivery = if surplus > 0 {
         let change_seal = inputs.taker_change_seal.as_ref().ok_or_else(|| {
             RgbError::TransferBuild(format!(
@@ -923,7 +955,7 @@ pub(crate) fn build_sell_transition(
             .map_err(|e| RgbError::TransferBuild(format!("add change state: {e}")))?;
         delivery
     } else {
-        DeliverySeal::Secret(inputs.maker_seal)
+        DeliverySeal::WitnessVout(maker_receive_seal)
     };
 
     let main = builder

@@ -21,7 +21,7 @@ use rgb::resolvers::AnyResolver;
 use rgb::validation::{ResolveWitness, ValidationConfig, Validity};
 use rgb::{
     AssignmentsRef, BundleId, ChainNet, ContractId, Genesis, GraphSeal, Operation, OpId, RgbDescr,
-    RgbKeychain, RgbWallet, SecretSeal, StateType, Transition, TransferParams, TxoSeal,
+    RgbKeychain, RgbWallet, StateType, Transition, TransferParams, TxoSeal,
 };
 
 use crate::swap;
@@ -699,31 +699,21 @@ impl RgbBackend for LibRgbBackend {
         &self,
         invoice: &str,
     ) -> Result<MakerInvoiceParts, RgbError> {
-        // The maker minted this invoice via `create_invoice`; we just reverse
-        // the wire encoding into the typed components rfq-maker threads into
-        // `create_swap_psbt_sell`. Reject witness-vout beneficiaries — the
-        // maker's `create_invoice` only emits blinded-seal invoices today.
+        // The maker minted this invoice via `create_invoice`; we only need its
+        // contract id + amount. The beneficiary seal is irrelevant — the maker
+        // routes its own receive to a fresh witness-vout output in
+        // `build_sell_transition`, so the invoice (blinded OR witness-vout, e.g.
+        // when the maker has no free anchor) is just the taker's consignment
+        // target.
         let parsed = RgbInvoice::from_str(invoice).map_err(|_| RgbError::InvalidInvoice)?;
         let contract_id = parsed.contract.ok_or_else(|| {
             RgbError::TransferBuild("maker invoice carries no contract id".to_owned())
         })?;
-        let seal = match parsed.beneficiary.into_inner() {
-            Beneficiary::BlindedSeal(seal) => seal,
-            Beneficiary::WitnessVout(..) => {
-                return Err(RgbError::TransferBuild(
-                    "maker invoice must carry a blinded-seal beneficiary".to_owned(),
-                ));
-            }
-        };
         let amount = match parsed.assignment_state {
             Some(InvoiceState::Amount(a)) => Some(*a.as_inner()),
             _ => None,
         };
-        Ok(MakerInvoiceParts {
-            contract_id,
-            seal,
-            amount,
-        })
+        Ok(MakerInvoiceParts { contract_id, amount })
     }
 
     async fn validate_incoming_consignment(
@@ -814,7 +804,6 @@ impl RgbBackend for LibRgbBackend {
         taker_rgb_prevouts: &[(Outpoint, TxOut)],
         maker_btc_inputs: &[(Outpoint, TxOut)],
         contract_id: ContractId,
-        maker_seal: SecretSeal,
         deliver_amount: u64,
         btc_payout_addr: &str,
         rgb_change_invoice: Option<&str>,
@@ -825,12 +814,11 @@ impl RgbBackend for LibRgbBackend {
         let mut wallet = self.load_wallet()?;
 
         // 1. Resolve the maker's side: taker's RGB-change seal (if any), the
-        //    taker's BTC payout spk, a fresh maker BTC change address, and
+        //    taker's BTC payout spk, a fresh maker receive + change address, and
         //    per-input terminals for the maker's BTC inputs.
         let inputs = swap::prepare_sell_inputs(
             &mut wallet,
             contract_id,
-            maker_seal,
             deliver_amount,
             btc_payout_addr,
             rgb_change_invoice,

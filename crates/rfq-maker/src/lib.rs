@@ -737,7 +737,6 @@ impl Maker {
                 &taker_rgb_prevouts,
                 &maker_btc_inputs,
                 maker_invoice_parts.contract_id,
-                maker_invoice_parts.seal,
                 deliver_amount,
                 &pending.btc_payout_addr,
                 pending.rgb_change_invoice.as_deref(),

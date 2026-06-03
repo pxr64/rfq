@@ -286,6 +286,28 @@ impl RegtestStack {
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         let out = bitcoin_cli(&self.compose_dir, &["sendrawtransaction", &hex])?;
+        // Confirm it so the swapped RGB settles on-chain before the next test
+        // composes against the same maker/taker allocation — without this,
+        // several round-trips spending the same allocation collide in the
+        // mempool as RBF replacements. Then re-sync both wallet caches so the
+        // next test's `list_inventory_utxos` / consignment build sees the
+        // post-swap UTXO set rather than the now-spent inputs.
+        self.mine_block()?;
+        wait_for_electrs_tip(&self.compose_dir, &self.electrum_url)?;
+        rgb_cmd(
+            &self.tools_dir,
+            &self.maker.stash_dir,
+            "maker",
+            &self.electrum_url,
+            &["utxos", "--sync"],
+        )?;
+        rgb_cmd(
+            &self.tools_dir,
+            &self.taker.stash_dir,
+            "taker",
+            &self.electrum_url,
+            &["utxos", "--sync"],
+        )?;
         Ok(out.trim().to_owned())
     }
 
@@ -598,20 +620,19 @@ impl RegtestStack {
             "issuer",
             &electrum_url,
         )?;
-        fund_role(
-            &tools_dir,
-            &compose_dir,
-            &maker.stash_dir,
-            "maker",
-            &electrum_url,
-        )?;
-        fund_role(
-            &tools_dir,
-            &compose_dir,
-            &maker.stash_dir,
-            "maker",
-            &electrum_url,
-        )?;
+        // Maker gets several keychain-9 UTXOs: one is claimed by the issuer→maker
+        // transfer for RGB, and the rest serve as both seal anchors for the
+        // buy-side maker invoices and spare BTC inputs for the broadcasting sell
+        // round-trips — the full suite runs many of each against one bootstrap.
+        for _ in 0..8 {
+            fund_role(
+                &tools_dir,
+                &compose_dir,
+                &maker.stash_dir,
+                "maker",
+                &electrum_url,
+            )?;
+        }
         fund_role(
             &tools_dir,
             &compose_dir,
