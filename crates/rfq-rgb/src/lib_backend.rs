@@ -5,10 +5,10 @@ use async_trait::async_trait;
 use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, SwapTransfer};
 
 use bpstd::psbt::Psbt;
-use bpstd::{Network, Sats, Txid, XprivAccount, XpubDerivable};
+use bpstd::{HardenedIndex, Keychain, Network, Sats, Txid, XprivAccount, XpubDerivable};
 use bpwallet::fs::FsTextStore;
-use bpwallet::hot::SecureIo;
-use bpwallet::Wallet;
+use bpwallet::hot::{SecureIo, Seed, SeedType};
+use bpwallet::{Bip43, Wallet};
 use psrgbt::PsbtConstructor;
 use amplify::Wrapper as _;
 use base64::Engine as _;
@@ -21,7 +21,7 @@ use rgb::resolvers::AnyResolver;
 use rgb::validation::{ResolveWitness, ValidationConfig, Validity};
 use rgb::{
     AssignmentsRef, BundleId, ChainNet, ContractId, Genesis, GraphSeal, Operation, OpId, RgbDescr,
-    RgbKeychain, RgbWallet, StateType, Transition, TransferParams, TxoSeal,
+    RgbKeychain, RgbWallet, StateType, TapretKey, Transition, TransferParams, TxoSeal,
 };
 
 use crate::swap;
@@ -68,6 +68,96 @@ impl LibRgbBackend {
             signer_account_file,
             signer_password,
         }
+    }
+
+    /// Create a fresh taproot (tapret) RGB wallet + an empty Stock on disk,
+    /// Rust-native (no `rgb-cmd`/docker) — the operator path that replaces
+    /// `rgb create --tapret-key-only`. Generates a new seed, writes the encrypted
+    /// signing account to `signer_account_file`, derives a BIP-86 taproot
+    /// descriptor on the RGB keychains `/<0;1;10>/*`, and persists the wallet
+    /// (`FsTextStore`) + Stock (`FsBinStore`) at the same paths `load_wallet` /
+    /// `load_stock` read from. Errors if a wallet already exists there.
+    pub fn create_wallet(&self) -> Result<(), RgbError> {
+        let network = self.parse_network()?;
+        if self.wallet_path().exists() {
+            return Err(RgbError::StashLoad(format!(
+                "wallet already exists at {}",
+                self.wallet_path().display()
+            )));
+        }
+
+        // Fresh seed → BIP-86 taproot account. A testnet xpub (tpub) for any
+        // non-mainnet network (signet/testnet/regtest); mainnet gets an xpub.
+        let seed = Seed::random(SeedType::Bit128);
+        let account = seed.derive(
+            Bip43::Bip86,
+            !matches!(network, Network::Mainnet),
+            HardenedIndex::hardened(0),
+        );
+
+        // Persist the encrypted signing account — the hot key the swap signs with.
+        if let Some(parent) = self.signer_account_file.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| RgbError::StashLoad(format!("create account dir: {e}")))?;
+        }
+        account
+            .write(&self.signer_account_file, &self.signer_password)
+            .map_err(|e| RgbError::StashLoad(format!("write account file: {e}")))?;
+
+        // Taproot descriptor on the RGB keychains (0=receive, 1=change,
+        // 10=tapret anchors) → `RgbDescr::TapretKey`.
+        let descriptor = format!("{}/<0;1;10>/*", account.to_xpub_account());
+        let xpub = XpubDerivable::from_str(&descriptor)
+            .map_err(|e| RgbError::StashLoad(format!("parse descriptor: {e}")))?;
+        let rgb_descr: RgbDescr = TapretKey::from(xpub).into();
+
+        // Create + persist the bp-wallet at the same path `load_wallet` reads.
+        std::fs::create_dir_all(self.wallet_path())
+            .map_err(|e| RgbError::StashLoad(format!("create wallet dir: {e}")))?;
+        let mut wallet: Wallet<XpubDerivable, RgbDescr> = Wallet::new_layer1(rgb_descr, network);
+        let provider = FsTextStore::new(self.wallet_path())
+            .map_err(|e| RgbError::StashLoad(format!("wallet provider: {e}")))?;
+        wallet
+            .make_persistent(provider, true)
+            .map_err(|e| RgbError::StashLoad(format!("wallet persist: {e}")))?;
+        wallet.set_name(self.wallet_name.clone());
+        wallet
+            .store()
+            .map_err(|e| RgbError::StashLoad(format!("wallet store: {e}")))?;
+
+        // Create + persist a fresh empty Stock at the same path `load_stock` reads
+        // (`make_persistent(_, true)` autosaves on drop).
+        std::fs::create_dir_all(self.stock_path())
+            .map_err(|e| RgbError::StashLoad(format!("create stock dir: {e}")))?;
+        let stock_provider = FsBinStore::new(self.stock_path())
+            .map_err(|e| RgbError::StashLoad(format!("stock provider: {e}")))?;
+        let mut stock = Stock::in_memory();
+        stock
+            .make_persistent(stock_provider, true)
+            .map_err(|e| RgbError::StashLoad(format!("stock persist: {e}")))?;
+        drop(stock);
+
+        Ok(())
+    }
+
+    /// Derive a receive address for the operator to fund manually from a faucet.
+    /// `rgb_keychain` → the tapret RGB seal-anchor keychain (10); otherwise the
+    /// external BTC keychain (0). Read-only: does not advance the wallet index.
+    pub fn funding_address(&self, rgb_keychain: bool) -> Result<String, RgbError> {
+        let mut wallet = self.load_wallet()?;
+        let addr = if rgb_keychain {
+            wallet.wallet_mut().next_address(RgbKeychain::Tapret, false)
+        } else {
+            wallet.wallet_mut().next_address(Keychain::OUTER, false)
+        };
+        Ok(addr.to_string())
+    }
+
+    /// Whether a wallet already exists on disk for this (data_dir, network,
+    /// name) — lets callers (e.g. `colorex maker init`) skip `create_wallet`
+    /// without clobbering an existing wallet.
+    pub fn wallet_exists(&self) -> bool {
+        self.wallet_path().exists()
     }
 
     /// Stock lives at `<data_dir>/<network>/` — same layout rgb-cmd's

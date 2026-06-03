@@ -5,9 +5,11 @@
 //! 2. If the config already exists and `--force` isn't set, prompt to overwrite.
 //! 3. Generate a fresh secp256k1 node-identity keypair (in memory).
 //! 4. Prompt for network, broker URL, listen addr, and optional RGB backend params.
-//! 5. Probe the RGB stash + broker /health (degrades to `[warn]` + continue).
-//! 6. Atomically write `maker.toml`, then the keypair files.
-//! 7. Print the rendered config.
+//! 5. Create the RGB taproot wallet + signing account if absent (kept if present),
+//!    and print the keychain-10 funding address.
+//! 6. Probe the RGB stash + broker /health (degrades to `[warn]` + continue).
+//! 7. Atomically write `maker.toml`, then the keypair files.
+//! 8. Print the rendered config.
 
 use std::path::{Path, PathBuf};
 
@@ -107,6 +109,28 @@ pub async fn run(args: InitArgs, config_path: &Path) -> Result<(), Box<dyn std::
 
     println!();
 
+    if let Some(r) = &rgb {
+        output::step("creating rgb wallet");
+        match create_rgb_wallet(r) {
+            Ok(Some(addr)) => {
+                output::step_ok();
+                println!("  fund this tapret (keychain-10) address, then run `colorex wallet sync`:");
+                println!("    {addr}");
+            }
+            Ok(None) => output::step_skip(), // wallet already exists — kept as-is
+            Err(e) => {
+                output::step_warn(&truncate_error(&e.to_string()));
+                let cont = Confirm::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Continue anyway?")
+                    .default(true)
+                    .interact()?;
+                if !cont {
+                    return Err("init aborted: rgb wallet creation failed".into());
+                }
+            }
+        }
+    }
+
     output::step("probing rgb20 inventory");
     match &rgb {
         Some(r) if !r.contract_id.is_empty() => match probe_rgb_inventory(r).await {
@@ -202,6 +226,26 @@ fn default_electrum_url(network: &str) -> &'static str {
         "mainnet" => "electrum.blockstream.info:50001",
         _ => "localhost:60001",
     }
+}
+
+/// Create the RGB taproot wallet for the maker if one doesn't exist yet, so
+/// `init` is a one-shot setup (config + node key + RGB wallet + signing
+/// account). Returns the keychain-10 funding address (None if a wallet was
+/// already present and kept as-is).
+fn create_rgb_wallet(r: &RgbAnswers) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let backend = LibRgbBackend::new(
+        PathBuf::from(shellexpand::tilde(&r.data_dir).into_owned()),
+        r.wallet_name.clone(),
+        r.network.clone(),
+        r.electrum_url.clone(),
+        PathBuf::from(shellexpand::tilde(&r.account_file).into_owned()),
+        r.password.clone(),
+    );
+    if backend.wallet_exists() {
+        return Ok(None);
+    }
+    backend.create_wallet()?;
+    Ok(Some(backend.funding_address(true)?))
 }
 
 async fn probe_rgb_inventory(r: &RgbAnswers) -> Result<usize, Box<dyn std::error::Error>> {

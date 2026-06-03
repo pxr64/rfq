@@ -78,6 +78,19 @@ pub enum BitcoinNetwork {
     Regtest,
 }
 
+impl std::str::FromStr for BitcoinNetwork {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "mainnet" | "bitcoin" => Ok(Self::Mainnet),
+            "testnet" => Ok(Self::Testnet),
+            "signet" => Ok(Self::Signet),
+            "regtest" => Ok(Self::Regtest),
+            other => Err(format!("unknown bitcoin network: {other}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum AssetKind {
     Btc,
@@ -653,6 +666,15 @@ mod tests {
     use std::str::FromStr;
 
     const VALID_TXID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn bitcoin_network_parses_known_names_case_insensitively() {
+        assert_eq!("signet".parse::<BitcoinNetwork>(), Ok(BitcoinNetwork::Signet));
+        assert_eq!("Regtest".parse::<BitcoinNetwork>(), Ok(BitcoinNetwork::Regtest));
+        assert_eq!("MAINNET".parse::<BitcoinNetwork>(), Ok(BitcoinNetwork::Mainnet));
+        assert_eq!("testnet".parse::<BitcoinNetwork>(), Ok(BitcoinNetwork::Testnet));
+        assert!("mars".parse::<BitcoinNetwork>().is_err());
+    }
 
     #[test]
     fn outpoint_display_uses_txid_colon_vout() {

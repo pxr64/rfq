@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use maker_node::{
     build_maker, build_runtime, init, maker_app, spawn_chain_observer_loop, spawn_cleanup_loop,
     spawn_rebalance_loop, MakerNodeConfig,
 };
 use rfq_client::{RfqClient, Url};
+use rfq_rgb::LibRgbBackend;
 use rfq_maker::Maker;
 use rfq_types::InventorySnapshot;
 use tokio::{net::TcpListener, sync::oneshot};
@@ -27,6 +28,54 @@ enum TopCommand {
         #[command(subcommand)]
         cmd: MakerCmd,
     },
+    /// Wallet tooling: create / address / sync a taproot RGB wallet (Rust-native,
+    /// no rgb-cmd or docker). Works for any role (issuer, maker, taker).
+    Wallet {
+        #[command(subcommand)]
+        cmd: WalletCmd,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+enum WalletCmd {
+    /// Create a fresh taproot RGB wallet + empty stock on disk.
+    Create {
+        #[command(flatten)]
+        common: WalletCommon,
+        /// Encrypted signing-account file to write (the hot key used to sign swaps).
+        #[arg(long)]
+        account_file: PathBuf,
+        #[arg(long, default_value = "")]
+        password: String,
+    },
+    /// Print a receive address to fund manually from a faucet (default: the
+    /// tapret keychain-10 RGB anchor address; `--btc` for the keychain-0 BTC one).
+    Address {
+        #[command(flatten)]
+        common: WalletCommon,
+        #[arg(long)]
+        btc: bool,
+    },
+    /// Sync the wallet against electrum (run after manual funding confirms).
+    Sync {
+        #[command(flatten)]
+        common: WalletCommon,
+        #[arg(long)]
+        electrum: String,
+    },
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq)]
+struct WalletCommon {
+    /// Network: regtest | signet | testnet | mainnet.
+    #[arg(long)]
+    network: String,
+    /// RGB data dir (stock lives at `<data_dir>/<network>`, wallet one level below).
+    #[arg(long)]
+    data_dir: PathBuf,
+    /// Wallet name.
+    #[arg(long)]
+    name: String,
 }
 
 #[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
@@ -60,11 +109,73 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             MakerCmd::Health => health(load_config(&config_path)?).await,
             MakerCmd::Inventory => inventory(load_config(&config_path)?).await,
         },
+        TopCommand::Wallet { cmd } => match cmd {
+            WalletCmd::Create {
+                common,
+                account_file,
+                password,
+            } => wallet_create(common, account_file, password),
+            WalletCmd::Address { common, btc } => wallet_address(common, btc),
+            WalletCmd::Sync { common, electrum } => wallet_sync(common, electrum).await,
+        },
     }
 }
 
 fn load_config(path: &Path) -> Result<MakerNodeConfig, String> {
     MakerNodeConfig::load(path).map_err(|e| format!("config {}: {e}", path.display()))
+}
+
+fn wallet_create(
+    common: WalletCommon,
+    account_file: PathBuf,
+    password: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let backend = LibRgbBackend::new(
+        common.data_dir,
+        common.name.clone(),
+        common.network,
+        String::new(),
+        account_file,
+        password,
+    );
+    backend.create_wallet()?;
+    println!("created wallet '{}'", common.name);
+    println!(
+        "fund this tapret (keychain-10) address from a faucet, then run `wallet sync`:\n  {}",
+        backend.funding_address(true)?
+    );
+    Ok(())
+}
+
+fn wallet_address(common: WalletCommon, btc: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let backend = LibRgbBackend::new(
+        common.data_dir,
+        common.name,
+        common.network,
+        String::new(),
+        PathBuf::new(),
+        String::new(),
+    );
+    println!("{}", backend.funding_address(!btc)?);
+    Ok(())
+}
+
+async fn wallet_sync(
+    common: WalletCommon,
+    electrum: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = common.name.clone();
+    let backend = LibRgbBackend::new(
+        common.data_dir,
+        common.name,
+        common.network,
+        electrum,
+        PathBuf::new(),
+        String::new(),
+    );
+    backend.sync_wallet().await?;
+    println!("synced '{name}'");
+    Ok(())
 }
 
 async fn run(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {

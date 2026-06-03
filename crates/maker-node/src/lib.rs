@@ -283,7 +283,12 @@ pub async fn build_runtime(
 ) -> Result<MakerNodeRuntime, Box<dyn std::error::Error>> {
     let maker_id = MakerId(config.maker.node_id.clone());
     let asset = AssetId {
-        network: BitcoinNetwork::Regtest,
+        // Network comes from the RGB config (signet/mainnet/...); the mock path
+        // (no [rgb] section) stays on regtest.
+        network: match &config.rgb {
+            Some(r) => r.network.parse::<BitcoinNetwork>()?,
+            None => BitcoinNetwork::Regtest,
+        },
         kind: AssetKind::Rgb20,
         id: config
             .rgb

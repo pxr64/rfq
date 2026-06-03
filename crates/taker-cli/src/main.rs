@@ -104,7 +104,7 @@ async fn buy(
     let quotes = client
         .request_quotes(CreateRfqRequest {
             base_asset: asset.clone(),
-            quote_asset: btc_asset(),
+            quote_asset: btc_asset(asset.network.clone()),
             side: Side::Buy,
             amount,
         })
@@ -154,7 +154,7 @@ async fn sell(
     let quotes = client
         .request_quotes(CreateRfqRequest {
             base_asset: asset.clone(),
-            quote_asset: btc_asset(),
+            quote_asset: btc_asset(asset.network.clone()),
             side: Side::Sell,
             amount,
         })
@@ -244,9 +244,9 @@ async fn persist_and_try_accept(
 /// minimally-funded witness-vout RGB input still leaves room for a change output.
 const SELL_RGB_FEE_SATS: u64 = 200;
 
-fn btc_asset() -> AssetId {
+fn btc_asset(network: BitcoinNetwork) -> AssetId {
     AssetId {
-        network: BitcoinNetwork::Regtest,
+        network,
         kind: AssetKind::Btc,
         id: "btc".to_owned(),
     }
@@ -286,6 +286,8 @@ impl TakerConfig {
             .map_err(|e| format!("read taker config {}: {e}", path.display()))?;
         let config: TakerConfig =
             toml::from_str(&text).map_err(|e| format!("parse taker config: {e}"))?;
+        // Validate the network up front so `rgb_asset` can rely on it.
+        config.rgb.network.parse::<BitcoinNetwork>()?;
         Ok(config)
     }
 
@@ -302,7 +304,11 @@ impl TakerConfig {
 
     fn rgb_asset(&self) -> AssetId {
         AssetId {
-            network: BitcoinNetwork::Regtest,
+            network: self
+                .rgb
+                .network
+                .parse()
+                .expect("network validated in TakerConfig::load"),
             kind: AssetKind::Rgb20,
             id: self.rgb.contract_id.clone(),
         }
