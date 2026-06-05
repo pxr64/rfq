@@ -11,9 +11,11 @@
 //! colorex-taker --config taker.toml sell 50
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+use colorex_wallet::{resolve_wallet, WalletInput};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input};
 use rfq_client::{RfqClient, Url};
 use rfq_rgb::Taker;
 use rfq_types::{
@@ -33,6 +35,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Interactively create the taker wallet + signing account and write
+    /// `taker.toml` (name-keyed, like `colorex maker init`).
+    Init {
+        /// Overwrite an existing config without prompting.
+        #[arg(long)]
+        force: bool,
+    },
     /// Buy `amount` RGB, paying BTC.
     Buy { amount: u64 },
     /// Sell `amount` RGB, receiving BTC.
@@ -55,12 +64,19 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    // `init` bootstraps the wallet + config, so it must run before config load.
+    if let Command::Init { force } = &cli.command {
+        return init(&cli.config, *force).await;
+    }
+
     let config = TakerConfig::load(&cli.config)?;
     let taker = config.taker();
     let asset = config.rgb_asset();
     let client = RfqClient::new(Url::parse(&config.broker_url)?);
 
     match cli.command {
+        Command::Init { .. } => unreachable!("handled above"),
         Command::Buy { amount } => buy(&client, &taker, &asset, amount, &config.btc_address).await,
         Command::Sell { amount } => {
             sell(&client, &taker, &asset, amount, &config.btc_address).await
@@ -84,6 +100,132 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     }
+}
+
+/// Interactively create the taker wallet + signing account and write `taker.toml`.
+/// Name-keyed via `colorex_wallet::resolve_wallet`, mirroring `colorex maker init`.
+async fn init(config_path: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let theme = ColorfulTheme::default();
+
+    if config_path.exists() && !force {
+        let overwrite = Confirm::with_theme(&theme)
+            .with_prompt(format!(
+                "config {} already exists. Overwrite?",
+                config_path.display()
+            ))
+            .default(false)
+            .interact()?;
+        if !overwrite {
+            return Err("init aborted: existing config kept".into());
+        }
+    }
+
+    // Wallet name defaults to "taker"; resolve_wallet prompts network / data dir /
+    // electrum / signer with name-derived defaults.
+    let name: String = Input::with_theme(&theme)
+        .with_prompt("wallet name")
+        .default("taker".to_owned())
+        .interact_text()?;
+    let resolved = resolve_wallet(
+        WalletInput {
+            name: Some(name),
+            ..Default::default()
+        },
+        true,
+        true,
+    )?;
+
+    let broker_url: String = Input::with_theme(&theme)
+        .with_prompt("broker URL")
+        .default("http://127.0.0.1:3000".to_owned())
+        .interact_text()?;
+    let contract_id: String = Input::with_theme(&theme)
+        .with_prompt("RGB contract id (leave empty to set later)")
+        .allow_empty(true)
+        .interact_text()?;
+
+    match resolved.create_wallet()? {
+        Some(addr) => {
+            println!("created taker wallet '{}'", resolved.name);
+            println!("  RGB (keychain-10) funding address: {addr}");
+        }
+        None => println!("taker wallet '{}' already exists — kept as-is", resolved.name),
+    }
+    // The taker pays BTC on buy / receives BTC on sell from its keychain-0 address.
+    let btc_address = resolved.backend().funding_address(false)?;
+    println!("  BTC (keychain-0) address: {btc_address}");
+
+    let toml = render_taker_toml(&TakerRender {
+        broker_url: &broker_url,
+        btc_address: &btc_address,
+        network: &resolved.network,
+        data_dir: &resolved.data_dir.to_string_lossy(),
+        wallet_name: &resolved.name,
+        electrum_url: &resolved.electrum_url,
+        contract_id: &contract_id,
+        account_file: &resolved.account_file.to_string_lossy(),
+        password: &resolved.password,
+    });
+    write_config(config_path, &toml)?;
+
+    println!();
+    println!("{toml}");
+    println!("wrote {}", config_path.display());
+    if contract_id.is_empty() {
+        println!("set [rgb] contract_id once the asset is issued, then `colorex-taker buy/sell`.");
+    }
+    Ok(())
+}
+
+struct TakerRender<'a> {
+    broker_url: &'a str,
+    btc_address: &'a str,
+    network: &'a str,
+    data_dir: &'a str,
+    wallet_name: &'a str,
+    electrum_url: &'a str,
+    contract_id: &'a str,
+    account_file: &'a str,
+    password: &'a str,
+}
+
+/// Render a `taker.toml` whose keys match `TakerConfig` / `RgbSection` /
+/// `SignerSection`. Top-level keys precede the `[rgb]` table (TOML requirement).
+fn render_taker_toml(r: &TakerRender<'_>) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("broker_url  = \"{}\"\n", r.broker_url));
+    out.push_str(&format!("btc_address = \"{}\"\n", r.btc_address));
+    out.push('\n');
+    out.push_str("[rgb]\n");
+    out.push_str(&format!("network      = \"{}\"\n", r.network));
+    out.push_str(&format!("data_dir     = \"{}\"\n", r.data_dir));
+    out.push_str(&format!("wallet_name  = \"{}\"\n", r.wallet_name));
+    out.push_str(&format!("electrum_url = \"{}\"\n", r.electrum_url));
+    out.push_str(&format!("contract_id  = \"{}\"\n", r.contract_id));
+    out.push('\n');
+    out.push_str("[rgb.signer]\n");
+    out.push_str(&format!("account_file = \"{}\"\n", r.account_file));
+    out.push_str(&format!("password     = \"{}\"\n", r.password));
+    out
+}
+
+fn write_config(path: &Path, contents: &str) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&tmp)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&tmp, perms)?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Buy `amount` RGB through the broker. Mirrors `drive_buy_via_broker`.
@@ -284,8 +426,12 @@ impl TakerConfig {
     fn load(path: &std::path::Path) -> Result<Self, Box<dyn std::error::Error>> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("read taker config {}: {e}", path.display()))?;
+        Self::load_str(&text)
+    }
+
+    fn load_str(text: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let config: TakerConfig =
-            toml::from_str(&text).map_err(|e| format!("parse taker config: {e}"))?;
+            toml::from_str(text).map_err(|e| format!("parse taker config: {e}"))?;
         // Validate the network up front so `rgb_asset` can rely on it.
         config.rgb.network.parse::<BitcoinNetwork>()?;
         Ok(config)
@@ -312,5 +458,31 @@ impl TakerConfig {
             kind: AssetKind::Rgb20,
             id: self.rgb.contract_id.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rendered_taker_toml_round_trips() {
+        let toml = render_taker_toml(&TakerRender {
+            broker_url: "http://127.0.0.1:3000",
+            btc_address: "tb1qexamplebtcaddr",
+            network: "signet",
+            data_dir: "/home/x/.local/share/colorex/taker",
+            wallet_name: "taker",
+            electrum_url: "ssl://mempool.space:60602",
+            contract_id: "rgb:abc-123",
+            account_file: "/home/x/.local/share/colorex/taker/account.key",
+            password: "",
+        });
+        let cfg = TakerConfig::load_str(&toml).expect("rendered taker.toml parses");
+        assert_eq!(cfg.broker_url, "http://127.0.0.1:3000");
+        assert_eq!(cfg.btc_address, "tb1qexamplebtcaddr");
+        assert_eq!(cfg.rgb.network, "signet");
+        assert_eq!(cfg.rgb.contract_id, "rgb:abc-123");
+        assert_eq!(cfg.rgb.electrum_url, "ssl://mempool.space:60602");
     }
 }

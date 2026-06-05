@@ -5,8 +5,8 @@ use maker_node::{
     build_maker, build_runtime, create_inventory_invoice, init, maker_app, orders,
     spawn_chain_observer_loop, spawn_cleanup_loop, spawn_rebalance_loop, MakerNodeConfig,
 };
+use colorex_wallet::{resolve_wallet, WalletInput};
 use rfq_client::{RfqClient, Url};
-use rfq_rgb::LibRgbBackend;
 use rfq_maker::Maker;
 use rfq_types::InventorySnapshot;
 use tokio::{net::TcpListener, sync::oneshot};
@@ -84,14 +84,17 @@ enum IssuerCmd {
         /// Recipient RGB invoice string.
         #[arg(long)]
         invoice: String,
-        /// Electrum URL to broadcast the anchoring tx.
+        /// Electrum URL to broadcast the anchoring tx. Defaults per-network;
+        /// prompted if omitted.
         #[arg(long)]
-        electrum: String,
-        /// Encrypted signing-account file (the issuer's hot key).
+        electrum: Option<String>,
+        /// Encrypted signing-account file (the issuer's hot key). Defaults to
+        /// `<data_dir>/account.key`; prompted if omitted.
         #[arg(long)]
-        account_file: PathBuf,
-        #[arg(long, default_value = "")]
-        password: String,
+        account_file: Option<PathBuf>,
+        /// Signer password. Prompted if omitted.
+        #[arg(long)]
+        password: Option<String>,
         /// Fee for the transfer tx, in sats.
         #[arg(long, default_value_t = 1000)]
         fee: u64,
@@ -104,11 +107,13 @@ enum WalletCmd {
     Create {
         #[command(flatten)]
         common: WalletCommon,
-        /// Encrypted signing-account file to write (the hot key used to sign swaps).
+        /// Encrypted signing-account file to write. Defaults to
+        /// `<data_dir>/account.key`; prompted if omitted.
         #[arg(long)]
-        account_file: PathBuf,
-        #[arg(long, default_value = "")]
-        password: String,
+        account_file: Option<PathBuf>,
+        /// Signer password. Prompted if omitted.
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Print a receive address to fund manually from a faucet (default: the
     /// tapret keychain-10 RGB anchor address; `--btc` for the keychain-0 BTC one).
@@ -122,22 +127,38 @@ enum WalletCmd {
     Sync {
         #[command(flatten)]
         common: WalletCommon,
+        /// Electrum URL. Defaults per-network; prompted if omitted.
         #[arg(long)]
-        electrum: String,
+        electrum: Option<String>,
     },
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
 struct WalletCommon {
-    /// Network: regtest | signet | testnet | mainnet.
+    /// Wallet name — the only required discriminator; everything else derives
+    /// from it (`~/.local/share/colorex/<name>`). Prompted if omitted.
     #[arg(long)]
-    network: String,
-    /// RGB data dir (stock lives at `<data_dir>/<network>`, wallet one level below).
+    name: Option<String>,
+    /// Network: regtest | signet | testnet | mainnet. Prompted if omitted.
     #[arg(long)]
-    data_dir: PathBuf,
-    /// Wallet name.
+    network: Option<String>,
+    /// RGB data dir (stock lives at `<data_dir>/<network>`). Defaults to
+    /// `~/.local/share/colorex/<name>`; prompted if omitted.
     #[arg(long)]
-    name: String,
+    data_dir: Option<PathBuf>,
+}
+
+impl WalletCommon {
+    /// Seed a [`WalletInput`] with the shared name/network/data-dir; per-command
+    /// extras (electrum/account/password) are layered on by each handler.
+    fn into_input(self) -> WalletInput {
+        WalletInput {
+            name: self.name,
+            network: self.network,
+            data_dir: self.data_dir,
+            ..Default::default()
+        }
+    }
 }
 
 #[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
@@ -258,54 +279,44 @@ fn load_config(path: &Path) -> Result<MakerNodeConfig, String> {
 
 fn wallet_create(
     common: WalletCommon,
-    account_file: PathBuf,
-    password: String,
+    account_file: Option<PathBuf>,
+    password: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let backend = LibRgbBackend::new(
-        common.data_dir,
-        common.name.clone(),
-        common.network,
-        String::new(),
+    let input = WalletInput {
         account_file,
         password,
-    );
-    backend.create_wallet()?;
-    println!("created wallet '{}'", common.name);
-    println!(
-        "fund this tapret (keychain-10) address from a faucet, then run `wallet sync`:\n  {}",
-        backend.funding_address(true)?
-    );
+        ..common.into_input()
+    };
+    let resolved = resolve_wallet(input, false, true)?;
+    match resolved.create_wallet()? {
+        Some(addr) => {
+            println!("created wallet '{}'", resolved.name);
+            println!(
+                "fund this tapret (keychain-10) address from a faucet, then run `wallet sync`:\n  {addr}"
+            );
+        }
+        None => println!("wallet '{}' already exists — kept as-is", resolved.name),
+    }
     Ok(())
 }
 
 fn wallet_address(common: WalletCommon, btc: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let backend = LibRgbBackend::new(
-        common.data_dir,
-        common.name,
-        common.network,
-        String::new(),
-        PathBuf::new(),
-        String::new(),
-    );
-    println!("{}", backend.funding_address(!btc)?);
+    let resolved = resolve_wallet(common.into_input(), false, false)?;
+    println!("{}", resolved.backend().funding_address(!btc)?);
     Ok(())
 }
 
 async fn wallet_sync(
     common: WalletCommon,
-    electrum: String,
+    electrum: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let name = common.name.clone();
-    let backend = LibRgbBackend::new(
-        common.data_dir,
-        common.name,
-        common.network,
-        electrum,
-        PathBuf::new(),
-        String::new(),
-    );
-    backend.sync_wallet().await?;
-    println!("synced '{name}'");
+    let input = WalletInput {
+        electrum_url: electrum,
+        ..common.into_input()
+    };
+    let resolved = resolve_wallet(input, true, false)?;
+    resolved.backend().sync_wallet().await?;
+    println!("synced '{}'", resolved.name);
     Ok(())
 }
 
@@ -386,14 +397,7 @@ fn issuer_issue(
     seal: Option<String>,
     issuer: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let backend = LibRgbBackend::new(
-        common.data_dir,
-        common.name,
-        common.network,
-        String::new(),
-        PathBuf::new(),
-        String::new(),
-    );
+    let backend = resolve_wallet(common.into_input(), false, false)?.backend();
     let genesis_seal = match seal {
         Some(s) => s,
         None => backend.pick_genesis_seal()?,
@@ -414,14 +418,7 @@ fn issuer_issue(
 }
 
 fn issuer_contracts(common: WalletCommon) -> Result<(), Box<dyn std::error::Error>> {
-    let backend = LibRgbBackend::new(
-        common.data_dir,
-        common.name,
-        common.network,
-        String::new(),
-        PathBuf::new(),
-        String::new(),
-    );
+    let backend = resolve_wallet(common.into_input(), false, false)?.backend();
     for line in backend.list_contracts()? {
         println!("{line}");
     }
@@ -432,19 +429,18 @@ fn issuer_contracts(common: WalletCommon) -> Result<(), Box<dyn std::error::Erro
 async fn issuer_transfer(
     common: WalletCommon,
     invoice: String,
-    electrum: String,
-    account_file: PathBuf,
-    password: String,
+    electrum: Option<String>,
+    account_file: Option<PathBuf>,
+    password: Option<String>,
     fee: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let backend = LibRgbBackend::new(
-        common.data_dir,
-        common.name,
-        common.network,
-        electrum,
+    let input = WalletInput {
+        electrum_url: electrum,
         account_file,
         password,
-    );
+        ..common.into_input()
+    };
+    let backend = resolve_wallet(input, true, true)?.backend();
     let (txid, consignment) = backend.distribute(&invoice, fee).await?;
     println!("transfer broadcast: {txid}");
     println!("hand this consignment to the recipient (they accept after the tx confirms):");

@@ -11,12 +11,16 @@
 //! 7. Atomically write `maker.toml`, then the keypair files.
 //! 8. Print the rendered config.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use clap::Args;
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
+use colorex_wallet::{
+    default_account_file, default_data_dir, default_electrum_url, expand_tilde, prompt_network,
+    ResolvedWallet,
+};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password};
 use rfq_client::{RfqClient, Url};
-use rfq_rgb::{LibRgbBackend, RgbBackend};
+use rfq_rgb::RgbBackend;
 use rfq_types::{AssetId, AssetKind, BitcoinNetwork};
 
 use crate::{node_key::NodeKey, output};
@@ -76,7 +80,7 @@ pub async fn run(args: InitArgs, config_path: &Path) -> Result<(), Box<dyn std::
             .interact_text()?;
         let data_dir: String = Input::with_theme(&ColorfulTheme::default())
             .with_prompt("RGB data dir")
-            .default("~/.local/share/colorex/rgb".into())
+            .default(default_data_dir("maker"))
             .interact_text()?;
         let wallet_name: String = Input::with_theme(&ColorfulTheme::default())
             .with_prompt("RGB wallet name")
@@ -88,7 +92,11 @@ pub async fn run(args: InitArgs, config_path: &Path) -> Result<(), Box<dyn std::
             .interact_text()?;
         let account_file: String = Input::with_theme(&ColorfulTheme::default())
             .with_prompt("signer account file")
-            .default("~/.local/share/colorex/maker.account".into())
+            .default(
+                default_account_file(Path::new(&default_data_dir("maker")))
+                    .to_string_lossy()
+                    .into_owned(),
+            )
             .interact_text()?;
         let password = Password::with_theme(&ColorfulTheme::default())
             .with_prompt("signer password (empty for regtest)")
@@ -111,7 +119,7 @@ pub async fn run(args: InitArgs, config_path: &Path) -> Result<(), Box<dyn std::
 
     if let Some(r) = &rgb {
         output::step("creating rgb wallet");
-        match create_rgb_wallet(r) {
+        match resolved_from(r).create_wallet() {
             Ok(Some(addr)) => {
                 output::step_ok();
                 println!("  fund this tapret (keychain-10) address, then run `colorex wallet sync`:");
@@ -208,58 +216,23 @@ struct RenderInput<'a> {
     rgb: Option<&'a RgbAnswers>,
 }
 
-fn prompt_network() -> Result<String, dialoguer::Error> {
-    let options = ["regtest", "signet", "testnet", "mainnet"];
-    let idx = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("network")
-        .items(&options)
-        .default(0)
-        .interact()?;
-    Ok(options[idx].to_owned())
-}
-
-fn default_electrum_url(network: &str) -> &'static str {
-    // Bare `host:port` — the maker daemon resolves via bp-electrum, which takes
-    // no scheme. Blockstream runs public testnet/mainnet servers but NO signet
-    // one, so signet defaults to a local electrs (the realistic signet setup).
-    match network {
-        "regtest" => "localhost:60001",
-        "signet" => "127.0.0.1:60001",
-        "testnet" => "electrum.blockstream.info:60001",
-        "mainnet" => "electrum.blockstream.info:50001",
-        _ => "localhost:60001",
+/// Build a [`ResolvedWallet`] from the maker's RGB answers (tilde-expanded), so
+/// wallet creation + inventory probing share the one construction path used by
+/// the `wallet` / `issuer` / taker commands. `maker init`'s extra prompts
+/// (broker, listen, contract id) stay maker-specific above.
+fn resolved_from(r: &RgbAnswers) -> ResolvedWallet {
+    ResolvedWallet {
+        name: r.wallet_name.clone(),
+        network: r.network.clone(),
+        data_dir: expand_tilde(&r.data_dir),
+        account_file: expand_tilde(&r.account_file),
+        electrum_url: r.electrum_url.clone(),
+        password: r.password.clone(),
     }
-}
-
-/// Create the RGB taproot wallet for the maker if one doesn't exist yet, so
-/// `init` is a one-shot setup (config + node key + RGB wallet + signing
-/// account). Returns the keychain-10 funding address (None if a wallet was
-/// already present and kept as-is).
-fn create_rgb_wallet(r: &RgbAnswers) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let backend = LibRgbBackend::new(
-        PathBuf::from(shellexpand::tilde(&r.data_dir).into_owned()),
-        r.wallet_name.clone(),
-        r.network.clone(),
-        r.electrum_url.clone(),
-        PathBuf::from(shellexpand::tilde(&r.account_file).into_owned()),
-        r.password.clone(),
-    );
-    if backend.wallet_exists() {
-        return Ok(None);
-    }
-    backend.create_wallet()?;
-    Ok(Some(backend.funding_address(true)?))
 }
 
 async fn probe_rgb_inventory(r: &RgbAnswers) -> Result<usize, Box<dyn std::error::Error>> {
-    let backend = LibRgbBackend::new(
-        PathBuf::from(shellexpand::tilde(&r.data_dir).into_owned()),
-        r.wallet_name.clone(),
-        r.network.clone(),
-        r.electrum_url.clone(),
-        PathBuf::from(shellexpand::tilde(&r.account_file).into_owned()),
-        r.password.clone(),
-    );
+    let backend = resolved_from(r).backend();
     let asset = AssetId {
         network: parse_network(&r.network).ok_or("unknown network")?,
         kind: AssetKind::Rgb20,

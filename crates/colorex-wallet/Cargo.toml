@@ -1,0 +1,10 @@
+[package]
+name = "colorex-wallet"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+rfq-rgb = { path = "../rfq-rgb" }
+dialoguer = { version = "0.11", default-features = false, features = ["password"] }
+shellexpand = "3"
