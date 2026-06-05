@@ -462,6 +462,38 @@ impl LibRgbBackend {
         Ok(())
     }
 
+    /// Sync the wallet against electrum, then return its tracked UTXOs (BTC).
+    /// Role-agnostic — needs no RGB contract; sum `sats` for the spendable
+    /// balance, and the keychain distinguishes the BTC (0) vs RGB-anchor (10)
+    /// addresses. Mirrors `sync_wallet`'s incremental update.
+    pub async fn wallet_balance(&self) -> Result<Vec<WalletUtxo>, RgbError> {
+        use bpstd::IdxBase as _;
+        use bpwallet::AnyIndexer;
+        let mut wallet = self.load_wallet()?;
+        let client = electrum::Client::new(&self.electrum_url)
+            .map_err(|e| RgbError::StashLoad(format!("electrum connect: {e}")))?;
+        let indexer = AnyIndexer::Electrum(Box::new(client));
+        let result = wallet.wallet_mut().update(&indexer);
+        if let Some(errors) = result.err {
+            return Err(RgbError::StashLoad(format!(
+                "wallet sync surfaced {} error(s): {:?}",
+                errors.len(),
+                errors
+            )));
+        }
+        let mut out = Vec::new();
+        for u in wallet.wallet().utxos() {
+            out.push(WalletUtxo {
+                txid: u.outpoint.txid.to_string(),
+                vout: u.outpoint.vout.into_u32(),
+                sats: u.value.sats(),
+                keychain: u.terminal.keychain.index(),
+                index: u.terminal.index.index(),
+            });
+        }
+        Ok(out)
+    }
+
     /// Build a unilateral RGB transfer to `recipient_invoice`, returning the
     /// base64 consignment. This is the taker's sell-side action: it hands the
     /// maker a consignment that the maker validates and anchors into the swap
@@ -613,6 +645,18 @@ impl LibRgbBackend {
             other => Err(RgbError::StashLoad(format!("unknown network `{other}`"))),
         }
     }
+}
+
+/// A single wallet UTXO: BTC value plus its derivation terminal. Role-agnostic
+/// (no RGB contract needed); `keychain` is the BIP-86 keychain (0 = BTC,
+/// 10 = tapret RGB anchor).
+#[derive(Debug, Clone)]
+pub struct WalletUtxo {
+    pub txid: String,
+    pub vout: u32,
+    pub sats: u64,
+    pub keychain: u32,
+    pub index: u32,
 }
 
 #[allow(dead_code)]

@@ -12,10 +12,34 @@ pub mod interactive;
 
 use std::path::PathBuf;
 
-use rfq_rgb::{LibRgbBackend, RgbError};
+use rfq_rgb::{LibRgbBackend, RgbError, WalletUtxo};
 
 pub use defaults::{default_account_file, default_data_dir, default_electrum_url, expand_tilde};
 pub use interactive::{prompt_network, resolve_wallet};
+
+/// Human-readable BTC balance for a wallet's UTXOs: a total line plus one line
+/// per UTXO, labelled by keychain (0 = BTC, 10 = RGB anchor). Shared by
+/// `colorex wallet balance` and `colorex-taker balance`.
+pub fn render_balance(utxos: &[WalletUtxo]) -> String {
+    let total: u64 = utxos.iter().map(|u| u.sats).sum();
+    let mut out = format!(
+        "balance: {total} sats ({} utxo{})\n",
+        utxos.len(),
+        if utxos.len() == 1 { "" } else { "s" }
+    );
+    for u in utxos {
+        let label = match u.keychain {
+            0 => "BTC",
+            10 => "RGB-anchor",
+            _ => "other",
+        };
+        out.push_str(&format!(
+            "  {}:{}  {} sats  [keychain {} · {label}]\n",
+            u.txid, u.vout, u.sats, u.keychain
+        ));
+    }
+    out
+}
 
 /// CLI-provided wallet values; any `None` is filled by [`resolve_wallet`]
 /// (prompt with a name-derived default).

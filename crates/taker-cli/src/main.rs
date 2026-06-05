@@ -52,6 +52,8 @@ enum Command {
     Accept { path: PathBuf },
     /// Print the taker's RGB inventory for the configured contract.
     Inventory,
+    /// Sync against electrum and print the taker wallet's BTC balance.
+    Balance,
 }
 
 #[tokio::main]
@@ -97,6 +99,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 total += u.amount;
             }
             println!("total={total} across {} allocation(s)", utxos.len());
+            Ok(())
+        }
+        Command::Balance => {
+            let rw = colorex_wallet::ResolvedWallet {
+                name: config.rgb.wallet_name.clone(),
+                network: config.rgb.network.clone(),
+                data_dir: config.rgb.data_dir.clone(),
+                account_file: config.rgb.signer.account_file.clone(),
+                electrum_url: config.rgb.electrum_url.clone(),
+                password: config.rgb.signer.password.clone(),
+            };
+            let utxos = rw.backend().wallet_balance().await?;
+            print!("{}", colorex_wallet::render_balance(&utxos));
             Ok(())
         }
     }

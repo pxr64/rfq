@@ -131,6 +131,14 @@ enum WalletCmd {
         #[arg(long)]
         electrum: Option<String>,
     },
+    /// Sync against electrum and print the wallet's BTC balance (per-utxo).
+    Balance {
+        #[command(flatten)]
+        common: WalletCommon,
+        /// Electrum URL. Defaults per-network; prompted if omitted.
+        #[arg(long)]
+        electrum: Option<String>,
+    },
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
@@ -248,6 +256,7 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             } => wallet_create(common, account_file, password),
             WalletCmd::Address { common, btc } => wallet_address(common, btc),
             WalletCmd::Sync { common, electrum } => wallet_sync(common, electrum).await,
+            WalletCmd::Balance { common, electrum } => wallet_balance(common, electrum).await,
         },
         TopCommand::Issuer { cmd } => match cmd {
             IssuerCmd::Issue {
@@ -317,6 +326,20 @@ async fn wallet_sync(
     let resolved = resolve_wallet(input, true, false)?;
     resolved.backend().sync_wallet().await?;
     println!("synced '{}'", resolved.name);
+    Ok(())
+}
+
+async fn wallet_balance(
+    common: WalletCommon,
+    electrum: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let input = WalletInput {
+        electrum_url: electrum,
+        ..common.into_input()
+    };
+    let resolved = resolve_wallet(input, true, false)?;
+    let utxos = resolved.backend().wallet_balance().await?;
+    print!("{}", colorex_wallet::render_balance(&utxos));
     Ok(())
 }
 
