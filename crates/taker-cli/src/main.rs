@@ -303,6 +303,13 @@ async fn buy(
         .transfer
         .ok_or("buy accept did not return a partial PSBT")?;
 
+    // Capture hook: dump the maker's partial PSBT (base64) for the browser
+    // wallet's decode work. Set COLOREX_DUMP_PSBT=/path to enable.
+    if let Ok(path) = std::env::var("COLOREX_DUMP_PSBT") {
+        std::fs::write(&path, &transfer.partial_psbt).ok();
+        println!("dumped maker partial PSBT (base64) → {path}");
+    }
+
     let signed = taker.sign_and_finalize(&transfer.partial_psbt)?;
     let settled = client.submit_signed_psbt(quote.quote_id, signed).await?;
     let txid = settled
