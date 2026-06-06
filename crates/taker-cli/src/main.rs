@@ -92,13 +92,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Inventory => {
             let utxos = taker.inventory(&asset).await?;
-            println!("taker inventory for {}:", asset.id);
+            // Ticker + precision from the contract spec; fall back to the raw
+            // contract id / 0-precision if it isn't in the stash yet.
+            let (ticker, precision) = taker
+                .contract_spec(&asset)
+                .unwrap_or_else(|_| (asset.id.clone(), 0));
+            println!("taker inventory for {ticker} ({}):", asset.id);
             let mut total = 0u64;
             for u in &utxos {
-                println!("  {}:{}  amount={}", u.outpoint.txid, u.outpoint.vout, u.amount);
+                println!(
+                    "  {}:{}  {ticker} {}",
+                    u.outpoint.txid,
+                    u.outpoint.vout,
+                    rfq_types::format_amount(u.amount, precision)
+                );
                 total += u.amount;
             }
-            println!("total={total} across {} allocation(s)", utxos.len());
+            println!(
+                "total {ticker} {} across {} allocation(s)",
+                rfq_types::format_amount(total, precision),
+                utxos.len()
+            );
             Ok(())
         }
         Command::Balance => {

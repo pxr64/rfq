@@ -468,6 +468,8 @@ pub enum InventoryError {
         from: InventoryStatus,
         to: String,
     },
+    /// A persistence backend (e.g. SQLite) failed an I/O or (de)serialization op.
+    Backend(String),
 }
 
 impl std::fmt::Display for InventoryError {
@@ -482,6 +484,7 @@ impl std::fmt::Display for InventoryError {
             Self::InvalidTransition { from, to } => {
                 write!(f, "invalid inventory transition: {from:?} -> {to}")
             }
+            Self::Backend(msg) => write!(f, "inventory backend error: {msg}"),
         }
     }
 }
@@ -616,6 +619,8 @@ pub enum BtcInventoryError {
         requested: u64,
         available: u64,
     },
+    /// A persistence backend (e.g. SQLite) failed an I/O or (de)serialization op.
+    Backend(String),
 }
 
 impl std::fmt::Display for BtcInventoryError {
@@ -636,6 +641,7 @@ impl std::fmt::Display for BtcInventoryError {
                 f,
                 "insufficient btc inventory: requested {requested} sats, available {available} sats"
             ),
+            Self::Backend(msg) => write!(f, "btc inventory backend error: {msg}"),
         }
     }
 }
@@ -660,10 +666,34 @@ pub struct SwapTransfer {
     pub expected_witness_txid: Option<String>,
 }
 
+/// Format a raw integer token amount with `precision` decimal places, for
+/// human-readable display — e.g. `format_amount(100, 2) == "1.00"`,
+/// `format_amount(1, 8) == "0.00000001"`, `format_amount(5, 0) == "5"`. Pure
+/// integer math (no float rounding). `precision` is clamped to RGB's 0..=18.
+pub fn format_amount(raw: u64, precision: u8) -> String {
+    let precision = precision.min(18);
+    if precision == 0 {
+        return raw.to_string();
+    }
+    let divisor = 10u64.pow(precision as u32);
+    let whole = raw / divisor;
+    let frac = raw % divisor;
+    format!("{whole}.{frac:0width$}", width = precision as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn format_amount_places_decimals() {
+        assert_eq!(format_amount(100, 2), "1.00");
+        assert_eq!(format_amount(12345, 2), "123.45");
+        assert_eq!(format_amount(1, 8), "0.00000001");
+        assert_eq!(format_amount(5, 0), "5");
+        assert_eq!(format_amount(0, 2), "0.00");
+    }
 
     const VALID_TXID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 

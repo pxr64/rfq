@@ -86,6 +86,11 @@ impl Taker {
         self.lib_backend().list_inventory_utxos(asset).await
     }
 
+    /// The contract's ticker + precision (decimals), for formatting inventory.
+    pub fn contract_spec(&self, asset: &AssetId) -> Result<(String, u8), RgbError> {
+        self.lib_backend().contract_spec(asset)
+    }
+
     /// Mint a fresh RGB invoice on the taker's stash (buy: receive bought
     /// tokens; sell: receive over-consigned change).
     pub async fn create_invoice(&self, asset: &AssetId, amount: u64) -> Result<String, RgbError> {

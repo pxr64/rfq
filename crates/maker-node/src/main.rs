@@ -601,20 +601,47 @@ async fn inventory(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Er
 
     println!("colorex maker inventory");
     println!("node_id={}", config.maker.node_id);
-    print_inventory_snapshot(&snapshot);
+    print_inventory_snapshot(&snapshot, maker_contract_spec(&config).as_ref());
 
     Ok(())
+}
+
+/// Best-effort ticker + precision for the configured contract, for display.
+/// `None` (mock / no contract id) → raw amounts.
+fn maker_contract_spec(config: &MakerNodeConfig) -> Option<(String, u8)> {
+    let r = config.rgb.as_ref()?;
+    if r.contract_id.is_empty() {
+        return None;
+    }
+    let backend = rfq_rgb::LibRgbBackend::new(
+        r.data_dir.clone(),
+        r.wallet_name.clone(),
+        r.network.clone(),
+        String::new(),
+        std::path::PathBuf::new(),
+        String::new(),
+    );
+    let asset = rfq_types::AssetId {
+        network: r.network.parse().ok()?,
+        kind: rfq_types::AssetKind::Rgb20,
+        id: r.contract_id.clone(),
+    };
+    backend.contract_spec(&asset).ok()
 }
 
 fn parse_broker_url(config: &MakerNodeConfig) -> Result<Url, Box<dyn std::error::Error>> {
     Url::parse(&config.maker.broker_url).map_err(|e| e.into())
 }
 
-fn print_inventory_snapshot(snapshot: &InventorySnapshot) {
-    println!("total_amount={}", snapshot.total_amount);
-    println!("available_amount={}", snapshot.available_amount);
-    println!("reserved_amount={}", snapshot.reserved_amount);
-    println!("spent_amount={}", snapshot.spent_amount);
+fn print_inventory_snapshot(snapshot: &InventorySnapshot, spec: Option<&(String, u8)>) {
+    let amt = |v: u64| match spec {
+        Some((ticker, precision)) => format!("{ticker} {}", rfq_types::format_amount(v, *precision)),
+        None => v.to_string(),
+    };
+    println!("total_amount={}", amt(snapshot.total_amount));
+    println!("available_amount={}", amt(snapshot.available_amount));
+    println!("reserved_amount={}", amt(snapshot.reserved_amount));
+    println!("spent_amount={}", amt(snapshot.spent_amount));
     println!("total_allocations={}", snapshot.total_allocations);
     println!("available_allocations={}", snapshot.available_allocations);
     println!("reserved_allocations={}", snapshot.reserved_allocations);

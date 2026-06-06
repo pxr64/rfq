@@ -263,6 +263,23 @@ impl LibRgbBackend {
         Ok(lines)
     }
 
+    /// Read the contract's ticker + precision (decimal places) from its `spec`
+    /// global state — for human-readable inventory display (`COLX 1.00`).
+    pub fn contract_spec(&self, asset: &AssetId) -> Result<(String, u8), RgbError> {
+        let stock = self.load_stock()?;
+        let contract_id = ContractId::from_str(&asset.id)
+            .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
+        let contract = stock
+            .contract_data(contract_id)
+            .map_err(|e| RgbError::ContractNotFound(format!("contract not found: {e}")))?;
+        let spec_val = contract
+            .global("spec")
+            .next()
+            .ok_or_else(|| RgbError::ContractNotFound("contract has no spec state".to_owned()))?;
+        let spec = AssetSpec::from_strict_val_unchecked(&spec_val);
+        Ok((spec.ticker().to_owned(), spec.precision.decimals()))
+    }
+
     /// Pick a funded keychain-10 (tapret) UTXO to bind a contract genesis to,
     /// as `txid:vout`. The issuer wallet must be funded + synced first
     /// (`wallet sync`); the first distribution transfer spends this UTXO.
