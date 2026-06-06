@@ -71,16 +71,17 @@ give you back a consignment to accept (see [issuing-tokens.md](issuing-tokens.md
 
 ## 4. Set standing orders (pricing)
 
-Orders are the maker's liquidity terms — the price it quotes per (asset, side).
-Without any order, the maker falls back to a flat default
-(`DEFAULT_UNIT_PRICE_SATS`, ~1% over a 100-sat par).
+Orders are the maker's liquidity terms — the price it quotes per (asset, side),
+where **`side` is the taker's side** (the order answers "when a taker requests
+side X, quote at price Y"). Without any order, the maker falls back to a flat
+default (`DEFAULT_UNIT_PRICE_SATS`, ~1% over a 100-sat par).
 
 ```bash
-# Quote sells of FOO at 250 sats/unit, up to 1,000 units per quote:
-colorex maker order create --side sell --price 250 --size 1000 --asset rgb:FOO
+# Back taker BUYS of FOO (you sell RGB) at 250 sats/unit, up to 1,000 units/quote:
+colorex maker order create --side buy --price 250 --size 1000 --asset rgb:FOO
 
-# Quote buys of FOO at 240 sats/unit, up to 2,000 units per quote:
-colorex maker order create --side buy --price 240 --size 2000 --asset rgb:FOO
+# Back taker SELLS of FOO (you buy RGB, paying BTC) at 240 sats/unit, up to 2,000:
+colorex maker order create --side sell --price 240 --size 2000 --asset rgb:FOO
 
 colorex maker order list
 colorex maker order cancel <id>

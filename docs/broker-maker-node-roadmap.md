@@ -38,6 +38,9 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [x] Issue #23: Self-contained Rust e2e tests for rfq-rgb — in-Rust bootstrap landed; ephemeral docker stack split out as #26.
 - [x] Issue #25: Swap composition: route seal-anchor BTC value to a maker change output (don't burn as fee).
 - [ ] Issue #27: Maker-node runtime — post-broadcast wallet refresh + BTC inventory refresh + confirmation tracking. **Last critical gap before the daemon is fully operational on regtest** (today's state stops working after the first swap broadcasts).
+- [ ] Issue #29: Multi-asset maker — the daemon wires a single `[rgb] contract_id` end-to-end, so a maker is effectively single-asset even though the order book is already `(asset, side)`-keyed. Lift `build_runtime` to an active *set* of contracts (per-asset RGB + BTC inventory + chain observer) and add `--asset` to `maker invoice`/`inventory`.
+- [x] Maker→broker auto-discovery over WebSocket — makers dial the broker and self-register (`/maker-stream` + `MakerRegistry` + `WsMakerConnector`), replacing the static `BROKER_MAKER` env. Done (uncommitted); `BROKER_MAKER` kept as an optional static pre-seed.
+- [ ] Issue #30: Broker observability — makers online, per-maker uptime, aggregate available liquidity per (asset, side). Builds on the WS registry: add maker→broker `Heartbeat`/`InventoryUpdate` frames, track per-maker metadata, expose `GET /status`.
 - [ ] Issue #24: Replace bp-hot + easy rgb-cmd commands in the e2e test harness — bp-hot slice landed; rgb-cmd commands (import/create/address/utxos/invoice/transfer/accept) still subprocess.
 - [ ] Issue #26: Run regtest stack ephemerally via testcontainers-rs so `cargo test` owns its bitcoind + electrs lifecycle.
 - [ ] Issue #6: Add OpenAPI spec for public RFQ API
@@ -263,6 +266,57 @@ Landed:
 Follow-up (not #9): route the maker's per-quote status changes through
 `transition()` at runtime — needs a persisted per-settlement status, which
 belongs with settlement tracking / the `rfq-store` settlement records.
+
+## Issue #29: Multi-Asset Maker
+
+A maker is **single-asset** today, even though the pricing layer is multi-asset.
+The order book keys orders by `(asset_id, side)` (`crates/maker-node/src/orders.rs:71`)
+and `order create --asset` accepts any contract — but the running daemon only
+wires the one `[rgb] contract_id` end-to-end, so a second asset can be *priced*
+yet never *settled*.
+
+Single-asset wiring lives in `build_runtime` (`crates/maker-node/src/lib.rs:316`):
+it derives one `asset` from `contract_id`, loads RGB inventory only for it
+(`list_inventory_utxos(&asset)`, `lib.rs:344`), and binds BTC inventory + the
+chain observer to that single asset (`lib.rs:356`, `846`/`864`). `maker invoice`
+/ `maker inventory` use the config `contract_id` (and `invoice` errors if it's
+empty, `lib.rs:293`). The RGB stash itself is already multi-contract — the limit
+is purely daemon wiring.
+
+Scope:
+
+- Config: an active *set* of contracts (a `contract_ids` list, or derive from the
+  order book / stock), back-compatible with the single `contract_id` field.
+- `build_runtime`: per-asset RGB + BTC inventory; `Maker` holds inventory keyed by
+  asset.
+- Chain observer: track all active assets (per-asset / `Vec<asset>`).
+- CLI: `--asset` on `maker invoice` and `maker inventory`.
+- Verify swap-PSBT construction resolves the correct contract's allocations from
+  the multi-asset inventory (the quote path already keys on the RFQ asset via
+  `PricePolicy`).
+
+Relates to #27 (per-asset cache freshness multiplies the refresh surface) and
+builds on the per-UTXO inventory work (#14).
+
+## Issue #30: Broker Observability
+
+The maker→broker WebSocket auto-discovery (the `MakerRegistry` + `/maker-stream`
++ `WsMakerConnector`) means the broker now *knows* which makers are connected —
+the foundation for operational awareness it currently lacks.
+
+Scope:
+
+- WS protocol (`rfq-router::ws_protocol`): maker→broker `Heartbeat` +
+  `InventoryUpdate` (push an `InventorySnapshot` per `(asset, side)` periodically
+  / on change) over the existing duplex socket.
+- `MakerRegistry` per-maker metadata: `connected_at` (uptime), `last_seen`
+  (heartbeat-driven liveness), latest inventory snapshot.
+- `GET /status` (and/or `/makers`): `makers_online`, per-maker
+  `{uptime, last_seen}`, and aggregate available liquidity per `(asset, side)`
+  summed across makers. Prometheus `/metrics` later.
+
+Builds on the WS auto-discovery feature; reuses `rfq_types::InventorySnapshot`
+(already produced by `Maker::inventory_summary`).
 
 ## Issue #6: OpenAPI Spec
 
