@@ -1,0 +1,69 @@
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:31.0
+    restart: unless-stopped
+    command:
+      - -signet=1
+      - -server=1
+      - -txindex=1
+      - -fallbackfee=0.00001000
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      # No -rpcuser/-rpcpassword: bitcoind auto-generates a .cookie file that the
+      # electrs container reads via the shared volume mount (romanz/electrs only
+      # supports --cookie-file auth).
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+    ports:
+      # Default public-signet ports (38332/38333); free on this host (regtest
+      # stack uses 19443/19444, the stale satoma stack uses 18443).
+      - "38332:38332"
+      - "38333:38333"
+    volumes:
+      - bitcoind-data:/home/bitcoin/.bitcoin
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bitcoin-cli",
+          "-signet",
+          "-datadir=/home/bitcoin/.bitcoin",
+          "getblockchaininfo",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+
+  electrs:
+    # Reuse the romanz/electrs 0.11.1 image the regtest stack builds. romanz (not
+    # the blockstream/mempool fork) is REQUIRED: bp-wallet + the rgb-ops resolver
+    # both need verbose `blockchain.transaction.get`, which the fork (e.g.
+    # mempool.space) rejects -> bp-wallet's `expect("broken logic")` panic.
+    build:
+      context: ../regtest
+      dockerfile: electrs.Dockerfile
+    image: rgb-rfq/electrs:0.11.1
+    restart: unless-stopped
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    entrypoint: electrs
+    command:
+      - --network=signet
+      - --daemon-rpc-addr=bitcoind:38332
+      - --daemon-p2p-addr=bitcoind:38333
+      - --daemon-dir=/home/bitcoin/.bitcoin
+      - --cookie-file=/home/bitcoin/.bitcoin/signet/.cookie
+      - --electrum-rpc-addr=0.0.0.0:50001
+      - --db-dir=/data
+      - --log-filters=INFO
+    ports:
+      # Host electrum port shifted off 60001 (regtest) -> 60601 for signet.
+      - "60601:50001"
+    volumes:
+      - electrs-data:/data
+      - bitcoind-data:/home/bitcoin/.bitcoin:ro
+
+volumes:
+  bitcoind-data:
+  electrs-data:
