@@ -3,6 +3,7 @@
 //! the binary (`src/main.rs`) and integration tests
 //! (`tests/regtest_http_round_trip.rs`) can share them.
 
+pub mod broker_client;
 pub mod init;
 pub mod node_key;
 pub mod orders;

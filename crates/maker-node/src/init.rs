@@ -16,7 +16,7 @@ use std::path::Path;
 use clap::Args;
 use colorex_wallet::{
     default_account_file, default_data_dir, default_electrum_url, expand_tilde, prompt_network,
-    ResolvedWallet,
+    ResolvedWallet, WalletConfig,
 };
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password};
 use rfq_client::{RfqClient, Url};
@@ -136,6 +136,11 @@ pub async fn run(args: InitArgs, config_path: &Path) -> Result<(), Box<dyn std::
                     return Err("init aborted: rgb wallet creation failed".into());
                 }
             }
+        }
+        // Persist the per-wallet config so `colorex wallet`/`issuer` commands
+        // resolve this wallet by --name (no flags/prompts).
+        if let Err(e) = WalletConfig::from_resolved(&resolved_from(r), &r.contract_id).save() {
+            output::step_warn(&truncate_error(&e.to_string()));
         }
     }
 

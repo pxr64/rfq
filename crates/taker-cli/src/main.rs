@@ -170,6 +170,10 @@ async fn init(config_path: &Path, force: bool) -> Result<(), Box<dyn std::error:
     let btc_address = resolved.backend().funding_address(false)?;
     println!("  BTC (keychain-0) address: {btc_address}");
 
+    // Persist the per-wallet config too, so `colorex wallet ...`/`colorex-taker`
+    // commands resolve this wallet by --name.
+    colorex_wallet::WalletConfig::from_resolved(&resolved, &contract_id).save()?;
+
     let toml = render_taker_toml(&TakerRender {
         broker_url: &broker_url,
         btc_address: &btc_address,

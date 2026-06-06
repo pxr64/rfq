@@ -22,9 +22,14 @@ use rfq_types::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod registry;
+mod ws;
+
+use registry::MakerRegistry;
+
 #[derive(Clone)]
 pub struct AppState {
-    makers: Vec<Arc<dyn MakerConnector>>,
+    registry: Arc<MakerRegistry>,
     store: InMemoryQuoteStore,
 }
 
@@ -71,7 +76,7 @@ pub fn app() -> Router {
     );
 
     app_with_state(AppState {
-        makers: vec![maker],
+        registry: MakerRegistry::with(vec![maker]),
         store: InMemoryQuoteStore::new(),
     })
 }
@@ -118,6 +123,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/quotes/:id/accept", post(accept_quote))
         .route("/quotes/:id/consignment", post(deliver_consignment))
         .route("/quotes/:id/sign", post(sign_quote))
+        .route("/maker-stream", get(ws::maker_stream))
         .with_state(state)
 }
 
@@ -127,8 +133,14 @@ pub fn app_with_state(state: AppState) -> Router {
 /// starts empty. Routing is unchanged: handlers match each request's stored
 /// `quote.maker_id` against this list.
 pub fn app_with_makers(makers: Vec<Arc<dyn MakerConnector>>) -> Router {
+    app_with_registry(MakerRegistry::with(makers))
+}
+
+/// Build the broker router around a shared [`MakerRegistry`] that keeps gaining
+/// makers at runtime via `/maker-stream`.
+pub fn app_with_registry(registry: Arc<MakerRegistry>) -> Router {
     app_with_state(AppState {
-        makers,
+        registry,
         store: InMemoryQuoteStore::new(),
     })
 }
@@ -151,7 +163,8 @@ async fn create_rfq(
         amount: body.amount,
         created_at_ms: now_ms(),
     };
-    let quotes = fanout_quote(&state.makers, request).await?;
+    let makers = state.registry.snapshot().await;
+    let quotes = fanout_quote(&makers, request).await?;
 
     for quote in &quotes {
         state.store.save_quote(quote.clone()).await;
@@ -177,9 +190,9 @@ async fn accept_quote(
     }
 
     let maker = state
-        .makers
-        .iter()
-        .find(|maker| maker.maker_id() == quote.maker_id)
+        .registry
+        .get(&quote.maker_id)
+        .await
         .ok_or(ApiError::MakerNotFound)?;
 
     let intent = maker
@@ -212,9 +225,9 @@ async fn deliver_consignment(
     // deadline), which `deliver_consignment` enforces internally — same as
     // `/sign`.
     let maker = state
-        .makers
-        .iter()
-        .find(|maker| maker.maker_id() == quote.maker_id)
+        .registry
+        .get(&quote.maker_id)
+        .await
         .ok_or(ApiError::MakerNotFound)?;
 
     let intent = maker
@@ -239,9 +252,9 @@ async fn sign_quote(
         .ok_or(ApiError::NotFound)?;
 
     let maker = state
-        .makers
-        .iter()
-        .find(|maker| maker.maker_id() == quote.maker_id)
+        .registry
+        .get(&quote.maker_id)
+        .await
         .ok_or(ApiError::MakerNotFound)?;
 
     let intent = maker.submit_signed_psbt(quote_id, body.signed_psbt).await?;
@@ -378,7 +391,7 @@ mod tests {
             .with_btc_inventory(mock_btc_inventory()),
         );
         app_with_state(AppState {
-            makers: vec![maker],
+            registry: MakerRegistry::with(vec![maker]),
             store: InMemoryQuoteStore::new(),
         })
     }

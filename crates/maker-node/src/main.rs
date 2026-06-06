@@ -2,13 +2,12 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use maker_node::{
-    build_maker, build_runtime, create_inventory_invoice, init, maker_app, orders,
-    spawn_chain_observer_loop, spawn_cleanup_loop, spawn_rebalance_loop, MakerNodeConfig,
+    broker_client, build_maker, build_runtime, create_inventory_invoice, init, maker_app, orders,
+    output, spawn_chain_observer_loop, spawn_cleanup_loop, spawn_rebalance_loop, MakerNodeConfig,
 };
-use colorex_wallet::{resolve_wallet, WalletInput};
+use colorex_wallet::{resolve_named, resolve_wallet, WalletConfig, WalletInput};
 use rfq_client::{RfqClient, Url};
-use rfq_maker::Maker;
-use rfq_types::InventorySnapshot;
+use rfq_types::{InventorySnapshot, MakerId};
 use tokio::{net::TcpListener, sync::oneshot};
 
 #[derive(Debug, Parser)]
@@ -306,11 +305,15 @@ fn wallet_create(
         }
         None => println!("wallet '{}' already exists — kept as-is", resolved.name),
     }
+    // Persist the per-wallet config so future commands resolve by `--name` alone.
+    let cfg = WalletConfig::from_resolved(&resolved, "");
+    cfg.save()?;
+    println!("wrote {}", cfg.saved_path().display());
     Ok(())
 }
 
 fn wallet_address(common: WalletCommon, btc: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let resolved = resolve_wallet(common.into_input(), false, false)?;
+    let resolved = resolve_named(common.into_input())?;
     println!("{}", resolved.backend().funding_address(!btc)?);
     Ok(())
 }
@@ -323,7 +326,7 @@ async fn wallet_sync(
         electrum_url: electrum,
         ..common.into_input()
     };
-    let resolved = resolve_wallet(input, true, false)?;
+    let resolved = resolve_named(input)?;
     resolved.backend().sync_wallet().await?;
     println!("synced '{}'", resolved.name);
     Ok(())
@@ -337,7 +340,7 @@ async fn wallet_balance(
         electrum_url: electrum,
         ..common.into_input()
     };
-    let resolved = resolve_wallet(input, true, false)?;
+    let resolved = resolve_named(input)?;
     let utxos = resolved.backend().wallet_balance().await?;
     print!("{}", colorex_wallet::render_balance(&utxos));
     Ok(())
@@ -420,7 +423,7 @@ fn issuer_issue(
     seal: Option<String>,
     issuer: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let backend = resolve_wallet(common.into_input(), false, false)?.backend();
+    let backend = resolve_named(common.into_input())?.backend();
     let genesis_seal = match seal {
         Some(s) => s,
         None => backend.pick_genesis_seal()?,
@@ -441,7 +444,7 @@ fn issuer_issue(
 }
 
 fn issuer_contracts(common: WalletCommon) -> Result<(), Box<dyn std::error::Error>> {
-    let backend = resolve_wallet(common.into_input(), false, false)?.backend();
+    let backend = resolve_named(common.into_input())?.backend();
     for line in backend.list_contracts()? {
         println!("{line}");
     }
@@ -463,7 +466,7 @@ async fn issuer_transfer(
         password,
         ..common.into_input()
     };
-    let backend = resolve_wallet(input, true, true)?.backend();
+    let backend = resolve_named(input)?.backend();
     let (txid, consignment) = backend.distribute(&invoice, fee).await?;
     println!("transfer broadcast: {txid}");
     println!("hand this consignment to the recipient (they accept after the tx confirms):");
@@ -488,27 +491,36 @@ async fn run(
     let app = maker_app(maker.clone());
     let listener = TcpListener::bind(&config.maker.listen_addr).await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let maker_type = std::any::type_name::<Maker>();
 
-    println!("colorex maker starting");
-    println!("node_id={}", config.maker.node_id);
-    println!("broker_url={}", config.maker.broker_url);
-    println!("listen_addr={}", config.maker.listen_addr);
-    println!("cleanup_interval={:?}", config.intervals.cleanup);
-    println!("rebalance_interval={:?}", config.intervals.rebalance);
-    println!(
-        "standing_orders={order_count} ({})",
+    let broker_ws = broker_client::broker_ws_url(&config.maker.broker_url);
+    let network = config
+        .rgb
+        .as_ref()
+        .map(|r| r.network.as_str())
+        .unwrap_or("mock");
+    let node_short = config
+        .maker
+        .node_id
+        .get(..8)
+        .unwrap_or(&config.maker.node_id);
+
+    println!("colorex maker up");
+    output::info(&format!("node {node_short}… on {network}"));
+    output::info(&format!("broker {}", config.maker.broker_url));
+    output::info(&format!(
+        "standing orders {order_count} ({})",
         order_path.display()
-    );
-    println!(
-        "chain_observer={}",
-        if chain_observer_deps.is_some() {
-            format!("enabled (interval={:?})", config.intervals.chain_observer)
-        } else {
-            "disabled (no RGB config)".to_owned()
-        }
-    );
-    println!("maker_runtime={maker_type}");
+    ));
+    output::step("chain observer");
+    if chain_observer_deps.is_some() {
+        output::step_ok_with(&format!("every {:?}", config.intervals.chain_observer));
+    } else {
+        output::step_skip();
+    }
+    output::step("http server");
+    output::step_ok_with(&config.maker.listen_addr);
+    output::step("broker stream");
+    output::step_ok_with(&broker_ws);
 
     let cleanup_task = spawn_cleanup_loop(maker.clone(), config.intervals.cleanup);
     let rebalance_task = spawn_rebalance_loop(
@@ -529,16 +541,26 @@ async fn run(
         }
     });
 
+    // Dial the broker and auto-register over WebSocket — the broker then pushes
+    // quote/accept/settle requests over it (no `BROKER_MAKER` config needed).
+    let broker_task = tokio::spawn(broker_client::run_broker_stream(
+        broker_ws,
+        MakerId(config.maker.node_id.clone()),
+        maker.clone(),
+    ));
+
     tokio::signal::ctrl_c().await?;
     println!("colorex maker shutting down");
 
     let _ = shutdown_tx.send(());
     cleanup_task.abort();
     rebalance_task.abort();
+    broker_task.abort();
     if let Some(t) = &chain_observer_task {
         t.abort();
     }
     let _ = server_task.await;
+    let _ = broker_task.await;
     let _ = cleanup_task.await;
     let _ = rebalance_task.await;
     if let Some(t) = chain_observer_task {

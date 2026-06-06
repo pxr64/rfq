@@ -7,6 +7,7 @@
 //! is the natural shared home (a module inside `maker-node` would force
 //! `taker-cli` to depend on the whole maker daemon).
 
+pub mod config;
 pub mod defaults;
 pub mod interactive;
 
@@ -14,6 +15,7 @@ use std::path::PathBuf;
 
 use rfq_rgb::{LibRgbBackend, RgbError, WalletUtxo};
 
+pub use config::{resolve_named, WalletConfig};
 pub use defaults::{default_account_file, default_data_dir, default_electrum_url, expand_tilde};
 pub use interactive::{prompt_network, resolve_wallet};
 

@@ -1,24 +1,21 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use rfq_api::registry::MakerRegistry;
 use rfq_router::{HttpMakerConnector, MakerConnector, Url};
 use rfq_types::MakerId;
 
 /// Broker entrypoint.
 ///
-/// By default this serves the in-process **mock** makers (`rfq_api::app()`),
-/// matching the original demo behavior. To point the broker at one or more
-/// real `colorex maker up` daemons, set `BROKER_MAKER`:
+/// Makers **auto-register** over a WebSocket: `colorex maker up` dials
+/// `ws://<this-broker>/maker-stream` and registers itself — no broker config
+/// needed. The broker routes accept/consignment/sign by matching the registered
+/// `maker_id` against the stored `quote.maker_id`.
 ///
-/// ```text
-/// BROKER_MAKER="regtest-maker@http://127.0.0.1:4000" cargo run -p rfq-api
-/// ```
-///
-/// `BROKER_MAKER` is `<maker_id>@<url>`; repeat by comma-separating entries.
-/// The `<maker_id>` MUST equal the maker daemon's `config.maker.node_id` — the
-/// broker routes accept/consignment/sign by matching the stored `quote.maker_id`.
-///
-/// `BROKER_LISTEN` overrides the bind address (default `127.0.0.1:3000`).
+/// `BROKER_MAKER` (optional, legacy) statically pre-seeds HTTP-dialed makers:
+/// `<maker_id>@<url>`, comma-separated; `<maker_id>` MUST equal the maker's
+/// `config.maker.node_id`. `BROKER_LISTEN` overrides the bind (default
+/// `127.0.0.1:3000`).
 #[tokio::main]
 async fn main() {
     let listen: SocketAddr = std::env::var("BROKER_LISTEN")
@@ -26,19 +23,22 @@ async fn main() {
         .parse()
         .expect("BROKER_LISTEN must be a socket address, e.g. 127.0.0.1:3000");
 
-    let app = match std::env::var("BROKER_MAKER") {
+    // Optional static pre-seed; makers also self-register over /maker-stream.
+    let registry = match std::env::var("BROKER_MAKER") {
         Ok(spec) if !spec.trim().is_empty() => {
             let makers = parse_makers(&spec);
             for m in &makers {
-                println!("broker maker: {}", m.maker_id().0);
+                println!("broker: static maker {}", m.maker_id().0);
             }
-            rfq_api::app_with_makers(makers)
+            MakerRegistry::with(makers)
         }
         _ => {
-            println!("broker: no BROKER_MAKER set — serving in-process mock makers");
-            rfq_api::app()
+            println!("broker: makers auto-register over ws://…/maker-stream");
+            MakerRegistry::new()
         }
     };
+
+    let app = rfq_api::app_with_registry(registry);
 
     let listener = tokio::net::TcpListener::bind(listen)
         .await

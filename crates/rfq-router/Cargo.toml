@@ -11,5 +11,6 @@ reqwest.workspace = true
 rfq-core = { path = "../rfq-core" }
 rfq-types = { path = "../rfq-types" }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

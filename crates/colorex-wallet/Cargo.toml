@@ -7,4 +7,6 @@ version.workspace = true
 [dependencies]
 rfq-rgb = { path = "../rfq-rgb" }
 dialoguer = { version = "0.11", default-features = false, features = ["password"] }
+serde.workspace = true
 shellexpand = "3"
+toml = "0.8"

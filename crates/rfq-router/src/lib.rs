@@ -1,5 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
+pub mod ws_protocol;
+mod ws_connector;
+pub use ws_connector::WsMakerConnector;
+
 use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 pub use reqwest::Url;
