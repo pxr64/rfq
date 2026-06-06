@@ -341,6 +341,20 @@ impl LibRgbBackend {
         }
 
         let mut stock = self.load_stock()?;
+
+        // A recipient validates an NIA consignment against its stock's "trusted
+        // typesystem" (below), so the NIA schema must already be in the stock.
+        // `issue_contract` imports it for the issuer; a *separate* recipient
+        // (maker/taker) has an empty stock and would hit `TypeSystemMismatch`, so
+        // import the same embedded kit here. Idempotent on re-accept.
+        let kit = Kit::load(&mut &NIA_SCHEMA_KIT[..])
+            .map_err(|e| RgbError::StashLoad(format!("load NIA kit: {e}")))?
+            .validate()
+            .map_err(|e| RgbError::StashLoad(format!("validate NIA kit: {e:?}")))?;
+        stock
+            .import_kit(kit)
+            .map_err(|e| RgbError::StashLoad(format!("import NIA kit: {e}")))?;
+
         // Validation needs the full witness graph, so seed the resolver with the
         // consignment's own txes. Caveat: `AnyResolver` then short-circuits every
         // such txid to `WitnessOrd::Tentative` (rgb-ops `indexers/any.rs`) — a
