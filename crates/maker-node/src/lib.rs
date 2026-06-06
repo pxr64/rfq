@@ -19,14 +19,17 @@ use axum::{
     Json, Router,
 };
 use rfq_btc::{BitcoinClient, ElectrumClient, MockBitcoinClient};
-use rfq_maker::{Maker, RebalancePolicy};
+use rfq_maker::{CoinSelector, GreedyExactFitSelector, Maker, RebalancePolicy};
 use rfq_rgb::{LibRgbBackend, MockRgbBackend, RgbBackend};
 use rfq_router::MakerConnector;
-use rfq_store::{InMemoryQuoteStore, QuoteStore};
+use rfq_store::{
+    BtcInventoryStore, InMemoryQuoteStore, InventoryStore, QuoteStore, SqliteBtcInventoryStore,
+    SqliteInventoryStore,
+};
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, BtcInventoryStatus, BtcInventoryUtxo,
-    HealthResponse, InventorySnapshot, MakerId, Outpoint, Quote, QuoteId, QuoteRequest,
-    RgbInventoryUtxo, SettlementIntent,
+    HealthResponse, InventorySnapshot, InventoryStatus, InventoryUtxo, MakerId, Outpoint, Quote,
+    QuoteId, QuoteRequest, RgbInventoryUtxo, SettlementIntent,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{task::JoinHandle, time};
@@ -347,8 +350,25 @@ pub async fn build_runtime(
             let bitcoin_client: Arc<dyn BitcoinClient> =
                 Arc::new(ElectrumClient::connect(&rgb_cfg.electrum_url)?);
             let rgb_backend_trait: Arc<dyn RgbBackend> = backend.clone();
-            let maker = Maker::new(maker_id, rgb_utxos, rgb_backend_trait, bitcoin_client)
-                .with_btc_inventory(btc_inventory);
+
+            // Durable inventory: `maker.db` sits under the wallet-name namespace
+            // AND the network sub-dir (alongside the rgb stock), so the same
+            // wallet on different networks never shares inventory state.
+            let db_path = rgb_cfg.data_dir.join(&rgb_cfg.network).join("maker.db");
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let inv_store = SqliteInventoryStore::open(&db_path).await?;
+            let btc_store = SqliteBtcInventoryStore::open(&db_path).await?;
+            reconcile_rgb_inventory(&inv_store, &asset, &rgb_utxos, now_ms).await?;
+            reconcile_btc_inventory(&btc_store, &btc_inventory).await?;
+
+            let inv_store: Arc<dyn InventoryStore> = Arc::new(inv_store);
+            let btc_store: Arc<dyn BtcInventoryStore> = Arc::new(btc_store);
+            let selector: Arc<dyn CoinSelector> = Arc::new(GreedyExactFitSelector);
+            let maker =
+                Maker::with_components(maker_id, inv_store, selector, rgb_backend_trait, bitcoin_client)
+                    .with_btc_store(btc_store);
             Ok(MakerNodeRuntime {
                 maker,
                 chain_observer: Some(ChainObserverDeps {
@@ -380,6 +400,57 @@ pub async fn build_runtime(
             })
         }
     }
+}
+
+/// Reconcile the durable RGB inventory with on-chain UTXOs. A fresh db is
+/// seeded outright; a populated one (restart) keeps its persisted reservations
+/// and settlement statuses and only ingests UTXOs it isn't already tracking —
+/// the chain observer owns confirmation/spend transitions.
+async fn reconcile_rgb_inventory(
+    store: &SqliteInventoryStore,
+    asset: &AssetId,
+    rgb_utxos: &[RgbInventoryUtxo],
+    now_ms: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let to_inv = |u: &RgbInventoryUtxo| InventoryUtxo {
+        outpoint: u.outpoint.clone(),
+        asset_id: u.asset_id.clone(),
+        amount: u.amount,
+        btc_sats: u.btc_sats,
+        status: InventoryStatus::Available,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        pending_txid: None,
+    };
+    if store.is_empty().await {
+        store
+            .replace_for_asset(asset, rgb_utxos.iter().map(to_inv).collect())
+            .await?;
+    } else {
+        for u in rgb_utxos {
+            if store.get(&u.outpoint).await.is_none() {
+                let _ = store.ingest_change_utxo(to_inv(u)).await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// BTC analogue of [`reconcile_rgb_inventory`].
+async fn reconcile_btc_inventory(
+    store: &SqliteBtcInventoryStore,
+    btc_utxos: &[BtcInventoryUtxo],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if store.is_empty().await {
+        store.replace_all(btc_utxos.to_vec()).await;
+    } else {
+        for u in btc_utxos {
+            if store.get(&u.outpoint).await.is_none() {
+                let _ = store.ingest_change_utxo(u.clone()).await;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn now_ms() -> u64 {

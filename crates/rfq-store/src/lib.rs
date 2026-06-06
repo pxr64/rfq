@@ -14,6 +14,11 @@ pub use btc::{
     GreedyLargestFirstSelector, InMemoryBtcInventoryStore,
 };
 
+#[cfg(feature = "sqlite")]
+mod sqlite;
+#[cfg(feature = "sqlite")]
+pub use sqlite::{SqliteBtcInventoryStore, SqliteInventoryStore};
+
 #[async_trait]
 pub trait QuoteStore: Send + Sync {
     async fn save_quote(&self, quote: Quote);

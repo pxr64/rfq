@@ -292,6 +292,13 @@ impl Maker {
         self
     }
 
+    /// Inject a pre-built BTC inventory store (e.g. the durable SQLite one) in
+    /// place of seeding an in-memory one via [`Maker::with_btc_inventory`].
+    pub fn with_btc_store(mut self, store: Arc<dyn BtcInventoryStore>) -> Self {
+        self.btc_store = store;
+        self
+    }
+
     /// Per-UTXO view across all assets. Returned in outpoint order so callers
     /// can index deterministically.
     pub async fn utxo_snapshot(&self) -> Vec<InventoryUtxo> {

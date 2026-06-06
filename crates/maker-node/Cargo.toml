@@ -23,7 +23,7 @@ rfq-client = { path = "../rfq-client" }
 rfq-maker = { path = "../rfq-maker" }
 rfq-rgb = { path = "../rfq-rgb" }
 rfq-router = { path = "../rfq-router" }
-rfq-store = { path = "../rfq-store" }
+rfq-store = { path = "../rfq-store", features = ["sqlite"] }
 rfq-types = { path = "../rfq-types" }
 rfq-wallet = { path = "../rfq-wallet" }
 secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
