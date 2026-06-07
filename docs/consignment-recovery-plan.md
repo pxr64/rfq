@@ -78,6 +78,16 @@ Make import survive confirmation timing and restarts.
     confirms — same posture as BTC.
 - States per item: `pending → importing → tentative → confirmed | reverted | failed(reason)`.
   Surface an "incoming RGB (pending)" badge + a retry/dismiss affordance.
+- **MV3 mechanics (important).** Runs in the background service worker, but the SW
+  is **ephemeral** (~30s idle, 5min max) so:
+  - Queue **state in IndexedDB** (never worker memory).
+  - Retry/watch driven by **`chrome.alarms`** (NOT `setInterval` — it dies with
+    the SW), plus drain on **popup open** and **`chrome.runtime.onStartup`**.
+  - The import runs **headless / while locked**: `accept_consignment` validates +
+    writes to the stock and **needs no unlocked seed** (no signing), so the worker
+    can drain/promote/revert without the user unlocking.
+  - **Idempotent + single-flight**: guard against concurrent drains; re-importing
+    an accepted consignment is a no-op.
 - Provider/UI: a **manual "Import consignment"** action (paste base64) →
   enqueue → `window.colorex.acceptConsignment` (already wired). Lets a user pull
   from the stash service or a maker `reconsign` output.
