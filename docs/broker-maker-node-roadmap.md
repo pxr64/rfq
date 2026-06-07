@@ -19,6 +19,15 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
   `POST /quotes/{id}/cancel`** the dapp calls on user-cancel/sign-failure; **(4)
   per-origin reservation caps + RFQ rate-limit**; (5, later) fidelity bond. See the
   issue for acceptance criteria.
+- [ ] **HIGH — Issue #33: Consignment delivery & recovery** (`docs/consignment-recovery-plan.md`).
+  RGB consignments are ephemeral and the recipient must import one — today nothing
+  persists them and there's no recovery, so a taker can lose received RGB to a
+  timing/delivery failure (hit live: `81060df…` delivered 1 COLX, never imported).
+  Three parts: **(1) wallet import queue** (retry until the witness tx confirms +
+  manual import — colorex-wallet#4); **(2) maker `reconsign`** (re-derive from
+  stock); **(3) broker consignment stash service** (persist + authed recovery
+  endpoint, Postgres). First real BTC↔RGB signet swap shipped 2026-06-07 (tx
+  `81060df…`, all-P2TR) — this is the resilience follow-up.
 - [x] **Switch the swap close method from opret to tapret.** (Shipped.) Today
   the swap composition is hard-wired to `CloseMethod::OpretFirst` (an `OP_RETURN`
   output carries the RGB commitment), which flags every swap as an RGB tx on-chain.
