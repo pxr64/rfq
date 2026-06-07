@@ -53,11 +53,13 @@ async fn connect_and_serve(
     // Advertise the RGB contracts this maker serves (with ticker/precision) and
     // their network, so the broker can surface them via `GET /status` + `/assets`.
     let assets = maker.served_assets().await;
+    let prices = maker.order_prices();
     let network = assets.first().map(|a| a.id.network.clone());
     let register = serde_json::to_string(&MakerFrame::Register {
         maker_id: maker_id.clone(),
         network,
         assets,
+        prices,
     })?;
     write.send(Message::Text(register)).await?;
     println!("registered with broker as {}", maker_id.0);

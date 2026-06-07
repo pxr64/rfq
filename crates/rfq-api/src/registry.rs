@@ -8,19 +8,20 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rfq_router::MakerConnector;
-use rfq_types::{AssetInfo, BitcoinNetwork, MakerId};
+use rfq_types::{AssetInfo, BitcoinNetwork, MakerId, OrderPrice};
 use serde::Serialize;
 use tokio::sync::RwLock;
 use utoipa::ToSchema;
 
 /// A registered maker plus the observability metadata the broker surfaces via
-/// `GET /status`. `network`/`assets` come from the maker's `Register` frame and
-/// are empty for older makers that don't advertise them.
+/// `GET /status`. `network`/`assets`/`prices` come from the maker's `Register`
+/// frame and are empty for older makers that don't advertise them.
 struct Registered {
     connector: Arc<dyn MakerConnector>,
     connected_at: Instant,
     network: Option<BitcoinNetwork>,
     assets: Vec<AssetInfo>,
+    prices: Vec<OrderPrice>,
 }
 
 #[derive(Default)]
@@ -70,6 +71,7 @@ impl MakerRegistry {
                         connected_at: Instant::now(),
                         network: None,
                         assets: Vec::new(),
+                        prices: Vec::new(),
                     },
                 )
             })
@@ -84,6 +86,7 @@ impl MakerRegistry {
         maker: Arc<dyn MakerConnector>,
         network: Option<BitcoinNetwork>,
         assets: Vec<AssetInfo>,
+        prices: Vec<OrderPrice>,
     ) {
         self.makers.write().await.insert(
             maker.maker_id(),
@@ -92,6 +95,7 @@ impl MakerRegistry {
                 connector: maker,
                 network,
                 assets,
+                prices,
             },
         );
     }
@@ -172,5 +176,33 @@ impl MakerRegistry {
             }
         }
         out
+    }
+
+    /// Best standing-order price per (contract, side) across makers — the
+    /// broker's price feed (`GET /prices`). Best for the taker: lowest unit
+    /// price on Buy, highest on Sell.
+    pub async fn prices(&self) -> Vec<OrderPrice> {
+        let map = self.makers.read().await;
+        let mut best: Vec<OrderPrice> = Vec::new();
+        for reg in map.values() {
+            for p in &reg.prices {
+                match best
+                    .iter_mut()
+                    .find(|b| b.contract_id == p.contract_id && b.side == p.side)
+                {
+                    None => best.push(p.clone()),
+                    Some(b) => {
+                        let better = match p.side {
+                            rfq_types::Side::Buy => p.price_sats_per_unit < b.price_sats_per_unit,
+                            rfq_types::Side::Sell => p.price_sats_per_unit > b.price_sats_per_unit,
+                        };
+                        if better {
+                            *b = p.clone();
+                        }
+                    }
+                }
+            }
+        }
+        best
     }
 }

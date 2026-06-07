@@ -16,8 +16,8 @@ use rfq_store::{InMemoryQuoteStore, QuoteStore};
 pub use rfq_types::CreateRfqRequest;
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetInfo, AssetKind, BitcoinNetwork, BtcInventoryStatus,
-    BtcInventoryUtxo, HealthResponse, MakerId, Outpoint, Quote, QuoteId, QuoteRequest, RfqId,
-    RgbInventoryUtxo, SettlementIntent, SwapLeg,
+    BtcInventoryUtxo, HealthResponse, MakerId, OrderPrice, Outpoint, Quote, QuoteId, QuoteRequest,
+    RfqId, RgbInventoryUtxo, SettlementIntent, SwapLeg,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
@@ -132,7 +132,7 @@ fn mock_taker_funding() -> Vec<(Outpoint, rfq_btc::TxOut)> {
                        over the /maker-stream WebSocket (not documented here). See \
                        docs/swap-flows.md for the full protocol.",
     ),
-    paths(health, status, assets, create_rfq, accept_quote, deliver_consignment, sign_quote),
+    paths(health, status, assets, prices, create_rfq, accept_quote, deliver_consignment, sign_quote),
     components(schemas(
         CreateRfqRequest,
         Quote,
@@ -142,6 +142,7 @@ fn mock_taker_funding() -> Vec<(Outpoint, rfq_btc::TxOut)> {
         SettlementIntent,
         StatusResponse,
         AssetInfo,
+        OrderPrice,
         ErrorResponse,
     )),
     tags((name = "broker", description = "Public RFQ broker endpoints"))
@@ -154,6 +155,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/assets", get(assets))
+        .route("/prices", get(prices))
         .route("/rfq", post(create_rfq))
         .route("/quotes/:id/accept", post(accept_quote))
         .route("/quotes/:id/consignment", post(deliver_consignment))
@@ -232,6 +234,20 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
 )]
 async fn assets(State(state): State<AppState>) -> Json<Vec<AssetInfo>> {
     Json(state.registry.assets().await)
+}
+
+/// Price feed: best standing-order unit price per (contract, side) across makers.
+/// Clients use it to size a request (BTC → RGB amount) and show an estimate; it's
+/// consistent with the prices makers actually quote. Empty when no maker has a
+/// standing order — clients should fall back to "quote on accept".
+#[utoipa::path(
+    get,
+    path = "/prices",
+    tag = "broker",
+    responses((status = 200, description = "Best unit price per (asset, side)", body = [OrderPrice]))
+)]
+async fn prices(State(state): State<AppState>) -> Json<Vec<OrderPrice>> {
+    Json(state.registry.prices().await)
 }
 
 /// Request quotes for a swap. Fans the request out to every connected maker and

@@ -81,6 +81,17 @@ pub struct AssetInfo {
     pub precision: u8,
 }
 
+/// A maker's standing-order price for one (contract, side), advertised so the
+/// broker can serve a price feed (`GET /prices`) clients use to size requests +
+/// show an estimate. `side` is from the taker's view (`Buy` = taker buys RGB).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct OrderPrice {
+    pub contract_id: String,
+    pub side: Side,
+    pub price_sats_per_unit: u64,
+    pub max_size: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 pub enum BitcoinNetwork {
     Mainnet,

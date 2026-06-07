@@ -13,7 +13,7 @@ use futures::stream::SplitStream;
 use futures::{SinkExt, StreamExt};
 use rfq_router::ws_protocol::MakerFrame;
 use rfq_router::{MakerConnector, WsMakerConnector};
-use rfq_types::{AssetInfo, BitcoinNetwork, MakerId};
+use rfq_types::{AssetInfo, BitcoinNetwork, MakerId, OrderPrice};
 use tokio::time::timeout;
 
 use crate::AppState;
@@ -26,7 +26,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let (sink, mut stream) = socket.split();
 
     // The first frame must identify the maker (and may advertise metadata).
-    let Some((maker_id, network, assets)) = read_register(&mut stream).await else {
+    let Some((maker_id, network, assets, prices)) = read_register(&mut stream).await else {
         return;
     };
 
@@ -45,7 +45,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     let (connector, closed) = WsMakerConnector::spawn(maker_id.clone(), text_sink, text_stream);
     let connector: Arc<dyn MakerConnector> = connector;
-    state.registry.insert(connector.clone(), network, assets).await;
+    state.registry.insert(connector.clone(), network, assets, prices).await;
     println!("broker: maker registered: {}", maker_id.0);
 
     // Hold until the socket dies, then deregister (only if still this conn).
@@ -57,7 +57,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 /// Wait for the `Register` frame (≤5s per frame), returning the maker id plus
 /// any advertised observability metadata. Non-register text is ignored; a
 /// close/error/timeout ends the connection.
-type Registration = (MakerId, Option<BitcoinNetwork>, Vec<AssetInfo>);
+type Registration = (MakerId, Option<BitcoinNetwork>, Vec<AssetInfo>, Vec<OrderPrice>);
 
 async fn read_register(stream: &mut SplitStream<WebSocket>) -> Option<Registration> {
     loop {
@@ -67,9 +67,10 @@ async fn read_register(stream: &mut SplitStream<WebSocket>) -> Option<Registrati
                     maker_id,
                     network,
                     assets,
+                    prices,
                 }) = serde_json::from_str::<MakerFrame>(&t)
                 {
-                    return Some((maker_id, network, assets));
+                    return Some((maker_id, network, assets, prices));
                 }
                 // non-register text before register: keep waiting
             }

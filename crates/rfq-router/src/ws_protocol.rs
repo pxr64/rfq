@@ -12,8 +12,8 @@
 //! All frames are JSON text frames.
 
 use rfq_types::{
-    AcceptQuoteRequest, AssetInfo, BitcoinNetwork, MakerId, Quote, QuoteId, QuoteRequest,
-    SettlementIntent,
+    AcceptQuoteRequest, AssetInfo, BitcoinNetwork, MakerId, OrderPrice, Quote, QuoteId,
+    QuoteRequest, SettlementIntent,
 };
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +60,8 @@ pub enum MakerFrame {
         network: Option<BitcoinNetwork>,
         #[serde(default)]
         assets: Vec<AssetInfo>,
+        #[serde(default)]
+        prices: Vec<OrderPrice>,
     },
     /// Reply to a `WsRequest`, correlated by `req_id`.
     Response { req_id: u64, result: WsResult },

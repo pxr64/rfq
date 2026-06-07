@@ -14,7 +14,7 @@ use rfq_store::{
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetInfo, BtcInventoryStatus, BtcInventoryUtxo,
     ExtendedInventorySnapshot, InventoryError, InventorySnapshot, InventoryStatus, InventoryUtxo,
-    MakerId, Outpoint, Quote, QuoteId, QuoteRequest, RgbInventoryUtxo, ReservationId,
+    MakerId, OrderPrice, Outpoint, Quote, QuoteId, QuoteRequest, RgbInventoryUtxo, ReservationId,
     SettlementIntent, SettlementStatus, Side, SwapLeg,
 };
 use tokio::sync::RwLock;
@@ -57,6 +57,10 @@ pub enum PriceLookup {
 impl PricePolicy {
     pub fn from_entries(entries: Vec<PriceEntry>) -> Self {
         Self { entries }
+    }
+
+    pub fn entries(&self) -> &[PriceEntry] {
+        &self.entries
     }
 
     /// Resolve the unit price for a quote of `amount` on (`asset`, `side`).
@@ -305,6 +309,22 @@ impl Maker {
         let mut utxos = self.store.list_all().await;
         utxos.sort_by(|a, b| a.outpoint.cmp(&b.outpoint));
         utxos
+    }
+
+    /// The maker's standing-order prices (per contract + side), for the broker's
+    /// price feed. Mirrors the PricePolicy the maker quotes from, so the feed is
+    /// consistent with actual quotes.
+    pub fn order_prices(&self) -> Vec<OrderPrice> {
+        self.price_policy
+            .entries()
+            .iter()
+            .map(|e| OrderPrice {
+                contract_id: e.asset_id.clone(),
+                side: e.side.clone(),
+                price_sats_per_unit: e.price_sats_per_unit,
+                max_size: e.max_size,
+            })
+            .collect()
     }
 
     /// The distinct RGB contracts this maker serves, each with display metadata
