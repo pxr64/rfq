@@ -47,7 +47,8 @@ use bpstd::seals::txout::CloseMethod;
 use bpstd::signers::TestnetRefSigner;
 use bpstd::{
     Address, ConsensusEncode, Derive, Descriptor, Keychain, LockTime, Outpoint as BpOutpoint, Sats,
-    ScriptPubkey, SeqNo, SighashType, Terminal, TxOut as BpTxOut, TxVer, Txid, VarIntArray, Vout,
+    ScriptPubkey, SeqNo, SigScript, SighashType, Terminal, TxOut as BpTxOut, TxVer, Txid,
+    VarIntArray, Vout,
     XprivAccount, XpubDerivable,
 };
 use bpwallet::Wallet;
@@ -1171,6 +1172,20 @@ pub(crate) fn finalize_signed_psbt(
         .map_err(|e| RgbError::FinalizeFailed(format!("decode signed PSBT: {e}")))?;
 
     psbt.finalize(descriptor);
+
+    // A taker that finalized its input externally (e.g. the browser wallet via
+    // @scure/btc-signer) sets only `final_witness` — for a native-segwit/taproot
+    // input the empty scriptSig is correctly omitted per BIP-174. But this psbt
+    // crate's `extract()` unconditionally `.expect()`s `final_script_sig`
+    // (data.rs `to_signed_txin`), so it panics on such inputs even though they're
+    // fully finalized. Backfill an empty scriptSig wherever a witness is present
+    // but the scriptSig isn't. (The rust taker's `finalize` fills both, which is
+    // why the regtest CLI path never hit this.)
+    for input in psbt.inputs_mut() {
+        if input.final_witness.is_some() && input.final_script_sig.is_none() {
+            input.final_script_sig = Some(SigScript::empty());
+        }
+    }
 
     if !psbt.is_finalized() {
         return Err(RgbError::FinalizeFailed(
