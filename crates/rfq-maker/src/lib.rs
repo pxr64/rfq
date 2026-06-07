@@ -12,10 +12,10 @@ use rfq_store::{
     InMemoryInventoryStore, InventoryStore,
 };
 use rfq_types::{
-    AcceptQuoteRequest, AssetId, BtcInventoryStatus, BtcInventoryUtxo, ExtendedInventorySnapshot,
-    InventoryError, InventorySnapshot, InventoryStatus, InventoryUtxo, MakerId, Outpoint, Quote,
-    QuoteId, QuoteRequest, RgbInventoryUtxo, ReservationId, SettlementIntent, SettlementStatus,
-    Side, SwapLeg,
+    AcceptQuoteRequest, AssetId, AssetInfo, BtcInventoryStatus, BtcInventoryUtxo,
+    ExtendedInventorySnapshot, InventoryError, InventorySnapshot, InventoryStatus, InventoryUtxo,
+    MakerId, Outpoint, Quote, QuoteId, QuoteRequest, RgbInventoryUtxo, ReservationId,
+    SettlementIntent, SettlementStatus, Side, SwapLeg,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -305,6 +305,32 @@ impl Maker {
         let mut utxos = self.store.list_all().await;
         utxos.sort_by(|a, b| a.outpoint.cmp(&b.outpoint));
         utxos
+    }
+
+    /// The distinct RGB contracts this maker serves, each with display metadata
+    /// (ticker + precision) read from the contract. Advertised to the broker so
+    /// it can build an asset directory. Ticker/precision fall back to empty/0 if
+    /// the contract spec can't be read.
+    pub async fn served_assets(&self) -> Vec<AssetInfo> {
+        let mut seen: Vec<AssetId> = Vec::new();
+        let mut infos: Vec<AssetInfo> = Vec::new();
+        for u in self.utxo_snapshot().await {
+            if seen.contains(&u.asset_id) {
+                continue;
+            }
+            seen.push(u.asset_id.clone());
+            let (ticker, precision) = self
+                .rgb_backend
+                .asset_spec(&u.asset_id)
+                .await
+                .unwrap_or_else(|_| (String::new(), 0));
+            infos.push(AssetInfo {
+                id: u.asset_id,
+                ticker,
+                precision,
+            });
+        }
+        infos
     }
 
     pub async fn inventory_summary(&self) -> InventorySnapshot {

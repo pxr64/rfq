@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rfq_router::MakerConnector;
-use rfq_types::{AssetId, BitcoinNetwork, MakerId};
+use rfq_types::{AssetInfo, BitcoinNetwork, MakerId};
 use serde::Serialize;
 use tokio::sync::RwLock;
 use utoipa::ToSchema;
@@ -20,7 +20,7 @@ struct Registered {
     connector: Arc<dyn MakerConnector>,
     connected_at: Instant,
     network: Option<BitcoinNetwork>,
-    assets: Vec<AssetId>,
+    assets: Vec<AssetInfo>,
 }
 
 #[derive(Default)]
@@ -83,7 +83,7 @@ impl MakerRegistry {
         &self,
         maker: Arc<dyn MakerConnector>,
         network: Option<BitcoinNetwork>,
-        assets: Vec<AssetId>,
+        assets: Vec<AssetInfo>,
     ) {
         self.makers.write().await.insert(
             maker.maker_id(),
@@ -131,8 +131,8 @@ impl MakerRegistry {
 
         for (id, reg) in map.iter() {
             for asset in &reg.assets {
-                if !asset_ids.contains(&asset.id.as_str()) {
-                    asset_ids.push(asset.id.as_str());
+                if !asset_ids.contains(&asset.id.id.as_str()) {
+                    asset_ids.push(asset.id.id.as_str());
                 }
             }
             if let Some(net) = &reg.network {
@@ -144,7 +144,7 @@ impl MakerRegistry {
                 maker_id: id.0.clone(),
                 uptime_secs: reg.connected_at.elapsed().as_secs(),
                 network: reg.network.clone(),
-                assets: reg.assets.iter().map(|a| a.id.clone()).collect(),
+                assets: reg.assets.iter().map(|a| a.id.id.clone()).collect(),
             });
         }
 
@@ -154,5 +154,23 @@ impl MakerRegistry {
             networks,
             makers,
         }
+    }
+
+    /// Distinct assets served across all connected makers, with display
+    /// metadata — the broker's asset directory (`GET /assets`). Deduplicated by
+    /// contract id (first maker to advertise it wins).
+    pub async fn assets(&self) -> Vec<AssetInfo> {
+        let map = self.makers.read().await;
+        let mut seen: Vec<String> = Vec::new();
+        let mut out: Vec<AssetInfo> = Vec::new();
+        for reg in map.values() {
+            for info in &reg.assets {
+                if !seen.contains(&info.id.id) {
+                    seen.push(info.id.id.clone());
+                    out.push(info.clone());
+                }
+            }
+        }
+        out
     }
 }

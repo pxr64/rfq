@@ -100,6 +100,11 @@ pub trait RgbBackend: Send + Sync {
 
     async fn validate_invoice(&self, invoice: &str) -> Result<(), RgbError>;
 
+    /// Display metadata for `asset` — `(ticker, decimal_precision)` read from the
+    /// RGB contract's `spec`. Makers advertise this so the broker can serve an
+    /// asset directory.
+    async fn asset_spec(&self, asset: &AssetId) -> Result<(String, u8), RgbError>;
+
     /// Buy-side swap PSBT construction (declared-funding model). The maker
     /// contributes its RGB-bearing inputs (`maker_rgb_utxos`, the outpoints the
     /// inventory store reserved) and the RGB transition to `rgb_invoice`. The
@@ -258,6 +263,10 @@ impl RgbBackend for MockRgbBackend {
         } else {
             Err(RgbError::InvalidInvoice)
         }
+    }
+
+    async fn asset_spec(&self, _asset: &AssetId) -> Result<(String, u8), RgbError> {
+        Ok(("MOCK".to_owned(), 0))
     }
 
     async fn create_swap_psbt_buy(

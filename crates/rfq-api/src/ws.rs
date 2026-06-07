@@ -13,7 +13,7 @@ use futures::stream::SplitStream;
 use futures::{SinkExt, StreamExt};
 use rfq_router::ws_protocol::MakerFrame;
 use rfq_router::{MakerConnector, WsMakerConnector};
-use rfq_types::{AssetId, BitcoinNetwork, MakerId};
+use rfq_types::{AssetInfo, BitcoinNetwork, MakerId};
 use tokio::time::timeout;
 
 use crate::AppState;
@@ -57,7 +57,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 /// Wait for the `Register` frame (≤5s per frame), returning the maker id plus
 /// any advertised observability metadata. Non-register text is ignored; a
 /// close/error/timeout ends the connection.
-type Registration = (MakerId, Option<BitcoinNetwork>, Vec<AssetId>);
+type Registration = (MakerId, Option<BitcoinNetwork>, Vec<AssetInfo>);
 
 async fn read_register(stream: &mut SplitStream<WebSocket>) -> Option<Registration> {
     loop {

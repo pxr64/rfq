@@ -71,6 +71,16 @@ pub struct AssetId {
     pub id: String,
 }
 
+/// An asset plus its display metadata (ticker + decimal precision), read from
+/// the RGB contract. Makers advertise this for the contracts they serve so the
+/// broker can expose an asset directory (`GET /assets`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
+pub struct AssetInfo {
+    pub id: AssetId,
+    pub ticker: String,
+    pub precision: u8,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 pub enum BitcoinNetwork {
     Mainnet,

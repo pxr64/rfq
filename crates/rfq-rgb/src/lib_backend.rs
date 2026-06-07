@@ -803,6 +803,11 @@ fn extract_input_outpoints(
 
 #[async_trait]
 impl RgbBackend for LibRgbBackend {
+    async fn asset_spec(&self, asset: &AssetId) -> Result<(String, u8), RgbError> {
+        // Reuse the sync inherent reader (loads stock, reads the contract `spec`).
+        self.contract_spec(asset)
+    }
+
     async fn list_inventory_utxos(
         &self,
         asset: &AssetId,

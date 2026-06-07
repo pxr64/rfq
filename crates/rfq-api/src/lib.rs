@@ -15,9 +15,9 @@ use rfq_router::{fanout_quote, MakerConnector};
 use rfq_store::{InMemoryQuoteStore, QuoteStore};
 pub use rfq_types::CreateRfqRequest;
 use rfq_types::{
-    AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, BtcInventoryStatus, BtcInventoryUtxo,
-    HealthResponse, MakerId, Outpoint, Quote, QuoteId, QuoteRequest, RfqId, RgbInventoryUtxo,
-    SettlementIntent, SwapLeg,
+    AcceptQuoteRequest, AssetId, AssetInfo, AssetKind, BitcoinNetwork, BtcInventoryStatus,
+    BtcInventoryUtxo, HealthResponse, MakerId, Outpoint, Quote, QuoteId, QuoteRequest, RfqId,
+    RgbInventoryUtxo, SettlementIntent, SwapLeg,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
@@ -132,7 +132,7 @@ fn mock_taker_funding() -> Vec<(Outpoint, rfq_btc::TxOut)> {
                        over the /maker-stream WebSocket (not documented here). See \
                        docs/swap-flows.md for the full protocol.",
     ),
-    paths(health, status, create_rfq, accept_quote, deliver_consignment, sign_quote),
+    paths(health, status, assets, create_rfq, accept_quote, deliver_consignment, sign_quote),
     components(schemas(
         CreateRfqRequest,
         Quote,
@@ -141,6 +141,7 @@ fn mock_taker_funding() -> Vec<(Outpoint, rfq_btc::TxOut)> {
         SignQuoteBody,
         SettlementIntent,
         StatusResponse,
+        AssetInfo,
         ErrorResponse,
     )),
     tags((name = "broker", description = "Public RFQ broker endpoints"))
@@ -152,6 +153,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/health", get(health))
         .route("/status", get(status))
+        .route("/assets", get(assets))
         .route("/rfq", post(create_rfq))
         .route("/quotes/:id/accept", post(accept_quote))
         .route("/quotes/:id/consignment", post(deliver_consignment))
@@ -214,6 +216,19 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
         broker_version: env!("CARGO_PKG_VERSION").to_owned(),
         inner: state.registry.status().await,
     })
+}
+
+/// Asset directory: the distinct RGB assets quotable right now, with display
+/// metadata (ticker + precision), aggregated from connected makers. Clients use
+/// this to populate the tradeable-asset list instead of hardcoding it.
+#[utoipa::path(
+    get,
+    path = "/assets",
+    tag = "broker",
+    responses((status = 200, description = "Assets available to trade", body = [AssetInfo]))
+)]
+async fn assets(State(state): State<AppState>) -> Json<Vec<AssetInfo>> {
+    Json(state.registry.assets().await)
 }
 
 /// Request quotes for a swap. Fans the request out to every connected maker and
