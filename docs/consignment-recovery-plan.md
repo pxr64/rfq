@@ -21,31 +21,35 @@ can always re-deliver a consignment.
 
 ## Three components
 
-### 1. Maker `reconsign` command (maker-node) — recovery primitive
+### 1. Maker consignment persistence + `reconsign` (maker-node)
 
-Re-derive a consignment from the maker's stock (the stock still holds the
-transfer transition).
+The maker should **hold its own consignments** (not rely solely on the broker),
+with `reconsign` as the re-derive fallback.
 
-- CLI: `colorex maker reconsign --contract <id> --outpoint <txid:vout> [--out <file>]`
-  (witness txid inferred from the outpoint; `--out` writes base64, else stdout).
-- Impl: reuse the `stock.transfer(contract_id, [output_seal], [], [], Some(witness_id))`
-  path that `swap::commit_and_consign` already uses (witness-vout / output seal).
-  Add a thin `RgbBackend::reconsign(contract, outpoint) -> consignment_b64`.
-- Scope/limits: works for **witness-vout (explicit output) seals** — what swaps
-  use. **Blinded/secret seals can't be re-derived** post-hoc (the outpoint is
-  hidden); document that. Requires the witness tx be known to the resolver
-  (ideally confirmed).
-- Use: ops/support last-resort when the stash (below) doesn't have it.
+- **Persist on produce**: store every `final_consignment` the maker generates in a
+  new `maker.db` table (`consignments`: `quote_id`, `witness_txid`, `contract_id`,
+  recipient seal, blob, `created_at`). The maker can then re-serve a consignment
+  directly — cheap, no re-derive, no chain needed.
+- **`reconsign` (fallback)**: `colorex maker reconsign --contract <id> --outpoint <txid:vout> [--out <file>]`
+  re-derives from the stock via the `stock.transfer(contract_id, [output_seal], [],
+  [], Some(witness_id))` path `swap::commit_and_consign` already uses. Add a thin
+  `RgbBackend::reconsign(contract, outpoint) -> consignment_b64`. Works for
+  **witness-vout (explicit output) seals** — what swaps use; **blinded/secret
+  seals can't be re-derived** post-hoc (outpoint hidden) → document. This covers
+  consignments produced before persistence existed (e.g. the stranded `81060df…`).
+- Redundancy: **maker holds its own**, **broker holds all** (next). Either can
+  serve a recovery.
 
 ### 2. Broker consignment stash service — client-facing recovery
 
-Persist every settlement's consignment so clients can re-fetch it.
+Persist every settlement's consignment **across all makers** so any client can
+re-fetch it (complements the maker holding its own).
 
 - **Persist on settle**: when the maker finalizes (`/sign`), store the
   `final_consignment` keyed by `quote_id` + `witness_txid` + recipient (invoice /
   seal). Lands on the broker (rfq-api) datastore — ties to **Postgres** (see
-  [[project_broker_datastore]] / #30 v2). The maker can push it to the broker, or
-  the broker captures it from the `/sign` response it already proxies.
+  [[project_broker_datastore]] / #30 v2). The broker captures it from the `/sign`
+  response it already proxies (and the maker also keeps its own copy — component 1).
 - **Recovery endpoint**: `GET /consignments/{quote_id}` (and/or
   `GET /consignments?witness_txid=…`) → the stored consignment for re-import.
 - **Auth/privacy**: a consignment reveals transfer detail — the endpoint must be
@@ -86,18 +90,29 @@ so the common case never needs the stash.
 
 1. **Wallet import queue** — highest user value, self-contained; makes import
    robust immediately. Includes the manual-import UI + confirmation watch.
-2. **Maker `reconsign`** — small recovery primitive; unblocks recovering the
-   already-stranded `81060df…` COLX as the first test.
+2. **Maker consignment persistence + `reconsign`** — store consignments the maker
+   produces (maker.db); `reconsign` re-derives from stock as the fallback (and
+   recovers the pre-persistence `81060df…` COLX as the first test).
 3. **Dapp**: enqueue-on-settle (replace best-effort import) + persist consignment
    in history + re-import affordance.
 4. **Broker stash service** — persistence + authed recovery endpoint (with the
    Postgres datastore); largest, do last.
 
+## Resolved
+
+- **Does RGB accept against a mempool (unconfirmed) witness tx?** YES — verified
+  2026-06-07 in `rgb-wasm`: `parse_ords` maps a height-less tx to
+  `WitnessOrd::Tentative` (only `height > 0` → `Mined`), and `accept_consignment`
+  validates + `accept_transfer`s with `Tentative` (`Validity::Valid`). So import
+  works pre-confirmation (asset lands tentative; `update_witnesses` promotes it
+  once mined). **Confirmation is NOT a gate** for the import queue — its retry is
+  for transient failures + Tentative→Mined promotion. (Corollary: the earlier
+  stranded COLX was just never imported — `acceptConsignment` wasn't called — not
+  a confirmation problem.)
+
 ## Open questions
 
 - Auth model for the stash recovery endpoint (ownership proof vs per-quote token).
-- Confirmation-watch mechanism in the wallet (esplora polling vs a push).
-- Stash retention + where exactly persistence lives (broker Postgres vs maker).
-- Does RGB accept against a **mempool** (unconfirmed) witness tx, or is
-  confirmation required? Determines whether the queue can import pre-confirmation.
-  (Verify early — it shapes #1 and #2.)
+- Stash retention policy + dedupe between maker-local and broker copies.
+- Maker `reconsign` for blinded seals (can't re-derive) — is that ever needed for
+  swaps, or are swaps always witness-vout?
