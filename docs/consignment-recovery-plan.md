@@ -67,8 +67,17 @@ Make import survive confirmation timing and restarts.
   timer, and/or **witness-tx confirmation** (watch the txid via esplora — reuse
   the chain-sync path). Idempotent (re-importing an accepted consignment is a
   no-op).
-- States per item: `pending → importing → done | failed(reason)`. Surface an
-  "incoming RGB" badge + a retry/dismiss affordance in the wallet UI.
+- **Finality, not just import (RBF/reorg).** Import can succeed against a mempool
+  tx as `Tentative` (see Resolved), but tentative ≠ final — if the witness tx is
+  **replaced (RBF) or dropped**, the allocation must be **reverted**. The queue
+  keeps watching the witness txid after a tentative import and:
+  - **Mined** → promote (`update_witnesses`), show as confirmed/spendable.
+  - **Replaced/dropped** (esplora 404 / a conflicting tx confirms) → **revert the
+    tentative allocation**, mark the item `reverted`, notify the user.
+  - Treat received RGB as **pending (not spendable)** until the witness tx
+    confirms — same posture as BTC.
+- States per item: `pending → importing → tentative → confirmed | reverted | failed(reason)`.
+  Surface an "incoming RGB (pending)" badge + a retry/dismiss affordance.
 - Provider/UI: a **manual "Import consignment"** action (paste base64) →
   enqueue → `window.colorex.acceptConsignment` (already wired). Lets a user pull
   from the stash service or a maker `reconsign` output.
@@ -98,6 +107,22 @@ so the common case never needs the stash.
 4. **Broker stash service** — persistence + authed recovery endpoint (with the
    Postgres datastore); largest, do last.
 
+## Safety: RBF / replacement / finality
+
+- The **swap tx can't be unilaterally RBF'd**: all inputs are signed `SIGHASH_ALL`,
+  so changing anything invalidates the counterparty's signature (can't forge it).
+- A party **can** double-spend its **own** input via a conflicting/RBF tx, which
+  **evicts** the swap tx. This is an **abort, not theft**: neither output confirms,
+  the maker's RGB input is freed (maker keeps its RGB), the taker reclaims its BTC.
+- Therefore the only real hazard is a recipient treating a **tentative** allocation
+  as final. Mitigation lives in the import queue: **received RGB is pending until
+  confirmed; revert on replacement** (above).
+- Design knobs to consider: have the maker broadcast the swap tx with a
+  **non-RBF sequence** (reduce the replacement surface) and/or **CPFP** to speed
+  confirmation; require N confs before the dapp marks a swap "settled" vs
+  "broadcast". (The maker likewise shouldn't treat its incoming BTC as final until
+  confirmed — same rule, both directions.)
+
 ## Resolved
 
 - **Does RGB accept against a mempool (unconfirmed) witness tx?** YES — verified
@@ -105,8 +130,9 @@ so the common case never needs the stash.
   `WitnessOrd::Tentative` (only `height > 0` → `Mined`), and `accept_consignment`
   validates + `accept_transfer`s with `Tentative` (`Validity::Valid`). So import
   works pre-confirmation (asset lands tentative; `update_witnesses` promotes it
-  once mined). **Confirmation is NOT a gate** for the import queue — its retry is
-  for transient failures + Tentative→Mined promotion. (Corollary: the earlier
+  once mined). **Confirmation is NOT a gate** for the import *action* — but
+  tentative ≠ final: the queue must still watch for confirmation (promote) and
+  **replacement/drop (revert)** — see Safety: RBF. (Corollary: the earlier
   stranded COLX was just never imported — `acceptConsignment` wasn't called — not
   a confirmation problem.)
 
