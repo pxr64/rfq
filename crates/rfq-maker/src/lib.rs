@@ -8,7 +8,8 @@ use rfq_btc::BitcoinClient;
 use rfq_rgb::{RgbBackend, TxOut};
 use rfq_router::{MakerConnector, RouterError};
 use rfq_store::{
-    BtcCoinSelector, BtcInventoryStore, GreedyLargestFirstSelector, InMemoryBtcInventoryStore,
+    BtcCoinSelector, BtcInventoryStore, ConsignmentRecord, ConsignmentStore,
+    GreedyLargestFirstSelector, InMemoryBtcInventoryStore, InMemoryConsignmentStore,
     InMemoryInventoryStore, InventoryStore,
 };
 use rfq_types::{
@@ -216,6 +217,10 @@ pub struct Maker {
     /// Plain-BTC inventory the maker pays out from on the sell side. Empty
     /// unless seeded via `with_btc_inventory`; a buy-only maker never touches it.
     btc_store: Arc<dyn BtcInventoryStore>,
+    /// Durable record of every consignment the maker produces, so it can be
+    /// re-served on recovery. In-memory unless a durable store is injected via
+    /// [`Maker::with_consignment_store`].
+    consignment_store: Arc<dyn ConsignmentStore>,
     rgb_backend: Arc<dyn RgbBackend>,
     bitcoin_client: Arc<dyn BitcoinClient>,
     pending: Arc<RwLock<HashMap<QuoteId, PendingSettlement>>>,
@@ -273,6 +278,7 @@ impl Maker {
             store,
             selector,
             btc_store: Arc::new(InMemoryBtcInventoryStore::new()),
+            consignment_store: Arc::new(InMemoryConsignmentStore::new()),
             rgb_backend,
             bitcoin_client,
             pending: Arc::new(RwLock::new(HashMap::new())),
@@ -301,6 +307,35 @@ impl Maker {
     pub fn with_btc_store(mut self, store: Arc<dyn BtcInventoryStore>) -> Self {
         self.btc_store = store;
         self
+    }
+
+    /// Inject a durable consignment store (the SQLite one) in place of the
+    /// default in-memory store, so produced consignments survive a restart.
+    pub fn with_consignment_store(mut self, store: Arc<dyn ConsignmentStore>) -> Self {
+        self.consignment_store = store;
+        self
+    }
+
+    /// Best-effort persistence of a produced consignment. A failure is logged but
+    /// never aborts the swap — the consignment is already returned to the taker;
+    /// this store is the recovery safety net (re-served via the broker / CLI).
+    async fn persist_consignment(
+        &self,
+        quote_id: &QuoteId,
+        contract_id: &str,
+        witness_txid: &str,
+        consignment: &str,
+    ) {
+        let record = ConsignmentRecord {
+            quote_id: quote_id.clone(),
+            contract_id: contract_id.to_owned(),
+            witness_txid: witness_txid.to_owned(),
+            consignment: consignment.to_owned(),
+            created_at_ms: now_ms(),
+        };
+        if let Err(e) = self.consignment_store.save_consignment(record).await {
+            eprintln!("warning: failed to persist consignment for quote {}: {e}", quote_id.0);
+        }
     }
 
     /// Per-UTXO view across all assets. Returned in outpoint order so callers
@@ -1002,6 +1037,16 @@ impl Maker {
             .await
             .map_err(|e| RouterError::Maker(e.to_string()))?;
 
+        // Persist the maker-emitted consignment (sell: the RGB change transfer to
+        // the taker's change seal) for recovery.
+        self.persist_consignment(
+            &quote_id,
+            &pending.quote.base_asset.id,
+            &finalized.witness_txid,
+            &finalized.final_consignment_base64,
+        )
+        .await;
+
         self.pending.write().await.remove(&quote_id);
 
         Ok(SettlementIntent {
@@ -1357,6 +1402,16 @@ impl MakerConnector for Maker {
             )
             .await
             .map_err(|e| RouterError::Maker(e.to_string()))?;
+
+        // Tx is broadcast — persist the consignment so it can be re-served if the
+        // taker loses theirs (buy: the maker→taker token transfer).
+        self.persist_consignment(
+            &quote_id,
+            &pending.quote.base_asset.id,
+            &finalized.witness_txid,
+            &finalized.final_consignment_base64,
+        )
+        .await;
 
         self.pending.write().await.remove(&quote_id);
 

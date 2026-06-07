@@ -23,8 +23,8 @@ use rfq_maker::{CoinSelector, GreedyExactFitSelector, Maker, RebalancePolicy};
 use rfq_rgb::{LibRgbBackend, MockRgbBackend, RgbBackend};
 use rfq_router::MakerConnector;
 use rfq_store::{
-    BtcInventoryStore, InMemoryQuoteStore, InventoryStore, QuoteStore, SqliteBtcInventoryStore,
-    SqliteInventoryStore,
+    BtcInventoryStore, ConsignmentStore, InMemoryQuoteStore, InventoryStore, QuoteStore,
+    SqliteBtcInventoryStore, SqliteConsignmentStore, SqliteInventoryStore,
 };
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, BtcInventoryStatus, BtcInventoryUtxo,
@@ -341,6 +341,25 @@ pub fn reconsign_consignment(
     Ok(backend.reconsign(&contract_id, outpoint)?)
 }
 
+/// Re-serve a consignment the maker persisted at settlement, by quote id. Reads
+/// `maker.db` only (no chain, no stash) — the cheap recovery path that doesn't
+/// re-derive. `None` if the maker never recorded one for that quote.
+pub async fn fetch_consignment(
+    config: &MakerNodeConfig,
+    quote_id: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let rgb = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: a wallet is required to read consignments")?;
+    let db_path = rgb.data_dir.join(&rgb.network).join("maker.db");
+    let store = SqliteConsignmentStore::open(&db_path).await?;
+    Ok(store
+        .get_consignment(&QuoteId(quote_id.to_owned()))
+        .await?
+        .map(|r| r.consignment))
+}
+
 pub async fn build_runtime(
     config: &MakerNodeConfig,
 ) -> Result<MakerNodeRuntime, Box<dyn std::error::Error>> {
@@ -388,15 +407,18 @@ pub async fn build_runtime(
             }
             let inv_store = SqliteInventoryStore::open(&db_path).await?;
             let btc_store = SqliteBtcInventoryStore::open(&db_path).await?;
+            let consignment_store = SqliteConsignmentStore::open(&db_path).await?;
             reconcile_rgb_inventory(&inv_store, &asset, &rgb_utxos, now_ms).await?;
             reconcile_btc_inventory(&btc_store, &btc_inventory).await?;
 
             let inv_store: Arc<dyn InventoryStore> = Arc::new(inv_store);
             let btc_store: Arc<dyn BtcInventoryStore> = Arc::new(btc_store);
+            let consignment_store: Arc<dyn ConsignmentStore> = Arc::new(consignment_store);
             let selector: Arc<dyn CoinSelector> = Arc::new(GreedyExactFitSelector);
             let maker =
                 Maker::with_components(maker_id, inv_store, selector, rgb_backend_trait, bitcoin_client)
-                    .with_btc_store(btc_store);
+                    .with_btc_store(btc_store)
+                    .with_consignment_store(consignment_store);
             Ok(MakerNodeRuntime {
                 maker,
                 chain_observer: Some(ChainObserverDeps {

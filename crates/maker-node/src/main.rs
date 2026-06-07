@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use maker_node::{
     broker_client, build_maker, build_runtime, create_inventory_invoice, init, maker_app, orders,
-    output, reconsign_consignment, spawn_chain_observer_loop, spawn_cleanup_loop,
-    spawn_rebalance_loop, MakerNodeConfig,
+    fetch_consignment, output, reconsign_consignment, spawn_chain_observer_loop,
+    spawn_cleanup_loop, spawn_rebalance_loop, MakerNodeConfig,
 };
 use colorex_wallet::{resolve_named, resolve_wallet, WalletConfig, WalletInput};
 use rfq_rgb::RgbBackend;
@@ -218,6 +218,17 @@ enum MakerCmd {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Re-serve a consignment the maker recorded at settlement, by quote id.
+    /// Reads maker.db only — the cheap recovery path (no re-derive). Use
+    /// `reconsign` if the maker never recorded one.
+    Consignment {
+        /// Quote id of the settled swap.
+        #[arg(long)]
+        quote_id: String,
+        /// Write the base64 consignment here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
@@ -280,6 +291,9 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 outpoint,
                 out,
             } => maker_reconsign(load_config(&config_path)?, contract, outpoint, out),
+            MakerCmd::Consignment { quote_id, out } => {
+                maker_get_consignment(load_config(&config_path)?, quote_id, out).await
+            }
         },
         TopCommand::Wallet { cmd } => match cmd {
             WalletCmd::Create {
@@ -423,6 +437,29 @@ fn maker_reconsign(
             eprintln!("wrote consignment to {}", path.display());
         }
         None => println!("{consignment}"),
+    }
+    Ok(())
+}
+
+async fn maker_get_consignment(
+    config: MakerNodeConfig,
+    quote_id: String,
+    out: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match fetch_consignment(&config, &quote_id).await? {
+        Some(consignment) => match out {
+            Some(path) => {
+                std::fs::write(&path, &consignment)?;
+                eprintln!("wrote consignment to {}", path.display());
+            }
+            None => println!("{consignment}"),
+        },
+        None => {
+            return Err(format!(
+                "no consignment recorded for quote {quote_id} (try `reconsign` to re-derive)"
+            )
+            .into())
+        }
     }
     Ok(())
 }

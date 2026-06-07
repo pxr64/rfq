@@ -26,10 +26,17 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
-use crate::{BtcInventoryStore, InMemoryBtcInventoryStore, InMemoryInventoryStore, InventoryStore};
+use crate::{
+    BtcInventoryStore, ConsignmentError, ConsignmentRecord, ConsignmentStore,
+    InMemoryBtcInventoryStore, InMemoryInventoryStore, InventoryStore,
+};
 
 fn inv(e: impl std::fmt::Display) -> InventoryError {
     InventoryError::Backend(e.to_string())
+}
+
+fn cons(e: impl std::fmt::Display) -> ConsignmentError {
+    ConsignmentError::Backend(e.to_string())
 }
 
 fn btc(e: impl std::fmt::Display) -> BtcInventoryError {
@@ -510,6 +517,97 @@ impl BtcInventoryStore for SqliteBtcInventoryStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Consignment store
+// ---------------------------------------------------------------------------
+
+/// Durable [`ConsignmentStore`] over SQLite. Unlike the inventory stores there's
+/// no hot-read path, so it queries SQL directly (no in-memory working copy) and
+/// upserts one row per quote.
+pub struct SqliteConsignmentStore {
+    pool: SqlitePool,
+}
+
+impl SqliteConsignmentStore {
+    pub async fn open(path: &Path) -> Result<Self, ConsignmentError> {
+        let pool = open_pool(path).await.map_err(cons)?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS consignments (\
+                 quote_id TEXT PRIMARY KEY, contract_id TEXT NOT NULL, \
+                 witness_txid TEXT NOT NULL, consignment TEXT NOT NULL, \
+                 created_at_ms INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .map_err(cons)?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_consignments_witness ON consignments (witness_txid)")
+            .execute(&pool)
+            .await
+            .map_err(cons)?;
+        Ok(Self { pool })
+    }
+}
+
+type ConsignmentRow = (String, String, String, String, i64);
+
+fn row_to_record(r: ConsignmentRow) -> ConsignmentRecord {
+    ConsignmentRecord {
+        quote_id: QuoteId(r.0),
+        contract_id: r.1,
+        witness_txid: r.2,
+        consignment: r.3,
+        created_at_ms: r.4 as u64,
+    }
+}
+
+const SELECT_COLS: &str = "SELECT quote_id, contract_id, witness_txid, consignment, created_at_ms FROM consignments";
+
+#[async_trait]
+impl ConsignmentStore for SqliteConsignmentStore {
+    async fn save_consignment(&self, record: ConsignmentRecord) -> Result<(), ConsignmentError> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO consignments \
+                 (quote_id, contract_id, witness_txid, consignment, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(&record.quote_id.0)
+        .bind(&record.contract_id)
+        .bind(&record.witness_txid)
+        .bind(&record.consignment)
+        .bind(record.created_at_ms as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(cons)?;
+        Ok(())
+    }
+
+    async fn get_consignment(
+        &self,
+        quote_id: &QuoteId,
+    ) -> Result<Option<ConsignmentRecord>, ConsignmentError> {
+        let row: Option<ConsignmentRow> =
+            sqlx::query_as(&format!("{SELECT_COLS} WHERE quote_id = ?1"))
+                .bind(&quote_id.0)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(cons)?;
+        Ok(row.map(row_to_record))
+    }
+
+    async fn get_by_witness(
+        &self,
+        witness_txid: &str,
+    ) -> Result<Vec<ConsignmentRecord>, ConsignmentError> {
+        let rows: Vec<ConsignmentRow> =
+            sqlx::query_as(&format!("{SELECT_COLS} WHERE witness_txid = ?1"))
+                .bind(witness_txid)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(cons)?;
+        Ok(rows.into_iter().map(row_to_record).collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,6 +777,38 @@ mod tests {
             store.find_reservation_for_quote(&QuoteId("q-1".into())).await,
             Some(rid)
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn consignment_survives_reopen_and_is_indexed_by_witness() {
+        let path = temp_db();
+        let rec = ConsignmentRecord {
+            quote_id: QuoteId("q-1".into()),
+            contract_id: "rgb:contract-A".into(),
+            witness_txid: "wt-1".into(),
+            consignment: "Y29uc2lnbm1lbnQ=".into(),
+            created_at_ms: NOW_MS,
+        };
+        {
+            let store = SqliteConsignmentStore::open(&path).await.unwrap();
+            store.save_consignment(rec.clone()).await.unwrap();
+            // Upsert: re-saving the same quote replaces, not duplicates.
+            store.save_consignment(rec.clone()).await.unwrap();
+        }
+        // Reopen → the record is recovered (durable across restart).
+        let store = SqliteConsignmentStore::open(&path).await.unwrap();
+        assert_eq!(
+            store.get_consignment(&QuoteId("q-1".into())).await.unwrap(),
+            Some(rec.clone())
+        );
+        assert!(store
+            .get_consignment(&QuoteId("missing".into()))
+            .await
+            .unwrap()
+            .is_none());
+        let by_wit = store.get_by_witness("wt-1").await.unwrap();
+        assert_eq!(by_wit, vec![rec]);
         let _ = std::fs::remove_file(&path);
     }
 }

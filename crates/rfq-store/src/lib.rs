@@ -17,7 +17,94 @@ pub use btc::{
 #[cfg(feature = "sqlite")]
 mod sqlite;
 #[cfg(feature = "sqlite")]
-pub use sqlite::{SqliteBtcInventoryStore, SqliteInventoryStore};
+pub use sqlite::{SqliteBtcInventoryStore, SqliteConsignmentStore, SqliteInventoryStore};
+
+/// A consignment the maker produced for a settled swap, kept so it can be
+/// re-served if the recipient loses theirs (failed delivery, wallet reset). The
+/// cheap counterpart to `colorex maker reconsign`, which re-derives from the stash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsignmentRecord {
+    pub quote_id: QuoteId,
+    /// RGB contract id (the `base_asset` id of the quote).
+    pub contract_id: String,
+    /// The swap's witness txid the consignment anchors to.
+    pub witness_txid: String,
+    /// The base64 `final_consignment` handed to the recipient.
+    pub consignment: String,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConsignmentError {
+    Backend(String),
+}
+
+impl std::fmt::Display for ConsignmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(msg) => write!(f, "consignment store error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ConsignmentError {}
+
+/// Durable store of the maker's produced consignments, keyed by quote id.
+/// Persisting is best-effort at the call site: a failure must not abort an
+/// otherwise-settled swap (the consignment is still returned to the taker).
+#[async_trait]
+pub trait ConsignmentStore: Send + Sync {
+    /// Upsert by `quote_id` (a re-settlement of the same quote replaces).
+    async fn save_consignment(&self, record: ConsignmentRecord) -> Result<(), ConsignmentError>;
+
+    async fn get_consignment(&self, quote_id: &QuoteId)
+        -> Result<Option<ConsignmentRecord>, ConsignmentError>;
+
+    /// Every record anchored to `witness_txid` (a swap may emit more than one,
+    /// e.g. a sell's change consignment).
+    async fn get_by_witness(&self, witness_txid: &str)
+        -> Result<Vec<ConsignmentRecord>, ConsignmentError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryConsignmentStore {
+    by_quote: Arc<RwLock<HashMap<QuoteId, ConsignmentRecord>>>,
+}
+
+impl InMemoryConsignmentStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl ConsignmentStore for InMemoryConsignmentStore {
+    async fn save_consignment(&self, record: ConsignmentRecord) -> Result<(), ConsignmentError> {
+        self.by_quote.write().await.insert(record.quote_id.clone(), record);
+        Ok(())
+    }
+
+    async fn get_consignment(
+        &self,
+        quote_id: &QuoteId,
+    ) -> Result<Option<ConsignmentRecord>, ConsignmentError> {
+        Ok(self.by_quote.read().await.get(quote_id).cloned())
+    }
+
+    async fn get_by_witness(
+        &self,
+        witness_txid: &str,
+    ) -> Result<Vec<ConsignmentRecord>, ConsignmentError> {
+        Ok(self
+            .by_quote
+            .read()
+            .await
+            .values()
+            .filter(|r| r.witness_txid == witness_txid)
+            .cloned()
+            .collect())
+    }
+}
 
 #[async_trait]
 pub trait QuoteStore: Send + Sync {
