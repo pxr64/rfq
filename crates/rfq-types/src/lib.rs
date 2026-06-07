@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Outpoint {
@@ -54,23 +55,23 @@ impl std::str::FromStr for Outpoint {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 pub struct RfqId(pub String);
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 pub struct QuoteId(pub String);
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 pub struct MakerId(pub String);
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 pub struct AssetId {
     pub network: BitcoinNetwork,
     pub kind: AssetKind,
     pub id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 pub enum BitcoinNetwork {
     Mainnet,
     Testnet,
@@ -91,13 +92,13 @@ impl std::str::FromStr for BitcoinNetwork {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 pub enum AssetKind {
     Btc,
     Rgb20,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub enum Side {
     Buy,
     Sell,
@@ -113,7 +114,7 @@ pub struct QuoteRequest {
     pub created_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateRfqRequest {
     pub base_asset: AssetId,
     pub quote_asset: AssetId,
@@ -121,12 +122,12 @@ pub struct CreateRfqRequest {
     pub amount: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub struct HealthResponse {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Quote {
     pub quote_id: QuoteId,
     pub rfq_id: RfqId,
@@ -158,7 +159,7 @@ pub struct AcceptQuoteRequest {
 
 /// Side-specific payload on `AcceptQuoteRequest`. See `docs/swap-flows.md` for
 /// the full flow on each side.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "side", rename_all = "snake_case")]
 pub enum SwapLeg {
     /// Taker is buying RGB and paying BTC. The taker declares the BTC address
@@ -183,7 +184,7 @@ pub enum SwapLeg {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SettlementIntent {
     pub quote_id: QuoteId,
     pub maker_id: MakerId,
@@ -217,7 +218,7 @@ pub struct SettlementIntent {
 /// enforce the graph; `Pending` and `Accepted` are part of the lifecycle spec
 /// but the mock maker currently emits intents starting at the `Awaiting*`
 /// states (it has no pre-accept settlement object).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 pub enum SettlementStatus {
     /// Genesis: a settlement exists but the maker has taken no action yet.
     Pending,
@@ -654,7 +655,7 @@ impl std::error::Error for BtcInventoryError {}
 ///
 /// Wire format: `partial_psbt` and `consignment` are base64-encoded (see
 /// `psbt_base64` / `consignment_base64` parameter naming in `rfq-wallet`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SwapTransfer {
     pub partial_psbt: String,
     /// Maker-built consignment for the RGB leg (buy side). On sell side this

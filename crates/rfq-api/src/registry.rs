@@ -1,18 +1,53 @@
-//! Runtime registry of connected makers, keyed by [`MakerId`]. Replaces the
-//! startup-fixed `Vec<Arc<dyn MakerConnector>>`: makers self-register over the
-//! WebSocket (`/maker-stream`) and are removed on disconnect. The static
-//! `BROKER_MAKER` path pre-seeds it via [`MakerRegistry::with`].
+//! Runtime registry of connected makers, keyed by [`MakerId`]. Makers
+//! self-register over the WebSocket (`/maker-stream`) and are removed on
+//! disconnect. Tests and the in-process mock pre-seed it via
+//! [`MakerRegistry::with`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use rfq_router::MakerConnector;
-use rfq_types::MakerId;
+use rfq_types::{AssetId, BitcoinNetwork, MakerId};
+use serde::Serialize;
 use tokio::sync::RwLock;
+use utoipa::ToSchema;
+
+/// A registered maker plus the observability metadata the broker surfaces via
+/// `GET /status`. `network`/`assets` come from the maker's `Register` frame and
+/// are empty for older makers that don't advertise them.
+struct Registered {
+    connector: Arc<dyn MakerConnector>,
+    connected_at: Instant,
+    network: Option<BitcoinNetwork>,
+    assets: Vec<AssetId>,
+}
 
 #[derive(Default)]
 pub struct MakerRegistry {
-    makers: RwLock<HashMap<MakerId, Arc<dyn MakerConnector>>>,
+    makers: RwLock<HashMap<MakerId, Registered>>,
+}
+
+/// Aggregate broker observability snapshot. `broker_version` is filled in by the
+/// HTTP handler (the registry doesn't know the crate version).
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct BrokerStatus {
+    pub makers_online: usize,
+    /// Count of distinct RGB contracts served across all makers — each is one
+    /// asset pair (asset ↔ BTC).
+    pub asset_pairs: usize,
+    /// Distinct networks advertised by connected makers.
+    pub networks: Vec<BitcoinNetwork>,
+    pub makers: Vec<MakerStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct MakerStatus {
+    pub maker_id: String,
+    pub uptime_secs: u64,
+    pub network: Option<BitcoinNetwork>,
+    /// The RGB contract ids this maker serves.
+    pub assets: Vec<String>,
 }
 
 impl MakerRegistry {
@@ -20,17 +55,45 @@ impl MakerRegistry {
         Arc::new(Self::default())
     }
 
-    /// Pre-seed from a static list (e.g. `BROKER_MAKER` HTTP connectors or the
-    /// in-process mock maker). Sync — used from the non-async `app*` builders.
+    /// Pre-seed from a static list (the in-process mock maker, or
+    /// `HttpMakerConnector`s in the round-trip tests). Sync — used from the
+    /// non-async `app*` builders. These carry no advertised metadata
+    /// (`network`/`assets` empty).
     pub fn with(makers: Vec<Arc<dyn MakerConnector>>) -> Arc<Self> {
-        let map = makers.into_iter().map(|m| (m.maker_id(), m)).collect();
+        let map = makers
+            .into_iter()
+            .map(|m| {
+                (
+                    m.maker_id(),
+                    Registered {
+                        connector: m,
+                        connected_at: Instant::now(),
+                        network: None,
+                        assets: Vec::new(),
+                    },
+                )
+            })
+            .collect();
         Arc::new(Self {
             makers: RwLock::new(map),
         })
     }
 
-    pub async fn insert(&self, maker: Arc<dyn MakerConnector>) {
-        self.makers.write().await.insert(maker.maker_id(), maker);
+    pub async fn insert(
+        &self,
+        maker: Arc<dyn MakerConnector>,
+        network: Option<BitcoinNetwork>,
+        assets: Vec<AssetId>,
+    ) {
+        self.makers.write().await.insert(
+            maker.maker_id(),
+            Registered {
+                connected_at: Instant::now(),
+                connector: maker,
+                network,
+                assets,
+            },
+        );
     }
 
     /// Remove `id` only if the registered connector is *this* exact `Arc` — so a
@@ -38,7 +101,7 @@ impl MakerRegistry {
     /// reconnected (last-writer-wins under flapping).
     pub async fn remove_if(&self, id: &MakerId, this: &Arc<dyn MakerConnector>) {
         let mut map = self.makers.write().await;
-        if matches!(map.get(id), Some(existing) if Arc::ptr_eq(existing, this)) {
+        if matches!(map.get(id), Some(existing) if Arc::ptr_eq(&existing.connector, this)) {
             map.remove(id);
         }
     }
@@ -46,10 +109,50 @@ impl MakerRegistry {
     /// Snapshot of the current connectors (clone the `Arc`s, drop the lock before
     /// awaiting on them in fanout).
     pub async fn snapshot(&self) -> Vec<Arc<dyn MakerConnector>> {
-        self.makers.read().await.values().cloned().collect()
+        self.makers
+            .read()
+            .await
+            .values()
+            .map(|r| r.connector.clone())
+            .collect()
     }
 
     pub async fn get(&self, id: &MakerId) -> Option<Arc<dyn MakerConnector>> {
-        self.makers.read().await.get(id).cloned()
+        self.makers.read().await.get(id).map(|r| r.connector.clone())
+    }
+
+    /// Aggregate observability snapshot for `GET /status`.
+    pub async fn status(&self) -> BrokerStatus {
+        let map = self.makers.read().await;
+
+        let mut asset_ids: Vec<&str> = Vec::new();
+        let mut networks: Vec<BitcoinNetwork> = Vec::new();
+        let mut makers: Vec<MakerStatus> = Vec::new();
+
+        for (id, reg) in map.iter() {
+            for asset in &reg.assets {
+                if !asset_ids.contains(&asset.id.as_str()) {
+                    asset_ids.push(asset.id.as_str());
+                }
+            }
+            if let Some(net) = &reg.network {
+                if !networks.contains(net) {
+                    networks.push(net.clone());
+                }
+            }
+            makers.push(MakerStatus {
+                maker_id: id.0.clone(),
+                uptime_secs: reg.connected_at.elapsed().as_secs(),
+                network: reg.network.clone(),
+                assets: reg.assets.iter().map(|a| a.id.clone()).collect(),
+            });
+        }
+
+        BrokerStatus {
+            makers_online: map.len(),
+            asset_pairs: asset_ids.len(),
+            networks,
+            makers,
+        }
     }
 }

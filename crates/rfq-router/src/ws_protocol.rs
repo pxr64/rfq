@@ -11,7 +11,10 @@
 //!
 //! All frames are JSON text frames.
 
-use rfq_types::{AcceptQuoteRequest, MakerId, Quote, QuoteId, QuoteRequest, SettlementIntent};
+use rfq_types::{
+    AcceptQuoteRequest, AssetId, BitcoinNetwork, MakerId, Quote, QuoteId, QuoteRequest,
+    SettlementIntent,
+};
 use serde::{Deserialize, Serialize};
 
 /// Broker → maker. Correlated back to the caller by `req_id`.
@@ -47,8 +50,17 @@ pub enum WsOp {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MakerFrame {
     /// Mandatory first frame: identifies the maker so the broker can route
-    /// `quote.maker_id` back to this connection.
-    Register { maker_id: MakerId },
+    /// `quote.maker_id` back to this connection. `network` and `assets` are
+    /// optional observability metadata (older makers omit them) the broker
+    /// surfaces via `GET /status`; `assets` lists the RGB contracts this maker
+    /// serves (each paired against BTC).
+    Register {
+        maker_id: MakerId,
+        #[serde(default)]
+        network: Option<BitcoinNetwork>,
+        #[serde(default)]
+        assets: Vec<AssetId>,
+    },
     /// Reply to a `WsRequest`, correlated by `req_id`.
     Response { req_id: u64, result: WsResult },
 }

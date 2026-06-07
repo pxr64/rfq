@@ -39,11 +39,11 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 - [x] Issue #25: Swap composition: route seal-anchor BTC value to a maker change output (don't burn as fee).
 - [ ] Issue #27: Maker-node runtime — post-broadcast wallet refresh + BTC inventory refresh + confirmation tracking. **Last critical gap before the daemon is fully operational on regtest** (today's state stops working after the first swap broadcasts).
 - [ ] Issue #29: Multi-asset maker — the daemon wires a single `[rgb] contract_id` end-to-end, so a maker is effectively single-asset even though the order book is already `(asset, side)`-keyed. Lift `build_runtime` to an active *set* of contracts (per-asset RGB + BTC inventory + chain observer) and add `--asset` to `maker invoice`/`inventory`.
-- [x] Maker→broker auto-discovery over WebSocket — makers dial the broker and self-register (`/maker-stream` + `MakerRegistry` + `WsMakerConnector`), replacing the static `BROKER_MAKER` env. Done (uncommitted); `BROKER_MAKER` kept as an optional static pre-seed.
-- [ ] Issue #30: Broker observability — makers online, per-maker uptime, aggregate available liquidity per (asset, side). Builds on the WS registry: add maker→broker `Heartbeat`/`InventoryUpdate` frames, track per-maker metadata, expose `GET /status`.
+- [x] Maker→broker auto-discovery over WebSocket — makers dial the broker and self-register (`/maker-stream` + `MakerRegistry` + `WsMakerConnector`). The static `BROKER_MAKER` env pre-seed has been removed: the broker registry always starts empty and is filled by self-registration.
+- [~] Issue #30: Broker observability. **v1 landed**: `GET /status` reports `makers_online`, `asset_pairs`, `networks`, and per-maker `uptime_secs` (registry gained `connected_at`; the `Register` frame now carries `network` + served `assets`). **Deferred (v2)**: median quote latency, quotes-routed-24h, settlement-success, online-vs-subscribed — need timestamped event capture + persistence (heartbeat/`InventoryUpdate` frames).
 - [ ] Issue #24: Replace bp-hot + easy rgb-cmd commands in the e2e test harness — bp-hot slice landed; rgb-cmd commands (import/create/address/utxos/invoice/transfer/accept) still subprocess.
 - [ ] Issue #26: Run regtest stack ephemerally via testcontainers-rs so `cargo test` owns its bitcoind + electrs lifecycle.
-- [ ] Issue #6: Add OpenAPI spec for public RFQ API
+- [x] Issue #6: OpenAPI spec for the broker API — generated in-code with `utoipa` (NestJS-style): `#[utoipa::path]` on the handlers + `ToSchema` on `rfq-types`. The broker serves Swagger UI at `GET /swagger-ui` and the spec at `GET /api-docs/openapi.json`, always in sync with the code. Covers `/health`, `/status`, `/rfq`, and the `accept`/`consignment`/`sign` quote routes; `/maker-stream` is intentionally excluded. TS clients can be generated from the served `openapi.json`.
 - [ ] Future work: RGB ↔ RGB atomic swap (asset-for-asset). Two RGB state transitions committed in one Bitcoin tx; design pass deferred until #15/#16 land so we know the final `SwapLeg` / `RgbBackend` surface to extend.
 
 ## Issue #2: Inventory Snapshot
@@ -318,12 +318,25 @@ Scope:
 Builds on the WS auto-discovery feature; reuses `rfq_types::InventorySnapshot`
 (already produced by `Maker::inventory_summary`).
 
-## Issue #6: OpenAPI Spec
+## Issue #6: OpenAPI Spec — DONE
 
-Document the broker contract once the core broker and maker-node surfaces stabilize.
+The broker contract is generated in-code with `utoipa` and served by the broker
+itself (NestJS-style), so it never drifts from the implementation:
 
-- Document broker API endpoints and schemas aligned with `rfq-types`.
-- Include inventory/health endpoints only if the broker exposes them.
+- **Swagger UI:** `GET /swagger-ui` — interactive docs + "Try it out".
+- **Raw spec:** `GET /api-docs/openapi.json`.
+- Source of truth: `#[utoipa::path]` annotations on the `rfq-api` handlers and
+  `#[derive(ToSchema)]` on the `rfq-types` wire structs (`ApiDoc` in
+  `crates/rfq-api/src/lib.rs`).
+- All broker routes: `/health`, `/status`, `/rfq`, `/quotes/{id}/accept`,
+  `/quotes/{id}/consignment`, `/quotes/{id}/sign`. Schemas: `CreateRfqRequest`,
+  `Quote`, `SwapLeg` (`side` discriminator), `SettlementIntent`/
+  `SettlementStatus`, `StatusResponse`, uniform `ErrorResponse`, etc.
+- The `/maker-stream` WebSocket is intentionally out of scope (maker↔broker
+  transport, not the public taker API).
+
+A TS client can be generated from the served spec, e.g.
+`openapi-typescript http://127.0.0.1:3000/api-docs/openapi.json`.
 
 ## Assumptions
 

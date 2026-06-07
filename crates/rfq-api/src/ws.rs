@@ -13,7 +13,7 @@ use futures::stream::SplitStream;
 use futures::{SinkExt, StreamExt};
 use rfq_router::ws_protocol::MakerFrame;
 use rfq_router::{MakerConnector, WsMakerConnector};
-use rfq_types::MakerId;
+use rfq_types::{AssetId, BitcoinNetwork, MakerId};
 use tokio::time::timeout;
 
 use crate::AppState;
@@ -25,8 +25,8 @@ pub(crate) async fn maker_stream(ws: WebSocketUpgrade, State(state): State<AppSt
 async fn handle_socket(socket: WebSocket, state: AppState) {
     let (sink, mut stream) = socket.split();
 
-    // The first frame must identify the maker.
-    let Some(maker_id) = read_register(&mut stream).await else {
+    // The first frame must identify the maker (and may advertise metadata).
+    let Some((maker_id, network, assets)) = read_register(&mut stream).await else {
         return;
     };
 
@@ -45,7 +45,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     let (connector, closed) = WsMakerConnector::spawn(maker_id.clone(), text_sink, text_stream);
     let connector: Arc<dyn MakerConnector> = connector;
-    state.registry.insert(connector.clone()).await;
+    state.registry.insert(connector.clone(), network, assets).await;
     println!("broker: maker registered: {}", maker_id.0);
 
     // Hold until the socket dies, then deregister (only if still this conn).
@@ -54,16 +54,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     println!("broker: maker disconnected: {}", maker_id.0);
 }
 
-/// Wait for the `Register` frame (≤5s per frame). Non-register text is ignored;
-/// a close/error/timeout ends the connection.
-async fn read_register(stream: &mut SplitStream<WebSocket>) -> Option<MakerId> {
+/// Wait for the `Register` frame (≤5s per frame), returning the maker id plus
+/// any advertised observability metadata. Non-register text is ignored; a
+/// close/error/timeout ends the connection.
+type Registration = (MakerId, Option<BitcoinNetwork>, Vec<AssetId>);
+
+async fn read_register(stream: &mut SplitStream<WebSocket>) -> Option<Registration> {
     loop {
         match timeout(Duration::from_secs(5), stream.next()).await {
             Ok(Some(Ok(Message::Text(t)))) => {
-                if let Ok(MakerFrame::Register { maker_id }) =
-                    serde_json::from_str::<MakerFrame>(&t)
+                if let Ok(MakerFrame::Register {
+                    maker_id,
+                    network,
+                    assets,
+                }) = serde_json::from_str::<MakerFrame>(&t)
                 {
-                    return Some(maker_id);
+                    return Some((maker_id, network, assets));
                 }
                 // non-register text before register: keep waiting
             }

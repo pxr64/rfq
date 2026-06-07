@@ -20,6 +20,8 @@ use rfq_types::{
     SettlementIntent, SwapLeg,
 };
 use serde::{Deserialize, Serialize};
+use utoipa::{OpenApi, ToSchema};
+use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 pub mod registry;
@@ -33,18 +35,18 @@ pub struct AppState {
     store: InMemoryQuoteStore,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AcceptQuoteBody {
     pub leg: SwapLeg,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SignQuoteBody {
     /// Base64 PSBT, taker-signed. See `docs/swap-flows.md`.
     pub signed_psbt: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ConsignmentBody {
     /// Base64 RGB consignment the taker built against the maker's
     /// `Quote.maker_rgb_invoice` (sell side). See `docs/swap-flows.md`.
@@ -116,9 +118,40 @@ fn mock_taker_funding() -> Vec<(Outpoint, rfq_btc::TxOut)> {
     )]
 }
 
+/// OpenAPI definition for the public broker API, generated from the
+/// `#[utoipa::path]` handlers and `ToSchema` types. Served as JSON at
+/// `/api-docs/openapi.json` and rendered by Swagger UI at `/swagger-ui`. The
+/// `/maker-stream` WebSocket is intentionally excluded (maker↔broker transport,
+/// not the public taker API).
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "Colorex RFQ Broker API",
+        description = "Public broker API for BTC ↔ RGB atomic swaps. Takers request \
+                       quotes, accept one, and drive settlement. Makers self-register \
+                       over the /maker-stream WebSocket (not documented here). See \
+                       docs/swap-flows.md for the full protocol.",
+    ),
+    paths(health, status, create_rfq, accept_quote, deliver_consignment, sign_quote),
+    components(schemas(
+        CreateRfqRequest,
+        Quote,
+        AcceptQuoteBody,
+        ConsignmentBody,
+        SignQuoteBody,
+        SettlementIntent,
+        StatusResponse,
+        ErrorResponse,
+    )),
+    tags((name = "broker", description = "Public RFQ broker endpoints"))
+)]
+pub struct ApiDoc;
+
 pub fn app_with_state(state: AppState) -> Router {
     Router::new()
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .route("/health", get(health))
+        .route("/status", get(status))
         .route("/rfq", post(create_rfq))
         .route("/quotes/:id/accept", post(accept_quote))
         .route("/quotes/:id/consignment", post(deliver_consignment))
@@ -145,12 +178,56 @@ pub fn app_with_registry(registry: Arc<MakerRegistry>) -> Router {
     })
 }
 
+/// Liveness probe. Returns `{ "status": "ok" }` whenever the broker is serving.
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "broker",
+    responses((status = 200, description = "Broker is up", body = HealthResponse))
+)]
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_owned(),
     })
 }
 
+/// Broker observability snapshot for the landing-page dashboard: makers online,
+/// asset-pair count, and networks served, plus per-maker uptime. Latency,
+/// quote-volume, and settlement-success stats are not tracked yet (see #30).
+#[derive(Debug, Serialize, ToSchema)]
+struct StatusResponse {
+    broker_version: String,
+    #[serde(flatten)]
+    inner: registry::BrokerStatus,
+}
+
+/// Aggregate broker stats: makers online, distinct asset pairs (each RGB
+/// contract paired against BTC), networks served, and per-maker uptime.
+#[utoipa::path(
+    get,
+    path = "/status",
+    tag = "broker",
+    responses((status = 200, description = "Current broker status", body = StatusResponse))
+)]
+async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
+    Json(StatusResponse {
+        broker_version: env!("CARGO_PKG_VERSION").to_owned(),
+        inner: state.registry.status().await,
+    })
+}
+
+/// Request quotes for a swap. Fans the request out to every connected maker and
+/// returns each quote that came back (one per willing maker; empty if none).
+#[utoipa::path(
+    post,
+    path = "/rfq",
+    tag = "broker",
+    request_body = CreateRfqRequest,
+    responses(
+        (status = 200, description = "Quotes from makers (possibly empty)", body = [Quote]),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+    )
+)]
 async fn create_rfq(
     State(state): State<AppState>,
     Json(body): Json<CreateRfqRequest>,
@@ -173,6 +250,21 @@ async fn create_rfq(
     Ok(Json(quotes))
 }
 
+/// Accept a quote and open settlement. The `leg` carries the side-specific
+/// payload (`buy` → maker builds the PSBT; `sell` → maker awaits the taker's
+/// consignment). Fails if the quote is unknown (404) or expired (400).
+#[utoipa::path(
+    post,
+    path = "/quotes/{id}/accept",
+    tag = "broker",
+    params(("id" = String, Path, description = "The quote_id from POST /rfq")),
+    request_body = AcceptQuoteBody,
+    responses(
+        (status = 200, description = "Settlement opened", body = SettlementIntent),
+        (status = 400, description = "Quote expired or invalid request", body = ErrorResponse),
+        (status = 404, description = "No quote with the given id", body = ErrorResponse),
+    )
+)]
 async fn accept_quote(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -208,6 +300,21 @@ async fn accept_quote(
     Ok(Json(intent))
 }
 
+/// Deliver the RGB consignment (sell side). The taker builds it against the
+/// maker's `maker_rgb_invoice`; the maker validates it, signs its PSBT inputs,
+/// and returns status `AwaitingTakerSignature` with a partial PSBT.
+#[utoipa::path(
+    post,
+    path = "/quotes/{id}/consignment",
+    tag = "broker",
+    params(("id" = String, Path, description = "The quote_id from POST /rfq")),
+    request_body = ConsignmentBody,
+    responses(
+        (status = 200, description = "Consignment accepted; partial PSBT returned", body = SettlementIntent),
+        (status = 400, description = "Consignment rejected or invalid", body = ErrorResponse),
+        (status = 404, description = "No quote with the given id", body = ErrorResponse),
+    )
+)]
 async fn deliver_consignment(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -237,6 +344,21 @@ async fn deliver_consignment(
     Ok(Json(intent))
 }
 
+/// Submit the taker-signed PSBT (final step on both sides). The maker finalizes,
+/// broadcasts the witness tx, and returns status `PendingBitcoinConfirm` with the
+/// `witness_txid` and the witness-extended `final_consignment`.
+#[utoipa::path(
+    post,
+    path = "/quotes/{id}/sign",
+    tag = "broker",
+    params(("id" = String, Path, description = "The quote_id from POST /rfq")),
+    request_body = SignQuoteBody,
+    responses(
+        (status = 200, description = "Witness tx broadcast; awaiting confirmation", body = SettlementIntent),
+        (status = 400, description = "Invalid PSBT or fee slippage exceeded", body = ErrorResponse),
+        (status = 404, description = "No quote with the given id", body = ErrorResponse),
+    )
+)]
 async fn sign_quote(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -319,7 +441,7 @@ impl From<rfq_router::RouterError> for ApiError {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 struct ErrorResponse {
     error: String,
 }
@@ -425,6 +547,63 @@ mod tests {
             side: Side::Sell,
             amount: 100,
         }
+    }
+
+    async fn get(app: &Router, uri: &str) -> (StatusCode, Vec<u8>) {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, bytes.to_vec())
+    }
+
+    #[test]
+    fn openapi_doc_covers_all_routes_and_schemas() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for path in [
+            "/health",
+            "/status",
+            "/rfq",
+            "/quotes/{id}/accept",
+            "/quotes/{id}/consignment",
+            "/quotes/{id}/sign",
+        ] {
+            assert!(doc["paths"].get(path).is_some(), "missing path {path}");
+        }
+        // Transitively-referenced schemas must be collected, not just the
+        // top-level ones listed in `components(schemas(...))`.
+        for schema in [
+            "CreateRfqRequest",
+            "Quote",
+            "SwapLeg",
+            "SettlementIntent",
+            "SettlementStatus",
+            "StatusResponse",
+            "AssetId",
+            "ErrorResponse",
+        ] {
+            assert!(
+                doc["components"]["schemas"].get(schema).is_some(),
+                "missing schema {schema}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_seeded_maker() {
+        // The mock `app()` seeds one maker holding one RGB asset.
+        let (status_code, body) = get(&app(), "/status").await;
+        assert_eq!(status_code, StatusCode::OK);
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["makers_online"], 1);
+        assert_eq!(status["broker_version"], env!("CARGO_PKG_VERSION"));
+        // Pre-seeded makers carry no advertised metadata.
+        assert_eq!(status["asset_pairs"], 0);
+        assert_eq!(status["makers"].as_array().unwrap().len(), 1);
+        assert_eq!(status["makers"][0]["maker_id"], "mock-maker-1");
     }
 
     #[tokio::test]

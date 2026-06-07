@@ -10,7 +10,7 @@ use futures::{SinkExt, StreamExt};
 use rfq_maker::Maker;
 use rfq_router::ws_protocol::{MakerFrame, WsOp, WsRequest, WsResult};
 use rfq_router::{MakerConnector, RouterError};
-use rfq_types::{MakerId, SettlementIntent};
+use rfq_types::{AssetId, MakerId, SettlementIntent};
 use tokio_tungstenite::tungstenite::Message;
 
 /// Derive the broker's `/maker-stream` WebSocket URL from its HTTP `broker_url`
@@ -50,8 +50,14 @@ async fn connect_and_serve(
     let (ws, _resp) = tokio_tungstenite::connect_async(ws_url).await?;
     let (mut write, mut read) = ws.split();
 
+    // Advertise the RGB contracts this maker serves (each paired against BTC)
+    // and their network, so the broker can surface them via `GET /status`.
+    let assets = served_assets(maker).await;
+    let network = assets.first().map(|a| a.network.clone());
     let register = serde_json::to_string(&MakerFrame::Register {
         maker_id: maker_id.clone(),
+        network,
+        assets,
     })?;
     write.send(Message::Text(register)).await?;
     println!("registered with broker as {}", maker_id.0);
@@ -73,6 +79,18 @@ async fn connect_and_serve(
             .await?;
     }
     Ok(())
+}
+
+/// The distinct RGB contracts this maker currently holds inventory for, in
+/// first-seen order. Each is one quotable asset (paired against BTC).
+async fn served_assets(maker: &Maker) -> Vec<AssetId> {
+    let mut assets = Vec::new();
+    for utxo in maker.utxo_snapshot().await {
+        if !assets.contains(&utxo.asset_id) {
+            assets.push(utxo.asset_id);
+        }
+    }
+    assets
 }
 
 /// Run one pushed request against the local maker. Mirrors the `maker_app` HTTP
