@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-.PHONY: regtest-up regtest-down regtest-reset regtest-mine rgb-tools-install rgb-schemas-fetch rgb-wallets-init rgb-create-wallets rgb-fund-wallets rgb-issue-asset rgb-transfer-maker rgb-transfer-taker regtest-bootstrap check
+.PHONY: regtest-up regtest-down regtest-reset regtest-mine rgb-tools-install rgb-schemas-fetch rgb-wallets-init rgb-create-wallets rgb-fund-wallets rgb-issue-asset rgb-transfer-maker rgb-transfer-taker regtest-bootstrap gen-wallet-fixtures check
 
 regtest-up:
 	./scripts/regtest-up
@@ -37,6 +37,11 @@ rgb-transfer-maker:
 
 rgb-transfer-taker:
 	./scripts/rgb-transfer-taker
+
+## Generate the two consignment fixtures for the rgb-wasm multi-asset test
+## (native colorex CLI; needs the stack up + matured). See the script header.
+gen-wallet-fixtures:
+	./scripts/gen-wallet-fixtures
 
 ## Full clean → ready-to-test bootstrap. Runs every step in order; each
 ## script is idempotent so re-running picks up where a previous attempt

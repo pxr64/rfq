@@ -313,6 +313,34 @@ pub async fn create_inventory_invoice(
     Ok(backend.create_invoice(&asset, amount).await?)
 }
 
+/// Re-derive a consignment the maker already produced, for recovery. `contract`
+/// defaults to the config's `[rgb] contract_id` when omitted. Reads the stash only
+/// — no chain access, no signing. See [`LibRgbBackend::reconsign`].
+pub fn reconsign_consignment(
+    config: &MakerNodeConfig,
+    contract: Option<String>,
+    outpoint: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let rgb = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: a wallet is required to reconsign")?;
+    let contract_id = match contract {
+        Some(c) if !c.is_empty() => c,
+        _ if !rgb.contract_id.is_empty() => rgb.contract_id.clone(),
+        _ => return Err("no --contract given and no [rgb] contract_id in maker.toml".into()),
+    };
+    let backend = LibRgbBackend::new(
+        rgb.data_dir.clone(),
+        rgb.wallet_name.clone(),
+        rgb.network.clone(),
+        rgb.electrum_url.clone(),
+        rgb.signer.account_file.clone(),
+        rgb.signer.password.clone(),
+    );
+    Ok(backend.reconsign(&contract_id, outpoint)?)
+}
+
 pub async fn build_runtime(
     config: &MakerNodeConfig,
 ) -> Result<MakerNodeRuntime, Box<dyn std::error::Error>> {

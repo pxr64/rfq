@@ -6,6 +6,7 @@
 infra/regtest/artifacts/
 infra/regtest/contracts/generated/
 infra/regtest/data/
+infra/regtest/fixture-wallets/
 infra/regtest/tools/
 infra/regtest/wallets/
 taker-consignment-*.b64

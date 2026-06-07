@@ -3,9 +3,11 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand};
 use maker_node::{
     broker_client, build_maker, build_runtime, create_inventory_invoice, init, maker_app, orders,
-    output, spawn_chain_observer_loop, spawn_cleanup_loop, spawn_rebalance_loop, MakerNodeConfig,
+    output, reconsign_consignment, spawn_chain_observer_loop, spawn_cleanup_loop,
+    spawn_rebalance_loop, MakerNodeConfig,
 };
 use colorex_wallet::{resolve_named, resolve_wallet, WalletConfig, WalletInput};
+use rfq_rgb::RgbBackend;
 use rfq_client::{RfqClient, Url};
 use rfq_types::{InventorySnapshot, MakerId};
 use tokio::{net::TcpListener, sync::oneshot};
@@ -138,6 +140,18 @@ enum WalletCmd {
         #[arg(long)]
         electrum: Option<String>,
     },
+    /// Mint a witness-vout RGB receive invoice for a contract. No funded UTXO
+    /// needed — the RGB lands on a fresh output of the sender's transfer tx.
+    Invoice {
+        #[command(flatten)]
+        common: WalletCommon,
+        /// RGB contract id to receive.
+        #[arg(long)]
+        contract: String,
+        /// Amount (smallest RGB units) the invoice requests.
+        #[arg(long)]
+        amount: u64,
+    },
 }
 
 #[derive(Debug, Args, Clone, PartialEq, Eq)]
@@ -188,6 +202,21 @@ enum MakerCmd {
     Order {
         #[command(subcommand)]
         cmd: OrderCmd,
+    },
+    /// Re-derive a consignment for an already-settled transfer (recovery). Reads
+    /// the maker's stash only — no chain access, no signing. Use when a recipient
+    /// lost their consignment (failed delivery / wallet reset).
+    Reconsign {
+        /// RGB contract id. Defaults to the config's `[rgb] contract_id`.
+        #[arg(long)]
+        contract: Option<String>,
+        /// The recipient's witness outpoint `txid:vout` (the swap output holding
+        /// their RGB; the txid is the witness tx). Witness-vout seals only.
+        #[arg(long)]
+        outpoint: String,
+        /// Write the base64 consignment here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -246,6 +275,11 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 OrderCmd::List => order_list(&config_path),
                 OrderCmd::Cancel { id } => order_cancel(&config_path, &id),
             },
+            MakerCmd::Reconsign {
+                contract,
+                outpoint,
+                out,
+            } => maker_reconsign(load_config(&config_path)?, contract, outpoint, out),
         },
         TopCommand::Wallet { cmd } => match cmd {
             WalletCmd::Create {
@@ -256,6 +290,11 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             WalletCmd::Address { common, btc } => wallet_address(common, btc),
             WalletCmd::Sync { common, electrum } => wallet_sync(common, electrum).await,
             WalletCmd::Balance { common, electrum } => wallet_balance(common, electrum).await,
+            WalletCmd::Invoice {
+                common,
+                contract,
+                amount,
+            } => wallet_invoice(common, contract, amount).await,
         },
         TopCommand::Issuer { cmd } => match cmd {
             IssuerCmd::Issue {
@@ -318,6 +357,22 @@ fn wallet_address(common: WalletCommon, btc: bool) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+async fn wallet_invoice(
+    common: WalletCommon,
+    contract: String,
+    amount: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let resolved = resolve_named(common.into_input())?;
+    let asset = rfq_types::AssetId {
+        network: resolved.network.parse()?,
+        kind: rfq_types::AssetKind::Rgb20,
+        id: contract,
+    };
+    let invoice = resolved.backend().create_invoice(&asset, amount).await?;
+    println!("{invoice}");
+    Ok(())
+}
+
 async fn wallet_sync(
     common: WalletCommon,
     electrum: Option<String>,
@@ -352,6 +407,23 @@ async fn maker_invoice(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let invoice = create_inventory_invoice(&config, amount).await?;
     println!("{invoice}");
+    Ok(())
+}
+
+fn maker_reconsign(
+    config: MakerNodeConfig,
+    contract: Option<String>,
+    outpoint: String,
+    out: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let consignment = reconsign_consignment(&config, contract, &outpoint)?;
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &consignment)?;
+            eprintln!("wrote consignment to {}", path.display());
+        }
+        None => println!("{consignment}"),
+    }
     Ok(())
 }
 

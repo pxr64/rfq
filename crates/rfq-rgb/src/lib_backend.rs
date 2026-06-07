@@ -600,6 +600,39 @@ impl LibRgbBackend {
         ))
     }
 
+    /// Re-derive the consignment for an already-settled transfer — the recovery
+    /// fallback when a recipient lost theirs (failed delivery, wallet reset, missed
+    /// import). Unlike [`Self::distribute`], this builds NOTHING new and touches no
+    /// chain: the transition + witness already live in the stash (the original
+    /// swap's `commit_and_consign` consumed the fascia), so `stock.transfer` simply
+    /// re-extracts the witness-extended consignment addressed to `outpoint`'s seal.
+    /// Read-only — no signing, no broadcast, no persistence.
+    ///
+    /// Witness-vout (explicit `txid:vout`) seals only — what swaps use; the witness
+    /// id is the outpoint's txid. Blinded/secret seals can't be re-derived (their
+    /// outpoint is hidden), so those aren't recoverable this way. Returns the base64
+    /// consignment for the recipient to re-import.
+    pub fn reconsign(&self, contract: &str, outpoint: &str) -> Result<String, RgbError> {
+        let contract_id = ContractId::from_str(contract)
+            .map_err(|e| RgbError::TransferBuild(format!("bad contract id {contract}: {e}")))?;
+        let output_seal = OutputSeal::from_str(outpoint)
+            .map_err(|e| RgbError::TransferBuild(format!("bad outpoint {outpoint}: {e}")))?;
+        // Witness-vout delivery: the seal's txid IS the witness tx the consignment
+        // anchors to (same identity `commit_and_consign` relies on).
+        let witness_id = output_seal.txid;
+
+        let stock = self.load_stock()?;
+        let transfer = stock
+            .transfer(contract_id, [output_seal], [], [], Some(witness_id))
+            .map_err(|e| RgbError::TransferBuild(format!("reconsign transfer: {e}")))?;
+
+        let mut bytes = Vec::new();
+        transfer
+            .save(&mut bytes)
+            .map_err(|e| RgbError::TransferBuild(format!("serialize consignment: {e}")))?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
     /// Wallet-derived BTC inventory: every spendable wallet UTXO that is
     /// **not** carrying an RGB allocation for `asset`. Replaces the hardcoded
     /// `mock_btc_inventory()` in `maker-node/src/main.rs`. Each returned

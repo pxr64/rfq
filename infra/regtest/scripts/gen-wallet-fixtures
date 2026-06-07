@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# Generate the two consignment fixtures the rgb-wasm multi-asset test needs:
+# two REAL transfers for two DISTINCT contracts, each anchored to a real regtest
+# witness tx. Writes base64 blobs to
+#   colorex-wallet/rgb-wasm/tests/fixtures/asset_{a,b}.consignment
+# plus a `network` marker, then the test
+# `cargo test -p rgb-wasm --test multi_asset_witness` runs the full assertions.
+#
+# Uses the native `colorex` CLI end to end (no rgb-cmd). The regtest stack must be
+# UP and past the coinbase-maturity window first:
+#
+#   make -C infra/regtest regtest-up
+#   make -C infra/regtest regtest-mine BLOCKS=103
+#   infra/regtest/scripts/gen-wallet-fixtures
+#
+# Idempotent-ish: wallets are kept across runs; each run mints fresh contracts +
+# consignments and overwrites the fixtures.
+set -euo pipefail
+
+source "$(dirname "$0")/common.sh"
+require_docker_services
+ensure_dirs
+
+REPO_ROOT="$(cd "$ROOT_DIR/../.." && pwd)"
+FIXTURES_DIR="${FIXTURES_DIR:-$REPO_ROOT/../colorex-wallet/rgb-wasm/tests/fixtures}"
+WORK="${WORK:-$ROOT_DIR/fixture-wallets}"   # scratch wallet/stock data (git-ignored tree)
+NET=regtest
+ELEC="$ELECTRUM_URL"
+PW="${FIXTURE_PASSWORD:-fixturepw}"
+FEE="${FIXTURE_FEE:-1000}"
+
+# Run the colorex binary; cargo's own logs go to stderr (-q), so command stdout we
+# capture stays clean.
+cx() { (cd "$REPO_ROOT" && cargo run -q -p maker-node -- "$@"); }
+
+mine() {
+  bcli -rpcwallet="$BITCOIN_WALLET" generatetoaddress "${1:-1}" \
+    "$(bcli -rpcwallet="$BITCOIN_WALLET" getnewaddress "" bech32)" >/dev/null
+}
+
+echo "==> building colorex (first run compiles the workspace)…" >&2
+(cd "$REPO_ROOT" && cargo build -q -p maker-node)
+
+# --- wallets ---------------------------------------------------------------------
+echo "==> creating issuer + taker wallets under ${WORK}" >&2
+cx wallet create --name fx-issuer --network "$NET" --data-dir "$WORK/issuer" \
+  --account-file "$WORK/issuer/account.key" --password "$PW" >&2
+cx wallet create --name fx-taker  --network "$NET" --data-dir "$WORK/taker" \
+  --account-file "$WORK/taker/account.key" --password "$PW" >&2
+
+issuer_common=(--name fx-issuer --network "$NET" --data-dir "$WORK/issuer")
+taker_common=(--name fx-taker  --network "$NET" --data-dir "$WORK/taker")
+
+# --- fund the issuer (keychain-10 = RGB anchors/genesis seal; keychain-0 = BTC fee) ---
+addr10="$(cx wallet address "${issuer_common[@]}")"
+addr0="$(cx wallet address "${issuer_common[@]}" --btc)"
+echo "==> funding issuer  tapret(10)=$addr10  btc(0)=$addr0" >&2
+for _ in 1 2 3; do
+  bcli -rpcwallet="$BITCOIN_WALLET" sendtoaddress "$addr10" 1 >/dev/null
+done
+bcli -rpcwallet="$BITCOIN_WALLET" sendtoaddress "$addr0" 1 >/dev/null
+mine 1
+cx wallet sync "${issuer_common[@]}" --electrum "$ELEC" >&2
+
+# --- issue two distinct contracts ------------------------------------------------
+# Bind each contract to its OWN keychain-10 UTXO. pick_genesis_seal always grabs
+# the first one, so without explicit --seal both contracts land on a single
+# outpoint and their transfers would double-spend it.
+mapfile -t SEALS < <(cx wallet balance "${issuer_common[@]}" --electrum "$ELEC" | awk '/keychain 10/ {print $1}')
+[[ "${#SEALS[@]}" -ge 2 ]] || { echo "ERROR: need >=2 keychain-10 UTXOs, got ${#SEALS[@]}" >&2; exit 1; }
+issue() { # ticker name seal -> contract id
+  cx issuer issue "${issuer_common[@]}" --ticker "$1" --asset-name "$2" \
+    --precision 0 --supply 1000000 --seal "$3" | awk '/^issued contract:/ {print $3}'
+}
+echo "==> issuing AAA (seal ${SEALS[0]}) + BBB (seal ${SEALS[1]})…" >&2
+CID_A="$(issue AAA AssetA "${SEALS[0]}")"
+CID_B="$(issue BBB AssetB "${SEALS[1]}")"
+echo "    A=$CID_A" >&2
+echo "    B=$CID_B" >&2
+[[ -n "$CID_A" && -n "$CID_B" && "$CID_A" != "$CID_B" ]] || {
+  echo "ERROR: failed to issue two distinct contracts" >&2; exit 1; }
+
+# --- taker mints a witness-vout invoice per contract (no funding needed) ----------
+echo "==> minting taker invoices…" >&2
+INV_A="$(cx wallet invoice "${taker_common[@]}" --contract "$CID_A" --amount 1000)"
+INV_B="$(cx wallet invoice "${taker_common[@]}" --contract "$CID_B" --amount 1000)"
+
+# --- issuer transfers each contract → the consignment is the last stdout line -----
+transfer() { # invoice -> base64 consignment
+  cx issuer transfer "${issuer_common[@]}" --invoice "$1" --electrum "$ELEC" \
+    --account-file "$WORK/issuer/account.key" --password "$PW" --fee "$FEE" | tail -n1
+}
+echo "==> transferring A, then B (confirm + re-sync between so B picks fresh inputs)…" >&2
+CONS_A="$(transfer "$INV_A")"
+mine 1
+cx wallet sync "${issuer_common[@]}" --electrum "$ELEC" >&2
+CONS_B="$(transfer "$INV_B")"
+mine 1   # confirm B's witness (the test also handles tentative)
+
+# --- write fixtures --------------------------------------------------------------
+mkdir -p "$FIXTURES_DIR"
+printf '%s' "$CONS_A" > "$FIXTURES_DIR/asset_a.consignment"
+printf '%s' "$CONS_B" > "$FIXTURES_DIR/asset_b.consignment"
+printf 'regtest'      > "$FIXTURES_DIR/network"
+
+echo >&2
+echo "==> wrote fixtures to $FIXTURES_DIR" >&2
+echo "    asset_a.consignment ($(wc -c < "$FIXTURES_DIR/asset_a.consignment") bytes, contract $CID_A)" >&2
+echo "    asset_b.consignment ($(wc -c < "$FIXTURES_DIR/asset_b.consignment") bytes, contract $CID_B)" >&2
+echo "    network = regtest" >&2
+echo >&2
+echo "now run: cargo test -p rgb-wasm --test multi_asset_witness" >&2
