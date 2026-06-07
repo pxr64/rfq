@@ -2358,6 +2358,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+ "tower-http",
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",

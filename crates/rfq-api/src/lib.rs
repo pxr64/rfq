@@ -159,6 +159,9 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/quotes/:id/consignment", post(deliver_consignment))
         .route("/quotes/:id/sign", post(sign_quote))
         .route("/maker-stream", get(ws::maker_stream))
+        // Browser dapps call the broker cross-origin; allow it. Permissive is
+        // fine for a public, no-auth read/quote API — tighten if auth is added.
+        .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }
 
