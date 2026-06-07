@@ -8,7 +8,18 @@ The MVP should work on Bitcoin regtest with a full RGB node and issued RGB20 ass
 
 ## Roadmap
 
-- [ ] **TOP PRIORITY — Switch the swap close method from opret to tapret.** Today
+- [ ] **TOP PRIORITY — Issue #32: Inventory-reservation griefing.** A taker can lock
+  a maker's inventory without ever settling. Today the maker reserves RGB at
+  `request_quote` (`QUOTE_TTL_MS = 30s`) and `accept` extends to
+  `TAKER_SIGNATURE_TTL_MS = 10min`, so (a) quote-spam reserves inventory for free and
+  (b) accept-and-abandon denies service for 10 min (hit live: an aborted buy left the
+  only COLX UTXO `Reserved`, nothing broadcast). Fix order: **(1) don't reserve on
+  quote** (price from the order book; just check it could fill); **(2) reserve only
+  after the funds/build check** in `accept`; **(3) short accept→sign TTL (~60–120s) +
+  `POST /quotes/{id}/cancel`** the dapp calls on user-cancel/sign-failure; **(4)
+  per-origin reservation caps + RFQ rate-limit**; (5, later) fidelity bond. See the
+  issue for acceptance criteria.
+- [x] **Switch the swap close method from opret to tapret.** (Shipped.) Today
   the swap composition is hard-wired to `CloseMethod::OpretFirst` (an `OP_RETURN`
   output carries the RGB commitment), which flags every swap as an RGB tx on-chain.
   Tapret tweaks the commitment into a Taproot output instead, so a swap is
