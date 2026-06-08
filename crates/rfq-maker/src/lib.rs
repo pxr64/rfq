@@ -18,6 +18,7 @@ use rfq_types::{
     MakerId, OrderPrice, Outpoint, Quote, QuoteId, QuoteRequest, RgbInventoryUtxo, ReservationId,
     SettlementIntent, SettlementStatus, Side, SwapLeg,
 };
+use arc_swap::ArcSwap;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -225,8 +226,10 @@ pub struct Maker {
     bitcoin_client: Arc<dyn BitcoinClient>,
     pending: Arc<RwLock<HashMap<QuoteId, PendingSettlement>>>,
     /// Standing-order prices. Empty unless seeded via [`Maker::with_price_policy`],
-    /// in which case quotes use the configured per-asset price.
-    price_policy: PricePolicy,
+    /// in which case quotes use the configured per-asset price. Held in an
+    /// `ArcSwap` so the daemon can hot-reload the order book without a restart
+    /// (see [`Maker::reload_price_policy`]); reads are lock-free.
+    price_policy: Arc<ArcSwap<PricePolicy>>,
 }
 
 impl Maker {
@@ -282,7 +285,7 @@ impl Maker {
             rgb_backend,
             bitcoin_client,
             pending: Arc::new(RwLock::new(HashMap::new())),
-            price_policy: PricePolicy::default(),
+            price_policy: Arc::new(ArcSwap::from_pointee(PricePolicy::default())),
         }
     }
 
@@ -290,8 +293,15 @@ impl Maker {
     /// Without it the maker quotes the flat [`DEFAULT_UNIT_PRICE_SATS`] for
     /// every asset.
     pub fn with_price_policy(mut self, policy: PricePolicy) -> Self {
-        self.price_policy = policy;
+        self.price_policy = Arc::new(ArcSwap::from_pointee(policy));
         self
+    }
+
+    /// Hot-swap the standing-order prices (the daemon's order-reload loop calls
+    /// this when the order book file changes). Lock-free; affects subsequent
+    /// quotes immediately, across all cloned `Maker` handles (shared `ArcSwap`).
+    pub fn reload_price_policy(&self, policy: PricePolicy) {
+        self.price_policy.store(Arc::new(policy));
     }
 
     /// Seed the maker's plain-BTC inventory — the pool it pays sell-side takers
@@ -351,6 +361,7 @@ impl Maker {
     /// consistent with actual quotes.
     pub fn order_prices(&self) -> Vec<OrderPrice> {
         self.price_policy
+            .load()
             .entries()
             .iter()
             .map(|e| OrderPrice {
@@ -622,6 +633,7 @@ impl Maker {
         let gross_btc_sats =
             match self
                 .price_policy
+                .load()
                 .unit_price(&request.base_asset, &request.side, amount)
             {
                 PriceLookup::Price(p) => p.saturating_mul(amount),
@@ -636,8 +648,18 @@ impl Maker {
         let required = gross_btc_sats.saturating_add(rfq_rgb::SEAL_ANCHOR_SATS);
         let selection = match GreedyLargestFirstSelector.select(required, &available) {
             Ok(s) => s,
-            // Not enough BTC on hand — decline the quote rather than error.
-            Err(_) => return Ok(None),
+            // Not enough BTC on hand — decline the quote rather than error, but log
+            // why (else a sell silently returns no quote and looks broken). The
+            // maker pays sell-side takers from its own keychain-0 BTC inventory.
+            Err(_) => {
+                let have: u64 = available.iter().map(|u| u.value_sats).sum();
+                eprintln!(
+                    "declining sell quote: BTC inventory {have} sats < needed {required} \
+                     (gross {gross_btc_sats} + anchor {}) — fund the maker's keychain-0 wallet",
+                    rfq_rgb::SEAL_ANCHOR_SATS,
+                );
+                return Ok(None);
+            }
         };
         let reservation_id = match self
             .btc_store
@@ -1089,6 +1111,7 @@ impl MakerConnector for Maker {
         let buy_unit_price =
             match self
                 .price_policy
+                .load()
                 .unit_price(&request.base_asset, &request.side, request.amount)
             {
                 PriceLookup::Price(p) => p,
@@ -1248,22 +1271,31 @@ impl MakerConnector for Maker {
             .saturating_add(actual_fee)
             .saturating_add(rfq_rgb::SEAL_ANCHOR_SATS);
         let taker_btc_inputs = match self.bitcoin_client.list_unspent(&btc_funding_addr).await {
-            Ok(utxos) => match select_btc_inputs(&utxos, required_funding) {
-                Some(selected) => selected,
-                None => {
-                    let _ = self.store.release_reservation(&reservation_id, now_ms()).await;
-                    return Err(RouterError::Maker(format!(
-                        "taker funding address {btc_funding_addr} has insufficient BTC for \
-                         price {} + fee {actual_fee} + anchor {}",
-                        quote.price, rfq_rgb::SEAL_ANCHOR_SATS,
-                    )));
+            Ok(utxos) => {
+                let available: u64 = utxos.iter().map(|(_, t)| t.value_sats).sum();
+                match select_btc_inputs(&utxos, required_funding) {
+                    Some(selected) => selected,
+                    None => {
+                        let _ = self.store.release_reservation(&reservation_id, now_ms()).await;
+                        // Surface the ACTUAL balance (0 when the keychain-0 address is
+                        // unfunded) vs. what's needed — and log it maker-side so it's
+                        // visible in `maker up`.
+                        let msg = format!(
+                            "buy declined: taker funding address {btc_funding_addr} has {available} sats, \
+                             needs {required_funding} (price {} + fee {actual_fee} + anchor {}) — \
+                             fund this keychain-0 address",
+                            quote.price, rfq_rgb::SEAL_ANCHOR_SATS,
+                        );
+                        eprintln!("{msg}");
+                        return Err(RouterError::Maker(msg));
+                    }
                 }
-            },
+            }
             Err(e) => {
                 let _ = self.store.release_reservation(&reservation_id, now_ms()).await;
-                return Err(RouterError::Maker(format!(
-                    "list_unspent({btc_funding_addr}) failed: {e}"
-                )));
+                let msg = format!("list_unspent({btc_funding_addr}) failed: {e}");
+                eprintln!("buy accept error: {msg}");
+                return Err(RouterError::Maker(msg));
             }
         };
 
@@ -2540,8 +2572,8 @@ mod tests {
             .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("insufficient") && msg.contains("anchor"),
-            "expected an insufficient-funding error mentioning the anchor, got: {msg}"
+            msg.contains("needs") && msg.contains("anchor"),
+            "expected a funding-shortfall error mentioning the anchor, got: {msg}"
         );
     }
 

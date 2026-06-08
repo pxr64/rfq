@@ -86,6 +86,22 @@ pub fn up_arrow(label: &str) {
     println!("{}{label}", paint(arrow(unicode_disabled()), CYAN));
 }
 
+/// A `› key  value` banner line — dimmed key, highlighted value. For labeled
+/// data such as funding addresses.
+pub fn kv(key: &str, value: &str) {
+    println!(
+        "{}{}  {}",
+        paint(chevron(unicode_disabled()), CYAN),
+        paint(key, DIM),
+        paint(value, GREEN)
+    );
+}
+
+/// A dimmed standalone note line (secondary guidance under a banner).
+pub fn note(text: &str) {
+    println!("{}", paint(text, DIM));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

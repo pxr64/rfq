@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use maker_node::{
     broker_client, build_maker, build_runtime, create_inventory_invoice, init, maker_app, orders,
     fetch_consignment, output, reconsign_consignment, spawn_chain_observer_loop,
-    spawn_cleanup_loop, spawn_rebalance_loop, MakerNodeConfig,
+    spawn_cleanup_loop, spawn_order_reload_loop, spawn_rebalance_loop, MakerNodeConfig,
 };
 use colorex_wallet::{resolve_named, resolve_wallet, WalletConfig, WalletInput};
 use rfq_rgb::RgbBackend;
@@ -192,6 +192,15 @@ enum MakerCmd {
     Health,
     /// Print the maker's RGB inventory snapshot.
     Inventory,
+    /// Print the two wallet addresses to fund: the keychain-0 BTC address (pays
+    /// sell-side takers + tx fees) and the keychain-10 RGB-anchor address (for
+    /// minting/receiving RGB seal anchors).
+    Addresses {
+        /// Electrum URL to fetch per-keychain balances (syncs the wallet). Omit
+        /// for addresses only. Tip: your config's `[rgb] electrum_url`.
+        #[arg(long)]
+        electrum: Option<String>,
+    },
     /// Mint an RGB invoice to receive inventory from an issuer.
     Invoice {
         /// Amount (in smallest RGB units) the invoice requests.
@@ -275,6 +284,9 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             MakerCmd::Up => run(load_config(&config_path)?, &config_path).await,
             MakerCmd::Health => health(load_config(&config_path)?).await,
             MakerCmd::Inventory => inventory(load_config(&config_path)?).await,
+            MakerCmd::Addresses { electrum } => {
+                maker_addresses(load_config(&config_path)?, electrum).await
+            }
             MakerCmd::Invoice { amount } => maker_invoice(load_config(&config_path)?, amount).await,
             MakerCmd::Order { cmd } => match cmd {
                 OrderCmd::Create {
@@ -421,6 +433,95 @@ async fn maker_invoice(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let invoice = create_inventory_invoice(&config, amount).await?;
     println!("{invoice}");
+    Ok(())
+}
+
+/// The two wallet addresses an operator funds: keychain-0 (BTC payment + fees) and
+/// keychain-10 (tapret RGB seal anchors). Derivation is xpub-only — no electrum or
+/// signer needed. `Err` if there's no `[rgb]` config.
+fn maker_funding_addresses(
+    config: &MakerNodeConfig,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let rgb = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: a wallet is required to derive addresses")?;
+    let backend = rfq_rgb::LibRgbBackend::new(
+        rgb.data_dir.clone(),
+        rgb.wallet_name.clone(),
+        rgb.network.clone(),
+        String::new(),
+        std::path::PathBuf::new(),
+        String::new(),
+    );
+    Ok((backend.funding_address(false)?, backend.funding_address(true)?))
+}
+
+/// Per-keychain BTC totals (k0, k10) — syncs the wallet against `electrum`.
+async fn maker_keychain_balances(
+    config: &MakerNodeConfig,
+    electrum: &str,
+) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+    let rgb = config.rgb.as_ref().ok_or("no [rgb] config")?;
+    let backend = rfq_rgb::LibRgbBackend::new(
+        rgb.data_dir.clone(),
+        rgb.wallet_name.clone(),
+        rgb.network.clone(),
+        electrum.to_owned(),
+        std::path::PathBuf::new(),
+        String::new(),
+    );
+    let (mut k0, mut k10) = (0u64, 0u64);
+    for u in backend.wallet_balance().await? {
+        match u.keychain {
+            0 => k0 += u.sats,
+            10 => k10 += u.sats,
+            _ => {}
+        }
+    }
+    Ok((k0, k10))
+}
+
+async fn maker_addresses(
+    config: MakerNodeConfig,
+    electrum: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (btc, anchor) = maker_funding_addresses(&config)?;
+    let network = config.rgb.as_ref().map(|r| r.network.as_str()).unwrap_or("");
+    let wallet = config.rgb.as_ref().map(|r| r.wallet_name.as_str()).unwrap_or("maker");
+
+    // Balance readout: use --electrum if given, else fall back to the config's
+    // `[rgb] electrum_url`. Syncs the wallet; on failure, degrade to addresses-only.
+    let electrum_url = electrum
+        .filter(|s| !s.is_empty())
+        .or_else(|| config.rgb.as_ref().map(|r| r.electrum_url.clone()).filter(|s| !s.is_empty()));
+    let balances = match &electrum_url {
+        Some(url) => match maker_keychain_balances(&config, url).await {
+            Ok(b) => Some(b),
+            Err(e) => {
+                output::step_warn(&format!("balance sync failed: {e}"));
+                None
+            }
+        },
+        None => None,
+    };
+    // The shown address is the next-unused one (where to SEND); the sats are the
+    // keychain TOTAL across all its UTXOs — so put the balance on the label, not
+    // beside the address (which would imply that single address holds it).
+    let label = |name: &str, keychain: u32, sats: Option<u64>| match sats {
+        Some(s) => format!("{name} · keychain {keychain} · {s} sats"),
+        None => format!("{name} · keychain {keychain}"),
+    };
+
+    println!("colorex maker addresses ({network})");
+    output::kv(&label("BTC payment", 0, balances.map(|(b0, _)| b0)), &btc);
+    output::kv(&label("RGB anchor", 10, balances.map(|(_, b10)| b10)), &anchor);
+    output::note("");
+    output::note("Fund BTC to pay sell-side takers + tx fees; fund RGB-anchor to mint/receive RGB.");
+    if electrum_url.is_none() {
+        output::note("Pass --electrum <url> (or set [rgb] electrum_url) to show balances.");
+    }
+    output::note(&format!("Re-sync after funding: colorex wallet sync --name {wallet} --network {network}"));
     Ok(())
 }
 
@@ -620,6 +721,11 @@ async fn run(
         "standing orders {order_count} ({})",
         order_path.display()
     ));
+    // Funding addresses, so the operator can top up without a separate command.
+    if let Ok((btc, anchor)) = maker_funding_addresses(&config) {
+        output::kv("fund BTC  · keychain 0 ", &btc);
+        output::kv("fund RGB  · keychain 10", &anchor);
+    }
     output::step("chain observer");
     if chain_observer_deps.is_some() {
         output::step_ok_with(&format!("every {:?}", config.intervals.chain_observer));
@@ -631,6 +737,10 @@ async fn run(
     output::step("broker stream");
     output::step_ok_with(&broker_ws);
 
+    // Hot-reload standing orders so `order create`/`cancel` take effect without a
+    // maker restart.
+    let order_reload_task =
+        spawn_order_reload_loop(maker.clone(), order_path.clone(), std::time::Duration::from_secs(5));
     let cleanup_task = spawn_cleanup_loop(maker.clone(), config.intervals.cleanup);
     let rebalance_task = spawn_rebalance_loop(
         maker.clone(),
@@ -662,6 +772,7 @@ async fn run(
     println!("colorex maker shutting down");
 
     let _ = shutdown_tx.send(());
+    order_reload_task.abort();
     cleanup_task.abort();
     rebalance_task.abort();
     broker_task.abort();
@@ -670,6 +781,7 @@ async fn run(
     }
     let _ = server_task.await;
     let _ = broker_task.await;
+    let _ = order_reload_task.await;
     let _ = cleanup_task.await;
     let _ = rebalance_task.await;
     if let Some(t) = chain_observer_task {

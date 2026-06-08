@@ -679,6 +679,36 @@ impl From<rfq_router::RouterError> for MakerNodeHttpError {
     }
 }
 
+/// Hot-reload the standing-order book into the maker without a restart. The
+/// `order create`/`cancel` CLI writes the order-book file (a separate process);
+/// this loop re-reads it on `interval` and swaps the maker's price policy, so new
+/// orders are quoted within one tick. (The broker's advertised `/prices` snapshot,
+/// sent at WS registration, still lags until reconnect — a later #30 enhancement.)
+pub fn spawn_order_reload_loop(
+    maker: Maker,
+    order_path: std::path::PathBuf,
+    reload_interval: Duration,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = time::interval(reload_interval);
+        let mut last: Option<usize> = None;
+        loop {
+            interval.tick().await;
+            match crate::orders::OrderBook::load(&order_path) {
+                Ok(book) => {
+                    let count = book.orders.len();
+                    maker.reload_price_policy(book.price_policy());
+                    if last != Some(count) {
+                        println!("reloaded standing orders: {count}");
+                        last = Some(count);
+                    }
+                }
+                Err(e) => eprintln!("order reload failed: {e}"),
+            }
+        }
+    })
+}
+
 pub fn spawn_cleanup_loop(maker: Maker, cleanup_interval: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = time::interval(cleanup_interval);
