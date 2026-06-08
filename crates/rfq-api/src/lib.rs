@@ -1,23 +1,26 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use rfq_btc::MockBitcoinClient;
+use rfq_btc::{BitcoinClient, MockBitcoinClient, TxConfirmation};
 use rfq_core::is_quote_expired;
 use rfq_maker::Maker;
 use rfq_rgb::MockRgbBackend;
 use rfq_router::{fanout_quote, MakerConnector};
-use rfq_store::{InMemoryQuoteStore, QuoteStore};
+use rfq_store::{
+    InMemoryQuoteStore, InMemorySettlementStore, Page, QuoteStore, SettlementFilter,
+    SettlementRecord, SettlementStore,
+};
 pub use rfq_types::CreateRfqRequest;
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetInfo, AssetKind, BitcoinNetwork, BtcInventoryStatus,
     BtcInventoryUtxo, HealthResponse, MakerId, OrderPrice, Outpoint, Quote, QuoteId, QuoteRequest,
-    RfqId, RgbInventoryUtxo, SettlementIntent, SwapLeg,
+    RfqId, RgbInventoryUtxo, SettlementIntent, SettlementStatus, Side, SwapLeg,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
@@ -33,6 +36,10 @@ use registry::MakerRegistry;
 pub struct AppState {
     registry: Arc<MakerRegistry>,
     store: InMemoryQuoteStore,
+    /// Records every settlement the broker relays, for the tx explorer
+    /// (`GET /settlements`). In-memory by default; the binary injects the
+    /// Postgres-backed store. See docs/broker-explorer-plan.md.
+    settlement_store: Arc<dyn SettlementStore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -80,6 +87,7 @@ pub fn app() -> Router {
     app_with_state(AppState {
         registry: MakerRegistry::with(vec![maker]),
         store: InMemoryQuoteStore::new(),
+        settlement_store: Arc::new(InMemorySettlementStore::new()),
     })
 }
 
@@ -132,7 +140,7 @@ fn mock_taker_funding() -> Vec<(Outpoint, rfq_btc::TxOut)> {
                        over the /maker-stream WebSocket (not documented here). See \
                        docs/swap-flows.md for the full protocol.",
     ),
-    paths(health, status, assets, prices, create_rfq, accept_quote, deliver_consignment, sign_quote),
+    paths(health, status, assets, prices, create_rfq, accept_quote, deliver_consignment, sign_quote, settlements),
     components(schemas(
         CreateRfqRequest,
         Quote,
@@ -140,6 +148,7 @@ fn mock_taker_funding() -> Vec<(Outpoint, rfq_btc::TxOut)> {
         ConsignmentBody,
         SignQuoteBody,
         SettlementIntent,
+        SettlementView,
         StatusResponse,
         AssetInfo,
         OrderPrice,
@@ -160,6 +169,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/quotes/:id/accept", post(accept_quote))
         .route("/quotes/:id/consignment", post(deliver_consignment))
         .route("/quotes/:id/sign", post(sign_quote))
+        .route("/settlements", get(settlements))
         .route("/maker-stream", get(ws::maker_stream))
         // Browser dapps call the broker cross-origin; allow it. Permissive is
         // fine for a public, no-auth read/quote API — tighten if auth is added.
@@ -177,11 +187,22 @@ pub fn app_with_makers(makers: Vec<Arc<dyn MakerConnector>>) -> Router {
 }
 
 /// Build the broker router around a shared [`MakerRegistry`] that keeps gaining
-/// makers at runtime via `/maker-stream`.
+/// makers at runtime via `/maker-stream`. Settlements are recorded in-memory.
 pub fn app_with_registry(registry: Arc<MakerRegistry>) -> Router {
+    app_with_registry_and_settlements(registry, Arc::new(InMemorySettlementStore::new()))
+}
+
+/// Like [`app_with_registry`] but with an injected settlement store — the broker
+/// binary passes the Postgres-backed one (the explorer's datastore). Returns the
+/// router; the binary also spawns [`run_confirmation_loop`] over the same store.
+pub fn app_with_registry_and_settlements(
+    registry: Arc<MakerRegistry>,
+    settlement_store: Arc<dyn SettlementStore>,
+) -> Router {
     app_with_state(AppState {
         registry,
         store: InMemoryQuoteStore::new(),
+        settlement_store,
     })
 }
 
@@ -323,7 +344,7 @@ async fn accept_quote(
 
     let intent = maker
         .accept_quote(
-            quote,
+            quote.clone(),
             AcceptQuoteRequest {
                 quote_id,
                 leg: body.leg,
@@ -331,6 +352,7 @@ async fn accept_quote(
         )
         .await?;
 
+    record_settlement(&state, &quote, &intent).await;
     Ok(Json(intent))
 }
 
@@ -415,7 +437,220 @@ async fn sign_quote(
 
     let intent = maker.submit_signed_psbt(quote_id, body.signed_psbt).await?;
 
+    record_settlement(&state, &quote, &intent).await;
     Ok(Json(intent))
+}
+
+/// A settlement row as the public explorer sees it — metadata only (no taker
+/// identifiers, no consignment blob; the witness txid is already public on-chain).
+#[derive(Debug, Serialize, ToSchema)]
+struct SettlementView {
+    quote_id: String,
+    maker_id: String,
+    base_asset: AssetId,
+    quote_asset: AssetId,
+    side: Side,
+    amount: u64,
+    price: u64,
+    fee_sats: u64,
+    witness_txid: Option<String>,
+    status: SettlementStatus,
+    confirmed_height: Option<u32>,
+    created_at_ms: u64,
+    updated_at_ms: u64,
+}
+
+impl From<SettlementRecord> for SettlementView {
+    fn from(r: SettlementRecord) -> Self {
+        Self {
+            quote_id: r.quote_id.0,
+            maker_id: r.maker_id.0,
+            base_asset: r.base_asset,
+            quote_asset: r.quote_asset,
+            side: r.side,
+            amount: r.amount,
+            price: r.price,
+            fee_sats: r.fee_sats,
+            witness_txid: r.witness_txid,
+            status: r.status,
+            confirmed_height: r.confirmed_height,
+            created_at_ms: r.created_at_ms,
+            updated_at_ms: r.updated_at_ms,
+        }
+    }
+}
+
+/// `GET /settlements` query: all filters optional; pagination defaults to the
+/// 50 newest. `limit` is capped at 200.
+#[derive(Debug, Deserialize)]
+struct SettlementsQuery {
+    maker: Option<String>,
+    base: Option<String>,
+    quote: Option<String>,
+    side: Option<String>,
+    status: Option<String>,
+    since_ms: Option<u64>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+const SETTLEMENTS_MAX_LIMIT: u32 = 200;
+
+fn parse_side(s: &str) -> Option<Side> {
+    match s.to_ascii_lowercase().as_str() {
+        "buy" => Some(Side::Buy),
+        "sell" => Some(Side::Sell),
+        _ => None,
+    }
+}
+
+fn parse_status(s: &str) -> Option<SettlementStatus> {
+    match s.to_ascii_lowercase().as_str() {
+        "pending" => Some(SettlementStatus::Pending),
+        "accepted" => Some(SettlementStatus::Accepted),
+        "awaiting_consignment" => Some(SettlementStatus::AwaitingConsignment),
+        "awaiting_taker_signature" => Some(SettlementStatus::AwaitingTakerSignature),
+        "pending_bitcoin_confirm" => Some(SettlementStatus::PendingBitcoinConfirm),
+        "settled" => Some(SettlementStatus::Settled),
+        "failed" => Some(SettlementStatus::Failed),
+        _ => None,
+    }
+}
+
+/// Browsable settlement history (the tx explorer's read path): the swaps the
+/// broker has relayed, newest first, with optional filters + pagination. Public,
+/// metadata only.
+#[utoipa::path(
+    get,
+    path = "/settlements",
+    tag = "broker",
+    params(
+        ("maker" = Option<String>, Query, description = "Filter by maker id"),
+        ("base" = Option<String>, Query, description = "Filter by base asset id"),
+        ("quote" = Option<String>, Query, description = "Filter by quote asset id"),
+        ("side" = Option<String>, Query, description = "buy | sell"),
+        ("status" = Option<String>, Query, description = "e.g. settled, pending_bitcoin_confirm"),
+        ("since_ms" = Option<u64>, Query, description = "Only rows created at/after this unix-ms"),
+        ("limit" = Option<u32>, Query, description = "Max rows (default 50, cap 200)"),
+        ("offset" = Option<u32>, Query, description = "Rows to skip (pagination)"),
+    ),
+    responses(
+        (status = 200, description = "Settlements, newest first", body = [SettlementView]),
+        (status = 400, description = "Invalid filter value", body = ErrorResponse),
+    )
+)]
+async fn settlements(
+    State(state): State<AppState>,
+    Query(q): Query<SettlementsQuery>,
+) -> Result<Json<Vec<SettlementView>>, ApiError> {
+    let side = match &q.side {
+        Some(s) => Some(parse_side(s).ok_or_else(|| ApiError::BadRequest(format!("bad side: {s}")))?),
+        None => None,
+    };
+    let status = match &q.status {
+        Some(s) => {
+            Some(parse_status(s).ok_or_else(|| ApiError::BadRequest(format!("bad status: {s}")))?)
+        }
+        None => None,
+    };
+    let filter = SettlementFilter {
+        maker_id: q.maker.map(MakerId),
+        base_asset_id: q.base,
+        quote_asset_id: q.quote,
+        side,
+        status,
+        since_ms: q.since_ms,
+    };
+    let page = Page {
+        limit: q.limit.unwrap_or(50).min(SETTLEMENTS_MAX_LIMIT),
+        offset: q.offset.unwrap_or(0),
+    };
+    let rows = state
+        .settlement_store
+        .list_settlements(&filter, page)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(rows.into_iter().map(SettlementView::from).collect()))
+}
+
+/// Persist the settlement the broker just relayed (best-effort: a store failure
+/// is logged, never fails the response — the swap already happened). Recorded at
+/// `/accept` (status Accepted) and refreshed at `/sign` (PendingBitcoinConfirm +
+/// witness txid); the confirmation loop later promotes it to Settled.
+async fn record_settlement(state: &AppState, quote: &Quote, intent: &SettlementIntent) {
+    let now = now_ms();
+    let record = SettlementRecord {
+        quote_id: quote.quote_id.clone(),
+        maker_id: quote.maker_id.clone(),
+        base_asset: quote.base_asset.clone(),
+        quote_asset: quote.quote_asset.clone(),
+        side: quote.side.clone(),
+        amount: quote.amount,
+        price: quote.price,
+        fee_sats: quote.estimated_fee_sats,
+        witness_txid: intent.witness_txid.clone(),
+        status: intent.status,
+        confirmed_height: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    if let Err(e) = state.settlement_store.save_settlement(record).await {
+        eprintln!("warning: failed to persist settlement {}: {e}", quote.quote_id.0);
+    }
+}
+
+/// Background confirmation loop: every `interval`, poll each `PendingBitcoinConfirm`
+/// settlement's witness tx via the chain client and promote it to `Settled` once it
+/// has `min_confirmations`. The broker's only chain dependency is electrum/electrs
+/// (the maker uses it too). Runs until cancelled; the binary spawns it.
+pub async fn run_confirmation_loop(
+    settlement_store: Arc<dyn SettlementStore>,
+    bitcoin: Arc<dyn BitcoinClient>,
+    min_confirmations: u32,
+    interval: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        confirm_pending_once(&settlement_store, &bitcoin, min_confirmations).await;
+    }
+}
+
+/// One sweep of the confirmation loop: promote every `PendingBitcoinConfirm`
+/// settlement whose witness tx now has `min_confirmations`. Returns how many were
+/// promoted. Factored out of [`run_confirmation_loop`] so it's testable.
+async fn confirm_pending_once(
+    settlement_store: &Arc<dyn SettlementStore>,
+    bitcoin: &Arc<dyn BitcoinClient>,
+    min_confirmations: u32,
+) -> usize {
+    let pending = match settlement_store.pending_witness_txids().await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("confirmation loop: list pending failed: {e}");
+            return 0;
+        }
+    };
+    if pending.is_empty() {
+        return 0;
+    }
+    let tip = bitcoin.block_height().await.unwrap_or(0);
+    let mut promoted = 0;
+    for (quote_id, txid) in pending {
+        if let Ok(TxConfirmation { confirmed: true, height: Some(h) }) = bitcoin.tx_status(&txid).await
+        {
+            let confs = tip.saturating_sub(h).saturating_add(1);
+            if confs >= min_confirmations {
+                match settlement_store
+                    .update_status(&quote_id, SettlementStatus::Settled, Some(h), now_ms())
+                    .await
+                {
+                    Ok(_) => promoted += 1,
+                    Err(e) => eprintln!("confirmation loop: update {} failed: {e}", quote_id.0),
+                }
+            }
+        }
+    }
+    promoted
 }
 
 #[derive(Debug)]
@@ -549,6 +784,7 @@ mod tests {
         app_with_state(AppState {
             registry: MakerRegistry::with(vec![maker]),
             store: InMemoryQuoteStore::new(),
+            settlement_store: Arc::new(InMemorySettlementStore::new()),
         })
     }
 
@@ -747,5 +983,90 @@ mod tests {
         assert_eq!(settled.status, SettlementStatus::PendingBitcoinConfirm);
         assert!(settled.witness_txid.is_some());
         assert!(settled.final_consignment.is_some());
+
+        // Explorer read path: accept → sign recorded exactly one settlement
+        // (upserted by quote_id), now PendingBitcoinConfirm with a witness.
+        let (status, body) = get(&app, "/settlements").await;
+        assert_eq!(status, StatusCode::OK);
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["quote_id"], quote.quote_id.0);
+        assert_eq!(rows[0]["status"], "PendingBitcoinConfirm");
+        assert_eq!(rows[0]["side"], "Sell");
+        assert!(rows[0]["witness_txid"].as_str().is_some());
+        assert!(rows[0]["confirmed_height"].is_null());
+
+        // A non-matching status filter returns nothing.
+        let (_, body) = get(&app, "/settlements?status=settled").await;
+        let empty: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirmation_loop_promotes_pending_to_settled() {
+        use rfq_types::{QuoteId, SettlementStatus};
+
+        let store: Arc<dyn SettlementStore> = Arc::new(InMemorySettlementStore::new());
+        store
+            .save_settlement(SettlementRecord {
+                quote_id: QuoteId("q1".into()),
+                maker_id: MakerId("m1".into()),
+                base_asset: btc_asset(),
+                quote_asset: rgb_asset(),
+                side: Side::Buy,
+                amount: 1,
+                price: 1,
+                fee_sats: 0,
+                witness_txid: Some("wt1".into()),
+                status: SettlementStatus::PendingBitcoinConfirm,
+                confirmed_height: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .await
+            .unwrap();
+
+        let btc_mock = MockBitcoinClient::new().with_block_height(105);
+        btc_mock.seed_tx_status("wt1", TxConfirmation { confirmed: true, height: Some(100) });
+        let bitcoin: Arc<dyn BitcoinClient> = Arc::new(btc_mock);
+
+        // tip 105, mined at 100 → 6 confs ≥ 3 → promoted.
+        assert_eq!(confirm_pending_once(&store, &bitcoin, 3).await, 1);
+        let row = store.get_settlement(&QuoteId("q1".into())).await.unwrap().unwrap();
+        assert_eq!(row.status, SettlementStatus::Settled);
+        assert_eq!(row.confirmed_height, Some(100));
+        // No longer pending → a second sweep promotes nothing.
+        assert_eq!(confirm_pending_once(&store, &bitcoin, 3).await, 0);
+    }
+
+    #[tokio::test]
+    async fn confirmation_loop_leaves_unconfirmed_pending() {
+        use rfq_types::{QuoteId, SettlementStatus};
+
+        let store: Arc<dyn SettlementStore> = Arc::new(InMemorySettlementStore::new());
+        store
+            .save_settlement(SettlementRecord {
+                quote_id: QuoteId("q1".into()),
+                maker_id: MakerId("m1".into()),
+                base_asset: btc_asset(),
+                quote_asset: rgb_asset(),
+                side: Side::Buy,
+                amount: 1,
+                price: 1,
+                fee_sats: 0,
+                witness_txid: Some("wt-mempool".into()),
+                status: SettlementStatus::PendingBitcoinConfirm,
+                confirmed_height: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .await
+            .unwrap();
+        // Mock returns unconfirmed for an unseeded txid.
+        let bitcoin: Arc<dyn BitcoinClient> = Arc::new(MockBitcoinClient::new().with_block_height(105));
+
+        assert_eq!(confirm_pending_once(&store, &bitcoin, 1).await, 0);
+        let row = store.get_settlement(&QuoteId("q1".into())).await.unwrap().unwrap();
+        assert_eq!(row.status, SettlementStatus::PendingBitcoinConfirm);
     }
 }
