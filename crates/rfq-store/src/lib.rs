@@ -2,8 +2,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use rfq_types::{
-    AssetId, ExtendedInventorySnapshot, InventoryError, InventoryStatus, InventoryUtxo, Outpoint,
-    Quote, QuoteId, ReservationId, RfqId,
+    AssetId, ExtendedInventorySnapshot, InventoryError, InventoryStatus, InventoryUtxo, MakerId,
+    Outpoint, Quote, QuoteId, ReservationId, RfqId, Side, SettlementStatus,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -18,6 +18,201 @@ pub use btc::{
 mod sqlite;
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteBtcInventoryStore, SqliteConsignmentStore, SqliteInventoryStore};
+
+#[cfg(feature = "postgres")]
+mod pg;
+#[cfg(feature = "postgres")]
+pub use pg::PostgresSettlementStore;
+
+// ---------------------------------------------------------------------------
+// Settlement store (broker) — the source for the tx explorer (colorex-dapp#1).
+// Records swaps the broker relays, metadata only (no taker identity, no
+// consignment blob). The broker uses the Postgres impl; the in-memory impl is the
+// default + the spec for tests. See docs/broker-explorer-plan.md.
+// ---------------------------------------------------------------------------
+
+/// One swap the broker relayed, as the explorer sees it. Metadata only — the
+/// witness txid is already public on-chain; taker identifiers and the consignment
+/// blob are deliberately absent (the consignment is the authed stash, #33).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementRecord {
+    pub quote_id: QuoteId,
+    pub maker_id: MakerId,
+    pub base_asset: AssetId,
+    pub quote_asset: AssetId,
+    pub side: Side,
+    pub amount: u64,
+    pub price: u64,
+    pub fee_sats: u64,
+    /// Set once the maker broadcasts (at `/sign`); `None` before then.
+    pub witness_txid: Option<String>,
+    pub status: SettlementStatus,
+    /// Block height once the confirmation loop sees the witness mined.
+    pub confirmed_height: Option<u32>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Filters for `list_settlements`. All `None` → unfiltered (newest first).
+#[derive(Debug, Clone, Default)]
+pub struct SettlementFilter {
+    pub maker_id: Option<MakerId>,
+    pub base_asset_id: Option<String>,
+    pub quote_asset_id: Option<String>,
+    pub side: Option<Side>,
+    pub status: Option<SettlementStatus>,
+    pub since_ms: Option<u64>,
+}
+
+/// Offset pagination (v1). A `(created_at, quote_id)` cursor can replace this later.
+#[derive(Debug, Clone, Copy)]
+pub struct Page {
+    pub limit: u32,
+    pub offset: u32,
+}
+
+impl Default for Page {
+    fn default() -> Self {
+        Self { limit: 50, offset: 0 }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum SettlementError {
+    Backend(String),
+}
+
+impl std::fmt::Display for SettlementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(msg) => write!(f, "settlement store error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for SettlementError {}
+
+#[async_trait]
+pub trait SettlementStore: Send + Sync {
+    /// Upsert by `quote_id` (recorded at `/accept`, updated at `/sign`). Preserves
+    /// the original `created_at_ms` on conflict; refreshes everything else.
+    async fn save_settlement(&self, record: SettlementRecord) -> Result<(), SettlementError>;
+
+    /// Promote a row's status (+ confirmed height), e.g. the confirmation loop
+    /// flipping `PendingBitcoinConfirm → Settled`. Returns whether a row matched.
+    async fn update_status(
+        &self,
+        quote_id: &QuoteId,
+        status: SettlementStatus,
+        confirmed_height: Option<u32>,
+        now_ms: u64,
+    ) -> Result<bool, SettlementError>;
+
+    async fn get_settlement(&self, quote_id: &QuoteId)
+        -> Result<Option<SettlementRecord>, SettlementError>;
+
+    /// Newest-first, filtered + paginated — the explorer read path.
+    async fn list_settlements(
+        &self,
+        filter: &SettlementFilter,
+        page: Page,
+    ) -> Result<Vec<SettlementRecord>, SettlementError>;
+
+    /// `(quote_id, witness_txid)` for every row still `PendingBitcoinConfirm` with a
+    /// witness — the work-list for the broker's confirmation loop.
+    async fn pending_witness_txids(&self)
+        -> Result<Vec<(QuoteId, String)>, SettlementError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemorySettlementStore {
+    by_quote: Arc<RwLock<HashMap<QuoteId, SettlementRecord>>>,
+}
+
+impl InMemorySettlementStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+fn matches_filter(r: &SettlementRecord, f: &SettlementFilter) -> bool {
+    f.maker_id.as_ref().is_none_or(|m| &r.maker_id == m)
+        && f.base_asset_id.as_ref().is_none_or(|a| &r.base_asset.id == a)
+        && f.quote_asset_id.as_ref().is_none_or(|a| &r.quote_asset.id == a)
+        && f.side.as_ref().is_none_or(|s| &r.side == s)
+        && f.status.as_ref().is_none_or(|s| &r.status == s)
+        && f.since_ms.is_none_or(|t| r.created_at_ms >= t)
+}
+
+#[async_trait]
+impl SettlementStore for InMemorySettlementStore {
+    async fn save_settlement(&self, mut record: SettlementRecord) -> Result<(), SettlementError> {
+        let mut map = self.by_quote.write().await;
+        if let Some(existing) = map.get(&record.quote_id) {
+            record.created_at_ms = existing.created_at_ms; // upsert keeps first-seen time
+        }
+        map.insert(record.quote_id.clone(), record);
+        Ok(())
+    }
+
+    async fn update_status(
+        &self,
+        quote_id: &QuoteId,
+        status: SettlementStatus,
+        confirmed_height: Option<u32>,
+        now_ms: u64,
+    ) -> Result<bool, SettlementError> {
+        let mut map = self.by_quote.write().await;
+        match map.get_mut(quote_id) {
+            Some(r) => {
+                r.status = status;
+                r.confirmed_height = confirmed_height;
+                r.updated_at_ms = now_ms;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn get_settlement(
+        &self,
+        quote_id: &QuoteId,
+    ) -> Result<Option<SettlementRecord>, SettlementError> {
+        Ok(self.by_quote.read().await.get(quote_id).cloned())
+    }
+
+    async fn list_settlements(
+        &self,
+        filter: &SettlementFilter,
+        page: Page,
+    ) -> Result<Vec<SettlementRecord>, SettlementError> {
+        let map = self.by_quote.read().await;
+        let mut rows: Vec<SettlementRecord> =
+            map.values().filter(|r| matches_filter(r, filter)).cloned().collect();
+        // Newest first; quote_id breaks ties for a stable order.
+        rows.sort_by(|a, b| {
+            b.created_at_ms
+                .cmp(&a.created_at_ms)
+                .then_with(|| b.quote_id.0.cmp(&a.quote_id.0))
+        });
+        Ok(rows
+            .into_iter()
+            .skip(page.offset as usize)
+            .take(page.limit as usize)
+            .collect())
+    }
+
+    async fn pending_witness_txids(&self) -> Result<Vec<(QuoteId, String)>, SettlementError> {
+        Ok(self
+            .by_quote
+            .read()
+            .await
+            .values()
+            .filter(|r| r.status == SettlementStatus::PendingBitcoinConfirm)
+            .filter_map(|r| r.witness_txid.clone().map(|t| (r.quote_id.clone(), t)))
+            .collect())
+    }
+}
 
 /// A consignment the maker produced for a settled swap, kept so it can be
 /// re-served if the recipient loses theirs (failed delivery, wallet reset). The
@@ -1357,5 +1552,136 @@ mod tests {
         assert_eq!(legacy.available_allocations, 1);
         assert_eq!(legacy.reserved_allocations, 1);
         assert_eq!(legacy.spent_allocations, 0);
+    }
+}
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    use rfq_types::{AssetId, AssetKind, BitcoinNetwork, MakerId, QuoteId, Side, SettlementStatus};
+
+    fn asset(id: &str, kind: AssetKind) -> AssetId {
+        AssetId { network: BitcoinNetwork::Regtest, kind, id: id.to_owned() }
+    }
+
+    fn record(quote: &str, maker: &str, created: u64) -> SettlementRecord {
+        SettlementRecord {
+            quote_id: QuoteId(quote.to_owned()),
+            maker_id: MakerId(maker.to_owned()),
+            base_asset: asset("btc", AssetKind::Btc),
+            quote_asset: asset("rgb:AAA", AssetKind::Rgb20),
+            side: Side::Buy,
+            amount: 1000,
+            price: 101,
+            fee_sats: 200,
+            witness_txid: None,
+            status: SettlementStatus::Accepted,
+            confirmed_height: None,
+            created_at_ms: created,
+            updated_at_ms: created,
+        }
+    }
+
+    #[tokio::test]
+    async fn save_get_and_upsert_preserves_created_at() {
+        let store = InMemorySettlementStore::new();
+        store.save_settlement(record("q1", "m1", 100)).await.unwrap();
+        assert_eq!(
+            store.get_settlement(&QuoteId("q1".into())).await.unwrap().unwrap().created_at_ms,
+            100
+        );
+
+        // Upsert (the /sign update): advance to broadcast with a witness — created_at stays.
+        let mut adv = record("q1", "m1", 999);
+        adv.status = SettlementStatus::PendingBitcoinConfirm;
+        adv.witness_txid = Some("wt1".into());
+        store.save_settlement(adv).await.unwrap();
+        let got = store.get_settlement(&QuoteId("q1".into())).await.unwrap().unwrap();
+        assert_eq!(got.created_at_ms, 100, "created_at preserved across upsert");
+        assert_eq!(got.witness_txid.as_deref(), Some("wt1"));
+        assert_eq!(got.status, SettlementStatus::PendingBitcoinConfirm);
+    }
+
+    #[tokio::test]
+    async fn update_status_promotes_and_reports_match() {
+        let store = InMemorySettlementStore::new();
+        let mut r = record("q1", "m1", 100);
+        r.status = SettlementStatus::PendingBitcoinConfirm;
+        r.witness_txid = Some("wt1".into());
+        store.save_settlement(r).await.unwrap();
+
+        assert!(store
+            .update_status(&QuoteId("q1".into()), SettlementStatus::Settled, Some(142), 200)
+            .await
+            .unwrap());
+        assert!(!store
+            .update_status(&QuoteId("missing".into()), SettlementStatus::Settled, None, 200)
+            .await
+            .unwrap());
+        let got = store.get_settlement(&QuoteId("q1".into())).await.unwrap().unwrap();
+        assert_eq!(got.status, SettlementStatus::Settled);
+        assert_eq!(got.confirmed_height, Some(142));
+        assert_eq!(got.updated_at_ms, 200);
+    }
+
+    #[tokio::test]
+    async fn list_filters_orders_newest_first_and_paginates() {
+        let store = InMemorySettlementStore::new();
+        store.save_settlement(record("q1", "m1", 100)).await.unwrap();
+        store.save_settlement(record("q2", "m2", 300)).await.unwrap();
+        store.save_settlement(record("q3", "m1", 200)).await.unwrap();
+
+        let all = store
+            .list_settlements(&SettlementFilter::default(), Page::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.quote_id.0.clone()).collect::<Vec<_>>(),
+            ["q2", "q3", "q1"],
+            "newest first"
+        );
+
+        let m1 = store
+            .list_settlements(
+                &SettlementFilter { maker_id: Some(MakerId("m1".into())), ..Default::default() },
+                Page::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(m1.len(), 2);
+        assert!(m1.iter().all(|r| r.maker_id.0 == "m1"));
+
+        let recent = store
+            .list_settlements(
+                &SettlementFilter { since_ms: Some(250), ..Default::default() },
+                Page::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recent.iter().map(|r| r.quote_id.0.clone()).collect::<Vec<_>>(), ["q2"]);
+
+        let page = store
+            .list_settlements(&SettlementFilter::default(), Page { limit: 1, offset: 1 })
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].quote_id.0, "q3");
+    }
+
+    #[tokio::test]
+    async fn pending_witness_txids_lists_only_broadcast_with_witness() {
+        let store = InMemorySettlementStore::new();
+        store.save_settlement(record("q1", "m1", 100)).await.unwrap(); // Accepted, no witness
+        let mut r2 = record("q2", "m1", 200);
+        r2.status = SettlementStatus::PendingBitcoinConfirm;
+        r2.witness_txid = Some("wt2".into());
+        store.save_settlement(r2).await.unwrap();
+        let mut r3 = record("q3", "m1", 300);
+        r3.status = SettlementStatus::Settled; // confirmed already — not pending
+        r3.witness_txid = Some("wt3".into());
+        store.save_settlement(r3).await.unwrap();
+
+        let pending = store.pending_witness_txids().await.unwrap();
+        assert_eq!(pending, vec![(QuoteId("q2".into()), "wt2".to_owned())]);
     }
 }

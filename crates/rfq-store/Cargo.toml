@@ -8,9 +8,10 @@ version.workspace = true
 async-trait.workspace = true
 rfq-types = { path = "../rfq-types" }
 serde_json = { workspace = true, optional = true }
-sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"], optional = true }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio"], optional = true }
 tokio.workspace = true
 uuid.workspace = true
 
 [features]
-sqlite = ["dep:sqlx", "dep:serde_json"]
+sqlite = ["dep:sqlx", "sqlx/sqlite", "dep:serde_json"]
+postgres = ["dep:sqlx", "sqlx/postgres", "dep:serde_json"]
