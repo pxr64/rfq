@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+
+use tokio::sync::RwLock;
 
 use axum::{
     extract::{Path, Query, State},
@@ -40,7 +43,21 @@ pub struct AppState {
     /// (`GET /settlements`). In-memory by default; the binary injects the
     /// Postgres-backed store. See docs/broker-explorer-plan.md.
     settlement_store: Arc<dyn SettlementStore>,
+    /// Per-RFQ stats captured at `/rfq` fanout (median quote price + maker count)
+    /// so a settlement recorded later at `/accept` can carry "Δ-vs-mid" + "best of
+    /// N". Transient enrichment (not durable); entries are removed on accept.
+    rfq_stats: Arc<RwLock<HashMap<RfqId, RfqStats>>>,
 }
+
+#[derive(Clone, Copy)]
+struct RfqStats {
+    quote_count: u32,
+    mid: u64,
+}
+
+/// Soft cap on the transient RFQ-stats map — cleared wholesale if exceeded so an
+/// abandoned-quote backlog can't grow unbounded (settlements keep their copy).
+const RFQ_STATS_CAP: usize = 50_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AcceptQuoteBody {
@@ -88,6 +105,7 @@ pub fn app() -> Router {
         registry: MakerRegistry::with(vec![maker]),
         store: InMemoryQuoteStore::new(),
         settlement_store: Arc::new(InMemorySettlementStore::new()),
+        rfq_stats: Arc::new(RwLock::new(HashMap::new())),
     })
 }
 
@@ -203,6 +221,7 @@ pub fn app_with_registry_and_settlements(
         registry,
         store: InMemoryQuoteStore::new(),
         settlement_store,
+        rfq_stats: Arc::new(RwLock::new(HashMap::new())),
     })
 }
 
@@ -295,11 +314,26 @@ async fn create_rfq(
         amount: body.amount,
         created_at_ms: now_ms(),
     };
+    let rfq_id = request.rfq_id.clone();
     let makers = state.registry.snapshot().await;
     let quotes = fanout_quote(&makers, request).await?;
 
     for quote in &quotes {
         state.store.save_quote(quote.clone()).await;
+    }
+
+    // Capture RFQ-level stats (median quote price + maker count) for the explorer's
+    // Δ-vs-mid and best-of-N; consumed when one of these quotes is accepted.
+    if !quotes.is_empty() {
+        let stats = RfqStats {
+            quote_count: quotes.len() as u32,
+            mid: median_price(&quotes),
+        };
+        let mut map = state.rfq_stats.write().await;
+        if map.len() >= RFQ_STATS_CAP {
+            map.clear();
+        }
+        map.insert(rfq_id, stats);
     }
 
     Ok(Json(quotes))
@@ -352,7 +386,10 @@ async fn accept_quote(
         )
         .await?;
 
-    record_settlement(&state, &quote, &intent).await;
+    // Consume the RFQ stats (removed → bounds the transient map); preserved across
+    // the later /sign upsert by the store.
+    let stats = state.rfq_stats.write().await.remove(&quote.rfq_id);
+    record_settlement(&state, &quote, &intent, stats).await;
     Ok(Json(intent))
 }
 
@@ -437,7 +474,9 @@ async fn sign_quote(
 
     let intent = maker.submit_signed_psbt(quote_id, body.signed_psbt).await?;
 
-    record_settlement(&state, &quote, &intent).await;
+    // RFQ stats (mid / quote_count) were recorded at /accept; the store preserves
+    // them across this upsert, so pass None here.
+    record_settlement(&state, &quote, &intent, None).await;
     Ok(Json(intent))
 }
 
@@ -456,6 +495,10 @@ struct SettlementView {
     witness_txid: Option<String>,
     status: SettlementStatus,
     confirmed_height: Option<u32>,
+    /// Median competing-quote price at RFQ time (Δ-vs-mid baseline).
+    mid: Option<u64>,
+    /// Makers that quoted this RFQ ("best of N").
+    quote_count: Option<u32>,
     created_at_ms: u64,
     updated_at_ms: u64,
 }
@@ -474,6 +517,8 @@ impl From<SettlementRecord> for SettlementView {
             witness_txid: r.witness_txid,
             status: r.status,
             confirmed_height: r.confirmed_height,
+            mid: r.mid,
+            quote_count: r.quote_count,
             created_at_ms: r.created_at_ms,
             updated_at_ms: r.updated_at_ms,
         }
@@ -577,7 +622,12 @@ async fn settlements(
 /// is logged, never fails the response — the swap already happened). Recorded at
 /// `/accept` (status Accepted) and refreshed at `/sign` (PendingBitcoinConfirm +
 /// witness txid); the confirmation loop later promotes it to Settled.
-async fn record_settlement(state: &AppState, quote: &Quote, intent: &SettlementIntent) {
+async fn record_settlement(
+    state: &AppState,
+    quote: &Quote,
+    intent: &SettlementIntent,
+    stats: Option<RfqStats>,
+) {
     let now = now_ms();
     let record = SettlementRecord {
         quote_id: quote.quote_id.clone(),
@@ -591,6 +641,8 @@ async fn record_settlement(state: &AppState, quote: &Quote, intent: &SettlementI
         witness_txid: intent.witness_txid.clone(),
         status: intent.status,
         confirmed_height: None,
+        mid: stats.map(|s| s.mid),
+        quote_count: stats.map(|s| s.quote_count),
         created_at_ms: now,
         updated_at_ms: now,
     };
@@ -722,6 +774,20 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Median of the quotes' unit prices — the broker's self-contained "mid" (it has
+/// no external oracle; the field of competing quotes is the market signal). The
+/// winning quote's price vs this is the explorer's Δ-vs-mid.
+fn median_price(quotes: &[Quote]) -> u64 {
+    let mut prices: Vec<u64> = quotes.iter().map(|q| q.price).collect();
+    prices.sort_unstable();
+    let n = prices.len();
+    match n {
+        0 => 0,
+        _ if n % 2 == 1 => prices[n / 2],
+        _ => (prices[n / 2 - 1] + prices[n / 2]) / 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,6 +851,7 @@ mod tests {
             registry: MakerRegistry::with(vec![maker]),
             store: InMemoryQuoteStore::new(),
             settlement_store: Arc::new(InMemorySettlementStore::new()),
+            rfq_stats: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -995,6 +1062,9 @@ mod tests {
         assert_eq!(rows[0]["side"], "Sell");
         assert!(rows[0]["witness_txid"].as_str().is_some());
         assert!(rows[0]["confirmed_height"].is_null());
+        // RFQ stats captured at /rfq, consumed at /accept, preserved through /sign.
+        assert_eq!(rows[0]["quote_count"], 1, "one maker quoted → best of 1");
+        assert!(rows[0]["mid"].as_u64().is_some(), "mid recorded from RFQ stats");
 
         // A non-matching status filter returns nothing.
         let (_, body) = get(&app, "/settlements?status=settled").await;
@@ -1020,6 +1090,8 @@ mod tests {
                 witness_txid: Some("wt1".into()),
                 status: SettlementStatus::PendingBitcoinConfirm,
                 confirmed_height: None,
+                mid: None,
+                quote_count: None,
                 created_at_ms: 1,
                 updated_at_ms: 1,
             })
@@ -1057,6 +1129,8 @@ mod tests {
                 witness_txid: Some("wt-mempool".into()),
                 status: SettlementStatus::PendingBitcoinConfirm,
                 confirmed_height: None,
+                mid: None,
+                quote_count: None,
                 created_at_ms: 1,
                 updated_at_ms: 1,
             })

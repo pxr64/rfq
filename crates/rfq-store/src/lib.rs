@@ -49,6 +49,13 @@ pub struct SettlementRecord {
     pub status: SettlementStatus,
     /// Block height once the confirmation loop sees the witness mined.
     pub confirmed_height: Option<u32>,
+    /// Median competing-quote price at RFQ time (same unit as `price`) — the
+    /// explorer's "mid" for a Δ-vs-mid figure. `None` if the broker didn't record
+    /// RFQ stats. Set once (at `/accept`) and preserved across the `/sign` upsert.
+    pub mid: Option<u64>,
+    /// How many makers quoted this RFQ — the explorer's "best of N". `None` if
+    /// unrecorded. Set once and preserved like `mid`.
+    pub quote_count: Option<u32>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -150,6 +157,10 @@ impl SettlementStore for InMemorySettlementStore {
         let mut map = self.by_quote.write().await;
         if let Some(existing) = map.get(&record.quote_id) {
             record.created_at_ms = existing.created_at_ms; // upsert keeps first-seen time
+            // RFQ stats are recorded once (at /accept); don't clobber them with the
+            // None a later /sign upsert carries.
+            record.mid = record.mid.or(existing.mid);
+            record.quote_count = record.quote_count.or(existing.quote_count);
         }
         map.insert(record.quote_id.clone(), record);
         Ok(())
@@ -1577,27 +1588,33 @@ mod settlement_tests {
             witness_txid: None,
             status: SettlementStatus::Accepted,
             confirmed_height: None,
+            mid: None,
+            quote_count: None,
             created_at_ms: created,
             updated_at_ms: created,
         }
     }
 
     #[tokio::test]
-    async fn save_get_and_upsert_preserves_created_at() {
+    async fn save_get_and_upsert_preserves_created_at_and_rfq_stats() {
         let store = InMemorySettlementStore::new();
-        store.save_settlement(record("q1", "m1", 100)).await.unwrap();
-        assert_eq!(
-            store.get_settlement(&QuoteId("q1".into())).await.unwrap().unwrap().created_at_ms,
-            100
-        );
+        // First record (at /accept) carries the RFQ stats.
+        let mut first = record("q1", "m1", 100);
+        first.mid = Some(99);
+        first.quote_count = Some(4);
+        store.save_settlement(first).await.unwrap();
 
-        // Upsert (the /sign update): advance to broadcast with a witness — created_at stays.
+        // Upsert (the /sign update): advance to broadcast; mid/quote_count come as
+        // None but must survive, and created_at stays.
         let mut adv = record("q1", "m1", 999);
         adv.status = SettlementStatus::PendingBitcoinConfirm;
         adv.witness_txid = Some("wt1".into());
         store.save_settlement(adv).await.unwrap();
+
         let got = store.get_settlement(&QuoteId("q1".into())).await.unwrap().unwrap();
         assert_eq!(got.created_at_ms, 100, "created_at preserved across upsert");
+        assert_eq!(got.mid, Some(99), "mid preserved across upsert");
+        assert_eq!(got.quote_count, Some(4), "quote_count preserved across upsert");
         assert_eq!(got.witness_txid.as_deref(), Some("wt1"));
         assert_eq!(got.status, SettlementStatus::PendingBitcoinConfirm);
     }

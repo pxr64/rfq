@@ -56,7 +56,7 @@ fn parse_status(s: &str) -> SettlementStatus {
 }
 
 const SELECT_COLS: &str = "quote_id, maker_id, base_asset, quote_asset, side, amount, price, \
-     fee_sats, witness_txid, status, confirmed_height, created_at_ms, updated_at_ms";
+     fee_sats, witness_txid, status, confirmed_height, mid, quote_count, created_at_ms, updated_at_ms";
 
 fn row_to_record(row: &PgRow) -> Result<SettlementRecord, SettlementError> {
     let base_json: String = row.try_get("base_asset").map_err(pg)?;
@@ -76,6 +76,11 @@ fn row_to_record(row: &PgRow) -> Result<SettlementRecord, SettlementError> {
             .try_get::<Option<i32>, _>("confirmed_height")
             .map_err(pg)?
             .map(|h| h as u32),
+        mid: row.try_get::<Option<i64>, _>("mid").map_err(pg)?.map(|m| m as u64),
+        quote_count: row
+            .try_get::<Option<i32>, _>("quote_count")
+            .map_err(pg)?
+            .map(|c| c as u32),
         created_at_ms: row.try_get::<i64, _>("created_at_ms").map_err(pg)? as u64,
         updated_at_ms: row.try_get::<i64, _>("updated_at_ms").map_err(pg)? as u64,
     })
@@ -101,7 +106,8 @@ impl PostgresSettlementStore {
                  base_asset_id TEXT NOT NULL, quote_asset_id TEXT NOT NULL, \
                  side TEXT NOT NULL, amount BIGINT NOT NULL, price BIGINT NOT NULL, \
                  fee_sats BIGINT NOT NULL, witness_txid TEXT, status TEXT NOT NULL, \
-                 confirmed_height INT, created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL)",
+                 confirmed_height INT, mid BIGINT, quote_count INT, \
+                 created_at_ms BIGINT NOT NULL, updated_at_ms BIGINT NOT NULL)",
         )
         .execute(&pool)
         .await
@@ -127,14 +133,16 @@ impl SettlementStore for PostgresSettlementStore {
         sqlx::query(
             "INSERT INTO settlements (quote_id, maker_id, base_asset, quote_asset, \
                  base_asset_id, quote_asset_id, side, amount, price, fee_sats, witness_txid, \
-                 status, confirmed_height, created_at_ms, updated_at_ms) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+                 status, confirmed_height, mid, quote_count, created_at_ms, updated_at_ms) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
              ON CONFLICT (quote_id) DO UPDATE SET \
                  maker_id=EXCLUDED.maker_id, base_asset=EXCLUDED.base_asset, \
                  quote_asset=EXCLUDED.quote_asset, base_asset_id=EXCLUDED.base_asset_id, \
                  quote_asset_id=EXCLUDED.quote_asset_id, side=EXCLUDED.side, amount=EXCLUDED.amount, \
                  price=EXCLUDED.price, fee_sats=EXCLUDED.fee_sats, witness_txid=EXCLUDED.witness_txid, \
                  status=EXCLUDED.status, confirmed_height=EXCLUDED.confirmed_height, \
+                 mid=COALESCE(EXCLUDED.mid, settlements.mid), \
+                 quote_count=COALESCE(EXCLUDED.quote_count, settlements.quote_count), \
                  updated_at_ms=EXCLUDED.updated_at_ms",
         )
         .bind(&record.quote_id.0)
@@ -150,6 +158,8 @@ impl SettlementStore for PostgresSettlementStore {
         .bind(record.witness_txid.as_deref())
         .bind(status_str(record.status))
         .bind(record.confirmed_height.map(|h| h as i32))
+        .bind(record.mid.map(|m| m as i64))
+        .bind(record.quote_count.map(|c| c as i32))
         .bind(record.created_at_ms as i64)
         .bind(record.updated_at_ms as i64)
         .execute(&self.pool)
@@ -264,6 +274,8 @@ mod tests {
             witness_txid: None,
             status: SettlementStatus::Accepted,
             confirmed_height: None,
+            mid: None,
+            quote_count: None,
             created_at_ms: created,
             updated_at_ms: created,
         }
@@ -281,10 +293,15 @@ mod tests {
         let store = PostgresSettlementStore::open(&url).await.unwrap();
         sqlx::query("DELETE FROM settlements").execute(&store.pool).await.unwrap();
 
-        store.save_settlement(rec("q1", 100)).await.unwrap();
+        // First record carries RFQ stats (as /accept would).
+        let mut q1 = rec("q1", 100);
+        q1.mid = Some(99);
+        q1.quote_count = Some(4);
+        store.save_settlement(q1).await.unwrap();
         store.save_settlement(rec("q2", 300)).await.unwrap();
 
-        // Upsert q1 → broadcast + witness; created_at_ms must survive.
+        // Upsert q1 → broadcast + witness; created_at_ms + RFQ stats must survive
+        // (the /sign upsert carries None for mid/quote_count).
         let mut adv = rec("q1", 999);
         adv.status = SettlementStatus::PendingBitcoinConfirm;
         adv.witness_txid = Some("wt1".into());
@@ -292,6 +309,8 @@ mod tests {
 
         let got = store.get_settlement(&QuoteId("q1".into())).await.unwrap().unwrap();
         assert_eq!(got.created_at_ms, 100, "created_at preserved across upsert");
+        assert_eq!(got.mid, Some(99), "mid preserved (COALESCE) across upsert");
+        assert_eq!(got.quote_count, Some(4), "quote_count preserved across upsert");
         assert_eq!(got.witness_txid.as_deref(), Some("wt1"));
         assert_eq!(got.base_asset.kind, AssetKind::Btc, "AssetId json round-trips");
         assert_eq!(got.quote_asset.id, "rgb:AAA");
