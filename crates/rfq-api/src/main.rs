@@ -23,6 +23,10 @@ use rfq_store::{InMemorySettlementStore, PostgresSettlementStore, SettlementStor
 /// - `BROKER_CONFIRMATIONS` — confs before a settlement is `Settled` (default 1).
 #[tokio::main]
 async fn main() {
+    // Load a local `.env` (BROKER_DATABASE_URL / BROKER_LISTEN / BROKER_ELECTRUM_URL
+    // / BROKER_CONFIRMATIONS) if present; real env vars still win.
+    dotenvy::dotenv().ok();
+
     let listen: SocketAddr = std::env::var("BROKER_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
         .parse()

@@ -6,6 +6,7 @@ version.workspace = true
 
 [dependencies]
 axum = { workspace = true, features = ["ws"] }
+dotenvy = "0.15"
 futures.workspace = true
 http.workspace = true
 rfq-btc = { path = "../rfq-btc", features = ["electrum"] }
