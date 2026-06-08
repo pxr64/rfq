@@ -76,12 +76,15 @@ pub(crate) type MakerWallet = RgbWallet<Wallet<XpubDerivable, RgbDescr>>;
 /// rather than created (they'd be unspendable / non-standard).
 const DUST_LIMIT_SATS: u64 = 546;
 
-/// BTC value parked on a witness-vout RGB output (the taker's "future seal").
-/// Comfortably above the dust limit so the output is standard and, crucially,
-/// still spendable later: `wallet.pay` funds a transfer only from the RGB
-/// input's own sats, so this must cover a future transfer fee + change output.
-/// The receiver recovers these sats when it spends the RGB-bearing UTXO.
-const SEAL_ANCHOR_SATS: u64 = 2_000;
+/// BTC value parked on a witness-vout RGB output (the taker's "future seal") —
+/// the dust limit. The fee for any later spend of this RGB is funded by inputs
+/// the spender APPENDS (the taker always adds the BTC inputs that pay the tx
+/// fee), not from this anchor, so it needn't exceed dust.
+///
+/// Public so the maker's buy-side funding selection covers it — a witness-vout
+/// taker's BTC inputs must fund `gross + fee + SEAL_ANCHOR_SATS`, not just
+/// `gross + fee`, or `assemble_unsigned_psbt` would overspend.
+pub const SEAL_ANCHOR_SATS: u64 = 546;
 
 /// How the counterparty's incoming RGB binds. A [`Beneficiary::BlindedSeal`]
 /// invoice rides on a pre-existing anchor UTXO (hidden from the sender); a
@@ -397,6 +400,19 @@ pub(crate) fn assemble_unsigned_psbt(
         TakerSeal::Witness(_) => SEAL_ANCHOR_SATS,
         TakerSeal::Blinded(_) => 0,
     };
+    // Backstop: never emit an overspending PSBT. If the taker's selected inputs
+    // don't cover gross + fee + anchor, reject here with a clear error rather than
+    // letting `saturating_sub` silently zero the change (which the counterparty's
+    // signer then rejects with "Outputs spends more than inputs amount").
+    let required = gross_btc_sats
+        .saturating_add(actual_fee_sats)
+        .saturating_add(taker_anchor_sats);
+    if taker_btc_total < required {
+        return Err(RgbError::TransferBuild(format!(
+            "taker funding {taker_btc_total} sats < required {required} \
+             (gross {gross_btc_sats} + fee {actual_fee_sats} + anchor {taker_anchor_sats})"
+        )));
+    }
     let taker_change = taker_btc_total
         .saturating_sub(gross_btc_sats)
         .saturating_sub(actual_fee_sats)
@@ -904,6 +920,16 @@ pub(crate) fn assemble_sell_psbt(
         .iter()
         .map(|i| i.value.into_inner())
         .sum();
+    // Backstop (mirror of the buy side): the maker must fund the gross payout +
+    // its own RGB-receive anchor. The fee is the taker's (netted from its payout),
+    // so it's not part of the maker's requirement. Reject rather than overspend.
+    let maker_required = gross_btc_sats.saturating_add(SEAL_ANCHOR_SATS);
+    if maker_btc_total < maker_required {
+        return Err(RgbError::TransferBuild(format!(
+            "maker BTC {maker_btc_total} sats < required {maker_required} \
+             (gross {gross_btc_sats} + anchor {SEAL_ANCHOR_SATS})"
+        )));
+    }
     // Fold the taker's RGB-input BTC value (seal-anchor sats) into the
     // taker's payout output so it doesn't get burned to fee (issue #25).
     // The taker keeps its own BTC: gets the agreed swap price minus the

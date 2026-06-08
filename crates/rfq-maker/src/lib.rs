@@ -630,7 +630,11 @@ impl Maker {
             };
 
         let available = self.btc_store.list_available().await;
-        let selection = match GreedyLargestFirstSelector.select(gross_btc_sats, &available) {
+        // The maker funds its own witness-vout RGB-receive anchor on top of the
+        // gross payout, so reserve gross + SEAL_ANCHOR_SATS. The network fee is the
+        // taker's — netted from its payout, not drawn from the maker's inventory.
+        let required = gross_btc_sats.saturating_add(rfq_rgb::SEAL_ANCHOR_SATS);
+        let selection = match GreedyLargestFirstSelector.select(required, &available) {
             Ok(s) => s,
             // Not enough BTC on hand — decline the quote rather than error.
             Err(_) => return Ok(None),
@@ -1235,15 +1239,23 @@ impl MakerConnector for Maker {
                 });
             }
         }
+        // The witness-vout RGB receive output the maker adds costs SEAL_ANCHOR_SATS,
+        // funded from the taker's inputs — so cover gross + fee + anchor, not just
+        // gross + fee, or the assembled PSBT overspends (the taker's signer then
+        // rejects it with "Outputs spends more than inputs amount").
+        let required_funding = quote
+            .price
+            .saturating_add(actual_fee)
+            .saturating_add(rfq_rgb::SEAL_ANCHOR_SATS);
         let taker_btc_inputs = match self.bitcoin_client.list_unspent(&btc_funding_addr).await {
-            Ok(utxos) => match select_btc_inputs(&utxos, quote.price.saturating_add(actual_fee)) {
+            Ok(utxos) => match select_btc_inputs(&utxos, required_funding) {
                 Some(selected) => selected,
                 None => {
                     let _ = self.store.release_reservation(&reservation_id, now_ms()).await;
                     return Err(RouterError::Maker(format!(
                         "taker funding address {btc_funding_addr} has insufficient BTC for \
-                         price {} + fee {actual_fee}",
-                        quote.price,
+                         price {} + fee {actual_fee} + anchor {}",
+                        quote.price, rfq_rgb::SEAL_ANCHOR_SATS,
                     )));
                 }
             },
@@ -2493,6 +2505,63 @@ mod tests {
             utxos[0].status,
             InventoryStatus::PendingBitcoinConfirm { .. }
         ));
+    }
+
+    /// A single taker funding UTXO of `value_sats` at `BUY_FUNDING_ADDR`.
+    fn funding_utxo(value_sats: u64) -> Vec<(Outpoint, TxOut)> {
+        let mut p2wpkh = vec![0x00, 0x14];
+        p2wpkh.extend(std::iter::repeat_n(0x22, 20));
+        vec![(
+            Outpoint::new(format!("{:064x}", 0xfeedu64), 0),
+            TxOut { value_sats, script_pubkey: p2wpkh },
+        )]
+    }
+
+    // Regression: the witness-vout RGB receive output costs SEAL_ANCHOR_SATS, so the
+    // taker's funding must cover price + fee + anchor. Funding only price + fee used
+    // to yield an overspending PSBT (the taker's signer then rejected it with
+    // "Outputs spends more than inputs amount"); the maker must now reject up front.
+    #[tokio::test]
+    async fn buy_rejects_funding_short_by_the_seal_anchor() {
+        let client = Arc::new(MockBitcoinClient::new());
+        let maker = maker_with_btc(vec![utxo()], Arc::clone(&client));
+        let quote = maker
+            .request_quote(quote_request("rfq-1"))
+            .await
+            .unwrap()
+            .expect("quote");
+        // price + fee, but NOT the seal anchor.
+        let short = quote.price + quote.estimated_fee_sats;
+        client.seed_address_unspent(BUY_FUNDING_ADDR, funding_utxo(short));
+
+        let err = maker
+            .accept_quote(quote.clone(), buy_request(&quote, "rgb:invoice"))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("insufficient") && msg.contains("anchor"),
+            "expected an insufficient-funding error mentioning the anchor, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn buy_accepts_funding_that_covers_price_fee_and_anchor() {
+        let client = Arc::new(MockBitcoinClient::new());
+        let maker = maker_with_btc(vec![utxo()], Arc::clone(&client));
+        let quote = maker
+            .request_quote(quote_request("rfq-1"))
+            .await
+            .unwrap()
+            .expect("quote");
+        let enough = quote.price + quote.estimated_fee_sats + rfq_rgb::SEAL_ANCHOR_SATS;
+        client.seed_address_unspent(BUY_FUNDING_ADDR, funding_utxo(enough));
+
+        let intent = maker
+            .accept_quote(quote.clone(), buy_request(&quote, "rgb:invoice"))
+            .await
+            .unwrap();
+        assert_eq!(intent.status, SettlementStatus::AwaitingTakerSignature);
     }
 
     #[tokio::test]

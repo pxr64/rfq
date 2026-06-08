@@ -12,6 +12,7 @@ mod swap;
 mod taker;
 pub use lib_backend::{LibRgbBackend, WalletUtxo};
 pub use swap::enrich_psbt_input;
+pub use swap::SEAL_ANCHOR_SATS;
 pub use taker::Taker;
 
 /// Self-bootstrapping regtest harness shared across rfq-rgb's own e2e
