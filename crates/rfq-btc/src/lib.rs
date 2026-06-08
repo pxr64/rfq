@@ -55,12 +55,24 @@ pub trait BitcoinClient: Send + Sync {
 
     /// Current best block height.
     async fn block_height(&self) -> Result<u32, BtcError>;
+
+    /// Confirmation status of `txid`: `confirmed = false` for a mempool or
+    /// unknown tx; `height` is the block once mined. The broker's settlement
+    /// confirmation loop polls this to flip `PendingBitcoinConfirm → Settled`.
+    async fn tx_status(&self, txid: &str) -> Result<TxConfirmation, BtcError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxOut {
     pub value_sats: u64,
     pub script_pubkey: Vec<u8>,
+}
+
+/// On-chain status of a transaction. `height` is `Some` only when `confirmed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxConfirmation {
+    pub confirmed: bool,
+    pub height: Option<u32>,
 }
 
 #[derive(Debug, Error)]

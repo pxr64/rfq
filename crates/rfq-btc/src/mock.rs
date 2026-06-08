@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use rfq_types::Outpoint;
 
-use crate::{is_segwit_script, BitcoinClient, BtcError, TxOut};
+use crate::{is_segwit_script, BitcoinClient, BtcError, TxConfirmation, TxOut};
 
 /// In-memory test double. Backs a `HashMap` of seeded prevouts, captures
 /// broadcasts, returns the configured feerate / height.
@@ -33,6 +33,9 @@ struct MockState {
     /// `Some(_)` makes the next broadcast call fail with the contained error
     /// message and then clears the slot.
     next_broadcast_error: Option<String>,
+    /// Per-txid confirmation status surfaced by `tx_status`; unseeded txids read
+    /// back as unconfirmed (mempool/unknown).
+    tx_status: HashMap<String, TxConfirmation>,
 }
 
 impl Default for MockBitcoinClient {
@@ -95,6 +98,16 @@ impl MockBitcoinClient {
         self.state.lock().expect("mock state lock").next_broadcast_error = Some(reason.into());
     }
 
+    /// Seed the `tx_status(txid)` result on an already-shared client (e.g. a
+    /// confirmation-loop test promoting a witness from mempool to mined).
+    pub fn seed_tx_status(&self, txid: impl Into<String>, status: TxConfirmation) {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .tx_status
+            .insert(txid.into(), status);
+    }
+
     /// Seed the `list_unspent(address)` result on an already-shared client.
     /// `&self` counterpart to the consuming `with_address_unspent` builder, for
     /// callers holding an `Arc<MockBitcoinClient>`.
@@ -150,6 +163,17 @@ impl BitcoinClient for MockBitcoinClient {
 
     async fn block_height(&self) -> Result<u32, BtcError> {
         Ok(self.state.lock().expect("mock state lock").block_height)
+    }
+
+    async fn tx_status(&self, txid: &str) -> Result<TxConfirmation, BtcError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("mock state lock")
+            .tx_status
+            .get(txid)
+            .copied()
+            .unwrap_or(TxConfirmation { confirmed: false, height: None }))
     }
 }
 
@@ -268,5 +292,21 @@ mod tests {
     async fn list_unspent_returns_empty_for_unseeded_address() {
         let client = MockBitcoinClient::new();
         assert_eq!(client.list_unspent("bcrt1qnope").await.unwrap(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn tx_status_defaults_unconfirmed_then_reflects_seed() {
+        let client = MockBitcoinClient::new();
+        // Unseeded → mempool/unknown.
+        assert_eq!(
+            client.tx_status("wt1").await.unwrap(),
+            TxConfirmation { confirmed: false, height: None }
+        );
+        // Promote it to mined.
+        client.seed_tx_status("wt1", TxConfirmation { confirmed: true, height: Some(142) });
+        assert_eq!(
+            client.tx_status("wt1").await.unwrap(),
+            TxConfirmation { confirmed: true, height: Some(142) }
+        );
     }
 }

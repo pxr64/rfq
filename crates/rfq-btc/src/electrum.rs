@@ -20,7 +20,7 @@ use electrum_client::bitcoin::Txid;
 use electrum_client::{Client, ConfigBuilder, ElectrumApi};
 use rfq_types::Outpoint;
 
-use crate::{is_segwit_script, BitcoinClient, BtcError, TxOut};
+use crate::{is_segwit_script, BitcoinClient, BtcError, TxConfirmation, TxOut};
 
 pub struct ElectrumClient {
     client: Arc<Client>,
@@ -143,5 +143,41 @@ impl BitcoinClient for ElectrumClient {
             .map_err(|e| BtcError::Backend(format!("blocking task join: {e}")))?
             .map_err(|e| BtcError::Backend(format!("electrum block_headers_subscribe: {e}")))?;
         Ok(header.height as u32)
+    }
+
+    async fn tx_status(&self, txid: &str) -> Result<TxConfirmation, BtcError> {
+        let parsed = Txid::from_str(txid)
+            .map_err(|e| BtcError::Backend(format!("invalid txid {txid}: {e}")))?;
+        let client = Arc::clone(&self.client);
+        tokio::task::spawn_blocking(move || -> Result<TxConfirmation, BtcError> {
+            // romanz/electrs exposes neither a verbose `transaction.get` nor a
+            // direct txid→height, so resolve the height via the history of one of
+            // the tx's own output scripts (`script.get_history` returns height>0 for
+            // a mined entry, 0 for mempool).
+            let tx = match client.transaction_get(&parsed) {
+                Ok(tx) => tx,
+                // Unknown to the node (never broadcast / evicted) → not confirmed.
+                Err(_) => return Ok(TxConfirmation { confirmed: false, height: None }),
+            };
+            for out in &tx.output {
+                if out.script_pubkey.is_empty() {
+                    continue;
+                }
+                let history = client
+                    .script_get_history(&out.script_pubkey)
+                    .map_err(|e| BtcError::Backend(format!("electrum script_get_history: {e}")))?;
+                if let Some(entry) = history.iter().find(|h| h.tx_hash == parsed) {
+                    return Ok(if entry.height > 0 {
+                        TxConfirmation { confirmed: true, height: Some(entry.height as u32) }
+                    } else {
+                        TxConfirmation { confirmed: false, height: None }
+                    });
+                }
+            }
+            // Known to the node but not yet in any output's history → mempool.
+            Ok(TxConfirmation { confirmed: false, height: None })
+        })
+        .await
+        .map_err(|e| BtcError::Backend(format!("blocking task join: {e}")))?
     }
 }
