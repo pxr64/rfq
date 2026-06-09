@@ -135,6 +135,19 @@ impl Taker {
             .await
     }
 
+    /// Export a **provenance** consignment for the taker's own `outpoints` — the
+    /// sell-leg primitive: the taker proves its RGB + history, the maker spends
+    /// those outpoints into the swap tx. No PSBT, no fee, no anchor. See
+    /// [`LibRgbBackend::export_provenance`] and
+    /// `docs/provenance-consignment-proposal.md`.
+    pub fn export_provenance(
+        &self,
+        contract: &str,
+        outpoints: &[String],
+    ) -> Result<String, RgbError> {
+        self.lib_backend().export_provenance(contract, outpoints)
+    }
+
     /// Look up a specific taker UTXO and return its `(Outpoint, TxOut)`. Used
     /// to resolve the RGB-input prevouts a validated sell consignment reports.
     pub fn lookup_prevout(&self, want: &Outpoint) -> Result<(Outpoint, TxOut), RgbError> {

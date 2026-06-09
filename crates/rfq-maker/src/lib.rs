@@ -5,7 +5,8 @@ use std::{
 
 use async_trait::async_trait;
 use rfq_btc::BitcoinClient;
-use rfq_rgb::{RgbBackend, TxOut};
+use rfq_rgb::{ContractId, RgbBackend, TxOut};
+use std::str::FromStr as _;
 use rfq_router::{MakerConnector, RouterError};
 use rfq_store::{
     BtcCoinSelector, BtcInventoryStore, ConsignmentRecord, ConsignmentStore,
@@ -638,7 +639,17 @@ impl Maker {
             {
                 PriceLookup::Price(p) => p.saturating_mul(amount),
                 PriceLookup::Fallback => amount.saturating_mul(DEFAULT_UNIT_PRICE_SATS),
-                PriceLookup::Decline => return Ok(None),
+                // Surface the silent decline (else a sell returns no quote and
+                // "looks broken"): the standing order exists but the requested
+                // amount is over its size.
+                PriceLookup::Decline => {
+                    eprintln!(
+                        "declining sell quote: amount {amount} over the sell order's max size \
+                         for asset {} — raise the order size or sell less",
+                        request.base_asset.id,
+                    );
+                    return Ok(None);
+                }
             };
 
         let available = self.btc_store.list_available().await;
@@ -677,21 +688,12 @@ impl Maker {
             Err(_) => return Ok(None),
         };
 
-        // Mint the maker's RGB invoice. On failure, hand the BTC back.
-        let maker_rgb_invoice = match self
-            .rgb_backend
-            .create_invoice(&request.base_asset, amount)
-            .await
-        {
-            Ok(inv) => inv,
-            Err(e) => {
-                let _ = self
-                    .btc_store
-                    .release_reservation(&reservation_id, now_ms())
-                    .await;
-                return Err(RouterError::Maker(e.to_string()));
-            }
-        };
+        // No maker invoice (provenance model): the taker exports a provenance
+        // consignment for its own outpoints and names them on the wire; the maker
+        // mints nothing and needs no spare anchor. The `reservation_id` holds the
+        // maker's BTC payout until /consignment. See
+        // docs/provenance-consignment-proposal.md.
+        let _ = reservation_id;
 
         Ok(Some(Quote {
             quote_id,
@@ -705,7 +707,7 @@ impl Maker {
             expires_at_ms,
             estimated_fee_sats: self.estimate_swap_fee().await,
             fee_slippage_bps: 2000,
-            maker_rgb_invoice: Some(maker_rgb_invoice),
+            maker_rgb_invoice: None,
         }))
     }
 
@@ -787,6 +789,7 @@ impl Maker {
         &self,
         quote_id: QuoteId,
         consignment_base64: String,
+        consigned_outpoints: Vec<Outpoint>,
     ) -> Result<SettlementIntent, RouterError> {
         self.btc_store.release_expired_reservations(now_ms()).await;
 
@@ -816,28 +819,23 @@ impl Maker {
         };
 
         let quote = &pending.quote;
-        let maker_rgb_invoice = quote.maker_rgb_invoice.clone().ok_or_else(|| {
-            RouterError::Maker("sell quote is missing its maker RGB invoice".to_owned())
+        // Provenance model (no maker invoice): the contract is the quote's base
+        // asset; the taker names the outpoints it's selling on the wire and the
+        // consignment proves their provenance. See
+        // docs/provenance-consignment-proposal.md.
+        let contract_id = ContractId::from_str(&quote.base_asset.id).map_err(|e| {
+            RouterError::Maker(format!("quote carries an invalid contract id: {e}"))
         })?;
 
-        // Round-trip the maker's own invoice back into typed components for
-        // `create_swap_psbt_sell` below. Done once here so the backend doesn't
-        // re-parse the wire string it just minted.
-        let maker_invoice_parts = self
-            .rgb_backend
-            .parse_maker_invoice(&maker_rgb_invoice)
-            .await
-            .map_err(|e| RouterError::Maker(format!("maker invoice parse: {e}")))?;
-
-        // Validate the consignment against the contract the maker quoted.
-        // Uses the typed `contract_id` from `parse_maker_invoice` above to
-        // avoid the self-round-trip of re-parsing the maker's own invoice
-        // string inside the backend.
+        // Validate the consignment + confirm the named outpoints carry the RGB.
+        // (Chain existence / unspent + prevout come from `get_outpoint` just below;
+        // the taker's signature authorizes the spend at /sign.)
         let info = match self
             .rgb_backend
             .validate_incoming_consignment(
                 &consignment_base64,
-                maker_invoice_parts.contract_id,
+                contract_id,
+                &consigned_outpoints,
             )
             .await
         {
@@ -916,17 +914,20 @@ impl Maker {
         }
 
         // Build the swap PSBT (maker BTC inputs signed in the mock string).
-        // `deliver_amount` falls back to the consigned total when the maker's
-        // invoice was minted amountless (current `create_invoice` always pins
-        // an amount, but the fallback keeps us future-proof).
-        let deliver_amount = maker_invoice_parts.amount.unwrap_or(info.total_amount);
+        // `deliver_amount` is the RGB amount the taker is selling (the quote
+        // amount); falls back to the consigned total if the quote omitted it.
+        let deliver_amount = if quote.amount > 0 {
+            quote.amount
+        } else {
+            info.total_amount
+        };
         let transfer = match self
             .rgb_backend
             .create_swap_psbt_sell(
                 &info,
                 &taker_rgb_prevouts,
                 &maker_btc_inputs,
-                maker_invoice_parts.contract_id,
+                contract_id,
                 deliver_amount,
                 &pending.btc_payout_addr,
                 pending.rgb_change_invoice.as_deref(),
@@ -1116,7 +1117,14 @@ impl MakerConnector for Maker {
             {
                 PriceLookup::Price(p) => p,
                 PriceLookup::Fallback => DEFAULT_UNIT_PRICE_SATS,
-                PriceLookup::Decline => return Ok(None),
+                PriceLookup::Decline => {
+                    eprintln!(
+                        "declining buy quote: amount {} over the buy order's max size for asset {} \
+                         — raise the order size or buy less",
+                        request.amount, request.base_asset.id,
+                    );
+                    return Ok(None);
+                }
             };
 
         // Exclusion-based retry: when a reservation fails because another
@@ -1474,8 +1482,9 @@ impl MakerConnector for Maker {
         &self,
         quote_id: QuoteId,
         consignment_base64: String,
+        consigned_outpoints: Vec<Outpoint>,
     ) -> Result<SettlementIntent, RouterError> {
-        self.deliver_consignment_sell(quote_id, consignment_base64)
+        self.deliver_consignment_sell(quote_id, consignment_base64, consigned_outpoints)
             .await
     }
 }
@@ -1558,7 +1567,7 @@ mod tests {
         AssetId {
             network: BitcoinNetwork::Regtest,
             kind: AssetKind::Rgb20,
-            id: "rgb-test-asset".to_owned(),
+            id: "rgb:eejuoPHh-agACtkj-6j2JkSs-cI4PIwm-CzKGJ7v-1s~IrX0".to_owned(),
         }
     }
 
@@ -1802,7 +1811,8 @@ mod tests {
         }
     }
 
-    /// A mock-valid taker consignment against `quote`'s maker RGB invoice.
+    /// A mock-valid taker **provenance** consignment for `outpoints` (the format
+    /// the `MockRgbBackend` parses). No maker invoice — provenance model.
     fn sell_consignment(quote: &Quote, outpoints: &[Outpoint]) -> String {
         let csv = outpoints
             .iter()
@@ -1810,22 +1820,22 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            "mock-consignment|sell|invoice={}|amount={}|outpoints={csv}",
-            quote.maker_rgb_invoice.as_deref().unwrap(),
+            "mock-consignment|sell|amount={}|outpoints={csv}",
             quote.amount,
         )
     }
 
     #[tokio::test]
-    async fn sell_quote_carries_maker_rgb_invoice() {
+    async fn sell_quote_carries_no_maker_invoice() {
         let quote = sell_maker()
             .request_quote(sell_quote_request("rfq-sell"))
             .await
             .unwrap()
             .expect("a BTC-funded maker quotes the sell side");
 
-        // Sell side: the taker needs an invoice to build a consignment against.
-        assert!(quote.maker_rgb_invoice.is_some());
+        // Provenance model: the maker mints no invoice; the taker exports provenance
+        // for its own outpoints and names them on the wire.
+        assert!(quote.maker_rgb_invoice.is_none());
     }
 
     #[tokio::test]
@@ -1867,7 +1877,7 @@ mod tests {
         let consignment =
             sell_consignment(&quote, &[taker_rgb_outpoint(0), taker_rgb_outpoint(1)]);
         let delivered = maker
-            .deliver_consignment(quote.quote_id.clone(), consignment)
+            .deliver_consignment(quote.quote_id.clone(), consignment, vec![])
             .await
             .unwrap();
         assert_eq!(delivered.status, SettlementStatus::AwaitingTakerSignature);
@@ -1911,7 +1921,7 @@ mod tests {
             .unwrap();
 
         let result = maker
-            .deliver_consignment(quote.quote_id.clone(), "rgb-invalid".to_owned())
+            .deliver_consignment(quote.quote_id.clone(), "rgb-invalid".to_owned(), vec![])
             .await;
         assert!(matches!(result, Err(RouterError::ConsignmentRejected(_))));
         // The BTC reservation was handed back.
@@ -1945,7 +1955,7 @@ mod tests {
 
         let consignment = sell_consignment(&quote, &[taker_rgb_outpoint(0)]);
         let result = maker
-            .deliver_consignment(quote.quote_id.clone(), consignment)
+            .deliver_consignment(quote.quote_id.clone(), consignment, vec![])
             .await;
         assert!(result.is_err());
     }
@@ -1969,7 +1979,7 @@ mod tests {
 
         let consignment = sell_consignment(&quote, &[taker_rgb_outpoint(0)]);
         let result = maker
-            .deliver_consignment(quote.quote_id.clone(), consignment)
+            .deliver_consignment(quote.quote_id.clone(), consignment, vec![])
             .await;
         assert!(matches!(
             result,
@@ -1993,7 +2003,7 @@ mod tests {
         let consignment =
             sell_consignment(&quote, &[taker_rgb_outpoint(0), taker_rgb_outpoint(1)]);
         let delivered = maker
-            .deliver_consignment(quote.quote_id.clone(), consignment)
+            .deliver_consignment(quote.quote_id.clone(), consignment, vec![])
             .await
             .unwrap();
         let psbt = delivered.transfer.expect("transfer").partial_psbt;
@@ -2021,7 +2031,7 @@ mod tests {
             .unwrap();
         let consignment = sell_consignment(&quote, &[taker_rgb_outpoint(0)]);
         let delivered = maker
-            .deliver_consignment(quote.quote_id.clone(), consignment)
+            .deliver_consignment(quote.quote_id.clone(), consignment, vec![])
             .await
             .unwrap();
         let transfer = delivered.transfer.expect("transfer");
@@ -2052,7 +2062,7 @@ mod tests {
             .unwrap();
         let consignment = sell_consignment(&quote, &[taker_rgb_outpoint(0)]);
         let delivered = maker
-            .deliver_consignment(quote.quote_id.clone(), consignment)
+            .deliver_consignment(quote.quote_id.clone(), consignment, vec![])
             .await
             .unwrap();
         let psbt = delivered.transfer.expect("transfer").partial_psbt;

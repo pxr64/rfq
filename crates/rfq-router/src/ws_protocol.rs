@@ -12,7 +12,7 @@
 //! All frames are JSON text frames.
 
 use rfq_types::{
-    AcceptQuoteRequest, AssetInfo, BitcoinNetwork, MakerId, OrderPrice, Quote, QuoteId,
+    AcceptQuoteRequest, AssetInfo, BitcoinNetwork, MakerId, OrderPrice, Outpoint, Quote, QuoteId,
     QuoteRequest, SettlementIntent,
 };
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,10 @@ pub enum WsOp {
     DeliverConsignment {
         quote_id: QuoteId,
         consignment: String,
+        /// The taker's RGB UTXOs being sold (provenance model — the consignment
+        /// proves the asset, the taker names which outpoints it offers).
+        #[serde(default)]
+        outpoints: Vec<Outpoint>,
     },
     SubmitSignedPsbt {
         quote_id: QuoteId,

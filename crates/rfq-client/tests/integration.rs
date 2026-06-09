@@ -27,7 +27,7 @@ fn rgb_asset() -> AssetId {
     AssetId {
         network: BitcoinNetwork::Regtest,
         kind: AssetKind::Rgb20,
-        id: "rgb-test-asset".to_owned(),
+        id: "rgb:eejuoPHh-agACtkj-6j2JkSs-cI4PIwm-CzKGJ7v-1s~IrX0".to_owned(),
     }
 }
 
@@ -93,8 +93,8 @@ async fn sell_quote_accepts_and_rejects_a_bad_consignment() {
     let quotes = client.request_quotes(rfq(Side::Sell)).await.unwrap();
     let quote = &quotes[0];
     assert!(
-        quote.maker_rgb_invoice.is_some(),
-        "sell quotes carry the maker's RGB invoice",
+        quote.maker_rgb_invoice.is_none(),
+        "provenance model: sell quotes carry no maker invoice",
     );
 
     let intent = client
@@ -111,7 +111,7 @@ async fn sell_quote_accepts_and_rejects_a_bad_consignment() {
 
     // Exercises `submit_consignment`: a malformed consignment is rejected.
     let result = client
-        .submit_consignment(quote.quote_id.clone(), "not-a-consignment".to_owned())
+        .submit_consignment(quote.quote_id.clone(), "not-a-consignment".to_owned(), vec![])
         .await;
     assert!(matches!(result, Err(RfqClientError::HttpStatus { .. })));
 }

@@ -7,14 +7,14 @@ use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, SwapTransfer};
 
 use bpstd::psbt::Psbt;
 use bpstd::signers::TestnetRefSigner;
-use bpstd::{HardenedIndex, Keychain, Network, Sats, Txid, XprivAccount, XpubDerivable};
+use bpstd::{HardenedIndex, Keychain, Network, Sats, XprivAccount, XpubDerivable};
 use bpwallet::fs::FsTextStore;
 use bpwallet::hot::{SecureIo, Seed, SeedType};
 use bpwallet::{Bip43, Wallet};
 use psrgbt::PsbtConstructor;
 use amplify::Wrapper as _;
 use base64::Engine as _;
-use rgb::containers::{ConsignmentExt, FileContent, Kit, Transfer, ValidConsignment};
+use rgb::containers::{ConsignmentExt, FileContent, Kit, Transfer};
 use rgb::contract::FilterIncludeAll;
 use rgb::invoice::{
     Beneficiary, InvoiceState, Pay2Vout, Precision, RgbInvoice, RgbInvoiceBuilder, XChainNet,
@@ -25,9 +25,8 @@ use rgb::resolvers::{AnyResolver, ContractIssueResolver};
 use rgb::stl::{AssetSpec, ContractTerms, RicardianContract};
 use rgb::validation::{ResolveWitness, ValidationConfig, Validity};
 use rgb::{
-    Amount, AssignmentsRef, BundleId, ChainNet, ContractId, Genesis, GenesisSeal, GraphSeal,
-    Identity, Operation, OpId, OutputSeal, RgbDescr, RgbKeychain, RgbWallet, StateType, TapretKey,
-    Transition, TransferParams, TxoSeal,
+    Amount, ChainNet, ContractId, GenesisSeal, GraphSeal, Identity, OutputSeal, RgbDescr,
+    RgbKeychain, RgbWallet, StateType, TapretKey, TransferParams,
 };
 
 use crate::swap;
@@ -61,6 +60,15 @@ pub struct LibRgbBackend {
     signer_account_file: PathBuf,
     #[allow(dead_code)]
     signer_password: String,
+    // Serializes ALL stock/wallet file access. The `FsBinStore`/`FsTextStore`
+    // back the stock + bp-wallet as files, and `Stock::load(_, true)` autosaves on
+    // drop — so two concurrent operations (the 5s chain-observer loop vs a request
+    // handler) interleave a read with a half-written file → "unexpected end of
+    // file". Every method that loads the stock/wallet holds this first (declared
+    // before the stock local, so it releases AFTER the autosave-on-drop). The
+    // guarded bodies are synchronous (no `.await` while held), so the futures stay
+    // `Send`. See `guard()`.
+    stock_lock: std::sync::Mutex<()>,
 }
 
 impl LibRgbBackend {
@@ -79,7 +87,18 @@ impl LibRgbBackend {
             electrum_url,
             signer_account_file,
             signer_password,
+            stock_lock: std::sync::Mutex::new(()),
         }
+    }
+
+    /// Acquire the stock-access lock, recovering from a poisoned mutex (a prior
+    /// panic mid-operation shouldn't wedge the maker — the next load re-reads the
+    /// file from scratch anyway). Bind this FIRST in any method that loads the
+    /// stock/wallet so it outlives the autosave-on-drop.
+    fn guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.stock_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Create a fresh taproot (tapret) RGB wallet + an empty Stock on disk,
@@ -266,6 +285,7 @@ impl LibRgbBackend {
     /// Read the contract's ticker + precision (decimal places) from its `spec`
     /// global state — for human-readable inventory display (`COLX 1.00`).
     pub fn contract_spec(&self, asset: &AssetId) -> Result<(String, u8), RgbError> {
+        let _guard = self.guard();
         let stock = self.load_stock()?;
         let contract_id = ContractId::from_str(&asset.id)
             .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
@@ -340,6 +360,7 @@ impl LibRgbBackend {
         consignment_base64: &str,
         expected_contract_id: ContractId,
     ) -> Result<(), RgbError> {
+        let _guard = self.guard();
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(consignment_base64.trim())
             .map_err(|e| {
@@ -471,6 +492,7 @@ impl LibRgbBackend {
     /// full `sync_from_scratch`. Persists via `Wallet`'s autosave-on-drop
     /// (the wallet handle is dropped at end of fn).
     pub async fn sync_wallet(&self) -> Result<(), RgbError> {
+        let _guard = self.guard();
         use bpwallet::AnyIndexer;
         // bp-electrum exports its lib as `electrum` (vs `electrum-client`'s
         // `electrum_client`); they're distinct crates. bp-wallet's
@@ -498,6 +520,7 @@ impl LibRgbBackend {
     /// balance, and the keychain distinguishes the BTC (0) vs RGB-anchor (10)
     /// addresses. Mirrors `sync_wallet`'s incremental update.
     pub async fn wallet_balance(&self) -> Result<Vec<WalletUtxo>, RgbError> {
+        let _guard = self.guard();
         use bpstd::IdxBase as _;
         use bpwallet::AnyIndexer;
         let mut wallet = self.load_wallet()?;
@@ -633,6 +656,52 @@ impl LibRgbBackend {
         Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
     }
 
+    /// Export the **provenance** of the caller's own allocation(s) at `outpoints` —
+    /// the consignment a holder hands a counterparty so the counterparty can spend
+    /// that allocation in a transaction *it* builds (the sell leg of a swap). Unlike
+    /// a `wallet.pay` consignment it **spends nothing, touches no chain, and
+    /// references no counterparty seal**: it terminates on the holder's *own*
+    /// witness-vout outpoints. Generalizes [`Self::reconsign`] to multiple outpoints.
+    /// See `docs/provenance-consignment-proposal.md`. Witness-vout (explicit
+    /// `txid:vout`) seals only. Returns the base64 consignment.
+    pub fn export_provenance(&self, contract: &str, outpoints: &[String]) -> Result<String, RgbError> {
+        let _guard = self.guard();
+        let contract_id = ContractId::from_str(contract)
+            .map_err(|e| RgbError::TransferBuild(format!("bad contract id {contract}: {e}")))?;
+        let seals: Vec<OutputSeal> = outpoints
+            .iter()
+            .map(|o| {
+                OutputSeal::from_str(o)
+                    .map_err(|e| RgbError::TransferBuild(format!("bad outpoint {o}: {e}")))
+            })
+            .collect::<Result<_, _>>()?;
+        if seals.is_empty() {
+            return Err(RgbError::TransferBuild(
+                "export_provenance: no outpoints supplied".to_owned(),
+            ));
+        }
+        // Witness-vout: the seal's txid IS the witness tx the consignment anchors to.
+        // If every outpoint shares one witness tx, pass it (the `reconsign` hint);
+        // otherwise let the stock walk the full witness graph.
+        let first = seals[0].txid;
+        let witness_id = if seals.iter().all(|s| s.txid == first) {
+            Some(first)
+        } else {
+            None
+        };
+
+        let stock = self.load_stock()?;
+        let transfer = stock
+            .transfer(contract_id, seals, [], [], witness_id)
+            .map_err(|e| RgbError::TransferBuild(format!("export provenance transfer: {e}")))?;
+
+        let mut bytes = Vec::new();
+        transfer
+            .save(&mut bytes)
+            .map_err(|e| RgbError::TransferBuild(format!("serialize consignment: {e}")))?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
     /// Wallet-derived BTC inventory: every spendable wallet UTXO that is
     /// **not** carrying an RGB allocation for `asset`. Replaces the hardcoded
     /// `mock_btc_inventory()` in `maker-node/src/main.rs`. Each returned
@@ -647,6 +716,7 @@ impl LibRgbBackend {
         asset: &AssetId,
         now_ms: u64,
     ) -> Result<Vec<rfq_types::BtcInventoryUtxo>, RgbError> {
+        let _guard = self.guard();
         use bpstd::Derive as _;
         let wallet = self.load_wallet()?;
         let contract_id = ContractId::from_str(&asset.id)
@@ -734,105 +804,6 @@ fn chain_net_for(network: Network) -> ChainNet {
     }
 }
 
-/// Either a genesis or a transition operation, paired with its anchoring
-/// witness txid where applicable. Used as a lookup target when resolving
-/// an [`Opout`](rgb::Opout) back to the bitcoin outpoint that carries the
-/// referenced RGB allocation.
-enum OpRef<'a> {
-    /// Genesis seals are explicit (`outpoint_or` returns the seal's own
-    /// outpoint regardless of the txid passed); the dummy txid is only here
-    /// to keep the call site uniform with the transition arm.
-    Genesis(&'a Genesis),
-    /// A state transition + its bundle's witness txid. Witness-vout seals
-    /// resolve against this txid via `seal.outpoint_or(txid)`.
-    Transition(&'a Transition, Txid),
-}
-
-/// Walk a validated transfer's terminal transitions, resolve each input
-/// [`Opout`](rgb::Opout) back to the bitcoin outpoint carrying the spent
-/// RGB allocation, and sum the consumed amounts. Returns
-/// `(total_amount, input_outpoints)` for [`ConsignmentInfo`].
-///
-/// "Terminal" here means transitions belonging to a bundle listed in
-/// `validated.terminals` (the bundles whose outputs include the recipient's
-/// seal — the "leaves" of the consignment graph). The non-terminal history
-/// (earlier transitions back to genesis) is still present in the
-/// consignment for validation purposes but its inputs are irrelevant to
-/// the swap PSBT: the swap only spends from outpoints carrying RGB *now*.
-fn extract_input_outpoints(
-    validated: &ValidConsignment<true>,
-) -> Result<(u64, Vec<Outpoint>), RgbError> {
-    use std::collections::{BTreeSet, HashMap};
-
-    // Index every operation in the consignment by OpId so we can hop from
-    // an Opout's `op` field back to the assignments it references.
-    let mut op_lookup: HashMap<OpId, OpRef<'_>> = HashMap::new();
-    op_lookup.insert(validated.genesis.id(), OpRef::Genesis(&validated.genesis));
-    for wb in validated.bundled_witnesses() {
-        let witness_txid = wb.pub_witness.txid();
-        for known in &wb.bundle.known_transitions {
-            op_lookup.insert(
-                known.transition.id(),
-                OpRef::Transition(&known.transition, witness_txid),
-            );
-        }
-    }
-
-    let terminal_bundle_ids: BTreeSet<BundleId> =
-        validated.terminals.keys().copied().collect();
-
-    let mut input_outpoints = Vec::new();
-    let mut total_amount: u64 = 0;
-    for wb in validated.bundled_witnesses() {
-        if !terminal_bundle_ids.contains(&wb.bundle.bundle_id()) {
-            continue;
-        }
-        for known in &wb.bundle.known_transitions {
-            for opout in known.transition.inputs.iter() {
-                let prior_op = op_lookup.get(&opout.op).ok_or_else(|| {
-                    RgbError::TransferBuild(format!(
-                        "consignment opout references unknown op {}",
-                        opout.op
-                    ))
-                })?;
-                let (assignments_ref, witness_txid) = match prior_op {
-                    OpRef::Genesis(g) => (
-                        AssignmentsRef::from(&g.assignments),
-                        Txid::coinbase(),
-                    ),
-                    OpRef::Transition(tx, witness_txid) => {
-                        (AssignmentsRef::from(&tx.assignments), *witness_txid)
-                    }
-                };
-                let ta = assignments_ref.get(opout.ty).ok_or_else(|| {
-                    RgbError::TransferBuild(format!(
-                        "opout {} references missing assignment type",
-                        opout
-                    ))
-                })?;
-                let seal = ta.revealed_seal_at(opout.no).map_err(|_| {
-                    RgbError::TransferBuild(format!(
-                        "opout {} index out of bounds for prior assignment",
-                        opout
-                    ))
-                })?;
-                if let Some(seal) = seal {
-                    let op = seal.outpoint_or(witness_txid);
-                    input_outpoints.push(Outpoint {
-                        txid: op.txid.to_string(),
-                        vout: op.vout.into_u32(),
-                    });
-                    if let Ok(state) = ta.as_fungible_state_at(opout.no) {
-                        total_amount =
-                            total_amount.saturating_add(state.as_inner().as_u64());
-                    }
-                }
-            }
-        }
-    }
-
-    Ok((total_amount, input_outpoints))
-}
 
 #[async_trait]
 impl RgbBackend for LibRgbBackend {
@@ -845,6 +816,7 @@ impl RgbBackend for LibRgbBackend {
         &self,
         asset: &AssetId,
     ) -> Result<Vec<RgbInventoryUtxo>, RgbError> {
+        let _guard = self.guard();
         // NB: the wallet UTXO set here is the on-disk cache — `load_wallet` does
         // no network sync. A long-running maker-node must refresh it in its
         // lifecycle (see "Wallet UTXO-cache sync" in docs/broker-maker-node-roadmap.md).
@@ -914,6 +886,7 @@ impl RgbBackend for LibRgbBackend {
         gross_btc_sats: u64,
         actual_fee_sats: u64,
     ) -> Result<SwapTransfer, RgbError> {
+        let _guard = self.guard();
         let account = self.load_signer()?;
         let mut wallet = self.load_wallet()?;
 
@@ -952,6 +925,7 @@ impl RgbBackend for LibRgbBackend {
         signed_psbt_base64: &str,
         original_consignment_base64: &str,
     ) -> Result<FinalizedSwap, RgbError> {
+        let _guard = self.guard();
         // Maker descriptor is needed to finalize the maker's own inputs
         // (sign_maker_inputs leaves them with partial_sigs only). The taker's
         // inputs should already be finalized on its end.
@@ -969,6 +943,7 @@ impl RgbBackend for LibRgbBackend {
     }
 
     async fn create_invoice(&self, asset: &AssetId, amount: u64) -> Result<String, RgbError> {
+        let _guard = self.guard();
         // Mirrors rgb-cmd's `Invoice` command for the fungible case: prefer a
         // blinded seal on a pre-existing keychain-10 anchor; when none is
         // available, fall back to a witness-vout "future seal" so the receiver
@@ -1028,16 +1003,15 @@ impl RgbBackend for LibRgbBackend {
                     .map_err(|e| RgbError::TransferBuild(format!("store seal: {e}")))?;
                 Beneficiary::BlindedSeal(seal.to_secret_seal())
             }
-            // Fallback: no anchor available → a witness-vout "future seal" on a
-            // fresh keychain-10 (Tapret) address. The RGB lands on a NEW output
-            // of the swap tx (bound by the sender against the post-sort vout), so
-            // no pre-funded anchor is needed. This receive output is NOT the
-            // tapret host (only the sender's output is), so it isn't tweaked — we
-            // recognize it by plain wallet ownership once the swap confirms.
+            // Fallback: no free anchor → a witness-vout "future seal" on a fresh
+            // keychain-10 (Tapret) address. Valid for a plain receive (the RGB lands
+            // on a NEW output of the broadcast tx the sender builds). NOTE: this is
+            // NOT used for the sell-side maker invoice anymore — sells use the
+            // provenance pattern (the taker exports provenance + names its outpoints;
+            // see docs/provenance-consignment-proposal.md), so the maker mints no
+            // invoice at all and never needs a spare anchor.
             None => {
-                let addr = wallet
-                    .wallet_mut()
-                    .next_address(RgbKeychain::Tapret, true);
+                let addr = wallet.wallet_mut().next_address(RgbKeychain::Tapret, true);
                 Beneficiary::WitnessVout(Pay2Vout::new(addr.payload), None)
             }
         };
@@ -1093,7 +1067,9 @@ impl RgbBackend for LibRgbBackend {
         &self,
         consignment_base64: &str,
         expected_contract_id: ContractId,
+        consigned_outpoints: &[Outpoint],
     ) -> Result<ConsignmentInfo, RgbError> {
+        let _guard = self.guard();
         // Mirrors rgb-cmd's `Validate`/`Accept` path: decode → validate the
         // state transition against the resolver + the maker's typesystem →
         // cross-check the contract id matches the maker's invoice. The
@@ -1148,25 +1124,44 @@ impl RgbBackend for LibRgbBackend {
             )));
         }
 
-        // Walk the terminal transitions' *input* Opouts and resolve each
-        // back to the bitcoin outpoint that currently carries the RGB.
-        // These are the outpoints `create_swap_psbt_sell` will pin as PSBT
-        // inputs. Output assignments (the consignment's destinations —
-        // maker's blinded seal + the taker's witness-vout change seal) are
-        // *not* what we want here: they reference a witness tx that hasn't
-        // broadcast yet, so they're not in any wallet's UTXO set.
-        let (total_amount, outpoints) = extract_input_outpoints(&validated)?;
-
-        // Absorb the consignment into the maker's stash so the taker's
-        // allocations are visible to `create_swap_psbt_sell` later (it spends
-        // them into the maker's seal). Mirrors rgb-cmd's Validate+Accept pair.
+        // Absorb the consignment so the taker's allocations + their full history
+        // enter the maker's stash; `create_swap_psbt_sell` then spends them into the
+        // maker's seal. A provenance consignment delivers to the taker's OWN
+        // outpoints, which the taker names on the wire (`consigned_outpoints`) — the
+        // consignment records provenance, not which outpoints the holder is offering
+        // (see docs/provenance-consignment-proposal.md). Accept first, then confirm.
         stock
             .accept_transfer(validated, &resolver)
             .map_err(|e| RgbError::StashLoad(format!("accept_transfer: {e}")))?;
 
+        // Confirm the claimed RGB actually sits at the named outpoints, and sum it.
+        // `contract.fungible` only surfaces allocations the stash truly holds, so a
+        // taker naming an outpoint the consignment didn't convey contributes 0 — the
+        // swap can't over-spend. The chain/ownership/signature checks happen upstream
+        // (`get_outpoint` in rfq-maker + the taker's signature at /sign).
+        let wanted: std::collections::HashSet<(String, u32)> = consigned_outpoints
+            .iter()
+            .map(|o| (o.txid.clone(), o.vout))
+            .collect();
+        let contract = stock
+            .contract_data(expected_contract_id)
+            .map_err(|e| RgbError::ContractNotFound(e.to_string()))?;
+        let mut total_amount: u64 = 0;
+        let filter = FilterIncludeAll;
+        for details in contract.schema.owned_types.values() {
+            if let Ok(allocs) = contract.fungible(details.name.clone(), &filter) {
+                for alloc in allocs {
+                    let op = alloc.seal.to_outpoint();
+                    if wanted.contains(&(op.txid.to_string(), op.vout.into_u32())) {
+                        total_amount = total_amount.saturating_add(alloc.state.value());
+                    }
+                }
+            }
+        }
+
         Ok(ConsignmentInfo {
             total_amount,
-            outpoints,
+            outpoints: consigned_outpoints.to_vec(),
         })
     }
 
@@ -1183,6 +1178,7 @@ impl RgbBackend for LibRgbBackend {
         gross_btc_sats: u64,
         actual_fee_sats: u64,
     ) -> Result<SwapTransfer, RgbError> {
+        let _guard = self.guard();
         let account = self.load_signer()?;
         let mut wallet = self.load_wallet()?;
 

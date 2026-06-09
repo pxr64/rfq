@@ -16,7 +16,9 @@ use futures::{Sink, SinkExt, Stream, StreamExt};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
-use rfq_types::{AcceptQuoteRequest, MakerId, Quote, QuoteId, QuoteRequest, SettlementIntent};
+use rfq_types::{
+    AcceptQuoteRequest, MakerId, Outpoint, Quote, QuoteId, QuoteRequest, SettlementIntent,
+};
 
 use crate::ws_protocol::{MakerFrame, WsOp, WsRequest, WsResult};
 use crate::{MakerConnector, RouterError};
@@ -161,10 +163,12 @@ impl MakerConnector for WsMakerConnector {
         &self,
         quote_id: QuoteId,
         consignment_base64: String,
+        consigned_outpoints: Vec<Outpoint>,
     ) -> Result<SettlementIntent, RouterError> {
         self.settlement(WsOp::DeliverConsignment {
             quote_id,
             consignment: consignment_base64,
+            outpoints: consigned_outpoints,
         })
         .await
     }

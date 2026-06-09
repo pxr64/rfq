@@ -39,7 +39,7 @@ async fn rfq_quote_accept_flow_succeeds() {
         base_asset: AssetId {
             network: BitcoinNetwork::Regtest,
             kind: AssetKind::Rgb20,
-            id: "rgb-test-asset".to_owned(),
+            id: "rgb:eejuoPHh-agACtkj-6j2JkSs-cI4PIwm-CzKGJ7v-1s~IrX0".to_owned(),
         },
         quote_asset: AssetId {
             network: BitcoinNetwork::Regtest,

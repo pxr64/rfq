@@ -170,10 +170,16 @@ pub trait RgbBackend: Send + Sync {
     /// parses the invoice once at /sign time (via `parse_maker_invoice`)
     /// so reusing the typed `contract_id` from `MakerInvoiceParts` avoids
     /// a self-round-trip inside the backend.
+    /// `consigned_outpoints` are the taker's RGB UTXOs being sold, named by the
+    /// taker on the wire (a provenance consignment proves the asset + history but
+    /// does NOT say which outpoints are being offered — that's the holder's input;
+    /// see docs/provenance-consignment-proposal.md). The backend accepts the
+    /// consignment, then confirms the claimed RGB actually sits at those outpoints.
     async fn validate_incoming_consignment(
         &self,
         consignment_base64: &str,
         expected_contract_id: ContractId,
+        consigned_outpoints: &[Outpoint],
     ) -> Result<ConsignmentInfo, RgbError>;
 
     /// Sell-side swap PSBT construction. Inputs: the taker's RGB-bearing
@@ -356,6 +362,7 @@ impl RgbBackend for MockRgbBackend {
         &self,
         consignment_base64: &str,
         expected_contract_id: ContractId,
+        consigned_outpoints: &[Outpoint],
     ) -> Result<ConsignmentInfo, RgbError> {
         // Real Stock validation lands in `LibRgbBackend`. The mock parses a
         // deterministic pipe-delimited blob the taker builds:
@@ -373,13 +380,11 @@ impl RgbBackend for MockRgbBackend {
                 RgbError::TransferBuild("not a sell-side consignment".to_owned())
             })?;
 
-        let mut invoice = None;
         let mut amount = None;
         let mut outpoints: Vec<Outpoint> = Vec::new();
         for field in body.split('|') {
-            if let Some(v) = field.strip_prefix("invoice=") {
-                invoice = Some(v.to_owned());
-            } else if let Some(v) = field.strip_prefix("amount=") {
+            // `invoice=` is ignored if present (provenance model — no maker invoice).
+            if let Some(v) = field.strip_prefix("amount=") {
                 amount = Some(
                     v.parse::<u64>()
                         .map_err(|_| RgbError::TransferBuild("bad amount field".to_owned()))?,
@@ -393,22 +398,19 @@ impl RgbBackend for MockRgbBackend {
             }
         }
 
-        let invoice =
-            invoice.ok_or_else(|| RgbError::TransferBuild("missing invoice field".to_owned()))?;
-        // Re-derive the embedded invoice's contract_id with the same
-        // mock_bytes32 pattern parse_maker_invoice uses, and compare to
-        // the typed expected_contract_id. Keeps the mock consignment
-        // format unchanged across the test sites that still embed
-        // `invoice=<inv>`, while the trait now takes a typed contract id.
-        let derived_contract_id =
-            ContractId::from(mock_bytes32(&format!("{invoice}|contract")));
-        if derived_contract_id != expected_contract_id {
-            return Err(RgbError::TransferBuild(
-                "consignment invoice does not match the maker's quote".to_owned(),
-            ));
-        }
+        // The real backend verifies the contract against the accepted consignment;
+        // the mock accepts `expected_contract_id` as given (only the `rgb-invalid`
+        // sentinel above drives the rejection path).
+        let _ = expected_contract_id;
         let total_amount =
             amount.ok_or_else(|| RgbError::TransferBuild("missing amount field".to_owned()))?;
+        // Provenance model: the taker names its outpoints on the wire. Prefer those;
+        // fall back to the blob-embedded list so existing fixtures keep working.
+        let outpoints = if consigned_outpoints.is_empty() {
+            outpoints
+        } else {
+            consigned_outpoints.to_vec()
+        };
         if outpoints.is_empty() {
             return Err(RgbError::TransferBuild(
                 "consignment names no outpoints".to_owned(),

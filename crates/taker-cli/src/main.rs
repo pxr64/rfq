@@ -19,7 +19,8 @@ use dialoguer::{theme::ColorfulTheme, Confirm, Input};
 use rfq_client::{RfqClient, Url};
 use rfq_rgb::Taker;
 use rfq_types::{
-    AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, CreateRfqRequest, Side, SwapLeg,
+    AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, CreateRfqRequest, Outpoint, Side,
+    SwapLeg,
 };
 use serde::Deserialize;
 
@@ -345,13 +346,28 @@ async fn sell(
         .into_iter()
         .next()
         .ok_or("no maker quoted the sell")?;
-    let maker_rgb_invoice = quote
-        .maker_rgb_invoice
-        .clone()
-        .ok_or("sell quote carried no maker_rgb_invoice")?;
     println!("quote {} price={} sats fee~{} sats", quote.quote_id.0, quote.price, quote.estimated_fee_sats);
 
-    // Change invoice for surplus RGB (taker's input usually exceeds `amount`).
+    // Pick the taker's own RGB UTXOs to sell — enough to cover `amount`,
+    // largest-first. These outpoints are what the maker spends into the swap tx;
+    // it learns them from us (provenance model — the consignment proves the asset,
+    // we name which outpoints we're offering).
+    let mut inv = taker.inventory(asset).await?;
+    inv.sort_by(|a, b| b.amount.cmp(&a.amount));
+    let mut chosen: Vec<Outpoint> = Vec::new();
+    let mut have: u64 = 0;
+    for u in inv {
+        if have >= amount {
+            break;
+        }
+        have = have.saturating_add(u.amount);
+        chosen.push(u.outpoint);
+    }
+    if have < amount {
+        return Err(format!("insufficient RGB to sell: have {have}, need {amount}").into());
+    }
+
+    // Change invoice for surplus RGB (the chosen inputs usually exceed `amount`).
     // The maker reads only the beneficiary seal off it; the amount is ignored.
     let rgb_change_invoice = taker.create_invoice(asset, amount).await?;
     let btc_payout_addr = btc_address.to_owned();
@@ -369,14 +385,16 @@ async fn sell(
         return Err("sell accept unexpectedly returned a PSBT before consignment".into());
     }
 
-    // Build the consignment in-process (unilateral RGB transfer to the maker's
-    // invoice); the maker anchors it into the swap tx and broadcasts.
-    let consignment = taker
-        .create_transfer_to_invoice(&maker_rgb_invoice, SELL_RGB_FEE_SATS)
-        .await?;
+    // Export provenance for the chosen outpoints (no PSBT, no fee, no anchor); the
+    // maker validates it, spends those outpoints into the swap tx, and broadcasts.
+    let outpoint_strs: Vec<String> = chosen
+        .iter()
+        .map(|o| format!("{}:{}", o.txid, o.vout))
+        .collect();
+    let consignment = taker.export_provenance(&asset.id, &outpoint_strs)?;
 
     let delivered = client
-        .submit_consignment(quote.quote_id.clone(), consignment)
+        .submit_consignment(quote.quote_id.clone(), consignment, chosen)
         .await?;
     let transfer = delivered
         .transfer
@@ -420,11 +438,6 @@ async fn persist_and_try_accept(
     }
 }
 
-/// Fee (sats) for the taker's in-process sell consignment transfer. This tx is
-/// a phantom: the maker discards it and rebuilds the real swap tx (with its own
-/// fee), so this only has to let `wallet.pay` balance — keep it small so a
-/// minimally-funded witness-vout RGB input still leaves room for a change output.
-const SELL_RGB_FEE_SATS: u64 = 200;
 
 fn btc_asset(network: BitcoinNetwork) -> AssetId {
     AssetId {

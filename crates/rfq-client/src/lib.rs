@@ -1,7 +1,8 @@
 use reqwest::StatusCode;
 pub use reqwest::Url;
 use rfq_types::{
-    AcceptQuoteRequest, CreateRfqRequest, HealthResponse, Quote, QuoteId, SettlementIntent,
+    AcceptQuoteRequest, CreateRfqRequest, HealthResponse, Outpoint, Quote, QuoteId,
+    SettlementIntent,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -46,13 +47,16 @@ impl RfqClient {
         parse_response(response).await
     }
 
-    /// Sell-side: submit the consignment the taker built against the maker's
-    /// `Quote.maker_rgb_invoice`. The maker validates it, builds the swap PSBT,
-    /// and returns a `SettlementIntent` in `AwaitingTakerSignature`.
+    /// Sell-side: submit the taker's **provenance** consignment plus the explicit
+    /// list of RGB outpoints being sold. The maker validates the consignment,
+    /// confirms the RGB at those outpoints, builds the swap PSBT, and returns a
+    /// `SettlementIntent` in `AwaitingTakerSignature`. See
+    /// `docs/provenance-consignment-proposal.md`.
     pub async fn submit_consignment(
         &self,
         quote_id: QuoteId,
         consignment_base64: String,
+        outpoints: Vec<Outpoint>,
     ) -> Result<SettlementIntent, RfqClientError> {
         let url = self.endpoint(&format!("quotes/{}/consignment", quote_id.0))?;
         let response = self
@@ -60,6 +64,7 @@ impl RfqClient {
             .post(url)
             .json(&ConsignmentRequest {
                 consignment: consignment_base64,
+                outpoints,
             })
             .send()
             .await?;
@@ -98,6 +103,7 @@ impl RfqClient {
 #[derive(Serialize)]
 struct ConsignmentRequest {
     consignment: String,
+    outpoints: Vec<Outpoint>,
 }
 
 #[derive(Serialize)]

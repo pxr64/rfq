@@ -97,7 +97,8 @@ async fn dispatch(maker: &Maker, op: WsOp) -> WsResult {
         WsOp::DeliverConsignment {
             quote_id,
             consignment,
-        } => settle(maker.deliver_consignment(quote_id, consignment).await),
+            outpoints,
+        } => settle(maker.deliver_consignment(quote_id, consignment, outpoints).await),
         WsOp::SubmitSignedPsbt { quote_id, psbt } => {
             settle(maker.submit_signed_psbt(quote_id, psbt).await)
         }

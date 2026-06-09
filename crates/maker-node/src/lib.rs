@@ -633,6 +633,9 @@ async fn maker_sign_quote(
 #[derive(Debug, serde::Deserialize)]
 struct ConsignmentBody {
     consignment: String,
+    /// Taker's RGB UTXOs being sold (provenance model). Optional for older callers.
+    #[serde(default)]
+    outpoints: Vec<Outpoint>,
 }
 
 async fn maker_consignment(
@@ -651,7 +654,7 @@ async fn maker_consignment(
     Ok(Json(
         state
             .maker
-            .deliver_consignment(quote_id, body.consignment)
+            .deliver_consignment(quote_id, body.consignment, body.outpoints)
             .await?,
     ))
 }

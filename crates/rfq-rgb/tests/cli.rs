@@ -126,8 +126,10 @@ async fn validate_incoming_consignment_accepts_a_real_consignment() {
         base64::engine::general_purpose::STANDARD.encode(stack.consignment_bytes());
 
     let backend = stack.maker_backend().await;
+    // TODO(provenance): pass the taker's consigned outpoints once this e2e fixture
+    // is updated to the provenance model (see docs/provenance-consignment-proposal.md).
     let info = backend
-        .validate_incoming_consignment(&consignment_b64, stack.contract_id())
+        .validate_incoming_consignment(&consignment_b64, stack.contract_id(), &[])
         .await
         .expect("validate_incoming_consignment should accept the bootstrap transfer");
 
@@ -659,8 +661,10 @@ async fn sell_round_trip_two_backends_broadcasts() {
     // sees the allocations.
     let consignment_info = {
         let maker = stack.maker_backend().await;
+        // TODO(provenance): pass the taker's consigned outpoints once this e2e
+        // fixture is updated to the provenance model.
         maker
-            .validate_incoming_consignment(&consignment_b64, maker_parts.contract_id)
+            .validate_incoming_consignment(&consignment_b64, maker_parts.contract_id, &[])
             .await
             .expect("validate_incoming_consignment")
     };

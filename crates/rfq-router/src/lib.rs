@@ -8,7 +8,9 @@ use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 pub use reqwest::Url;
 use rfq_core::{is_quote_expired, sort_quotes_best_price, validate_quote_request, RfqCoreError};
-use rfq_types::{AcceptQuoteRequest, MakerId, Quote, QuoteId, QuoteRequest, SettlementIntent};
+use rfq_types::{
+    AcceptQuoteRequest, MakerId, Outpoint, Quote, QuoteId, QuoteRequest, SettlementIntent,
+};
 use thiserror::Error;
 use tokio::time::timeout;
 
@@ -54,6 +56,7 @@ pub trait MakerConnector: Send + Sync {
         &self,
         _quote_id: QuoteId,
         _consignment_base64: String,
+        _consigned_outpoints: Vec<Outpoint>,
     ) -> Result<SettlementIntent, RouterError> {
         Err(RouterError::Maker(
             "deliver_consignment not yet implemented".to_owned(),
@@ -134,16 +137,19 @@ impl MakerConnector for HttpMakerConnector {
         &self,
         quote_id: QuoteId,
         consignment_base64: String,
+        consigned_outpoints: Vec<Outpoint>,
     ) -> Result<SettlementIntent, RouterError> {
         #[derive(serde::Serialize)]
         struct Body {
             consignment: String,
+            outpoints: Vec<Outpoint>,
         }
         let response = self
             .http
             .post(self.endpoint(&format!("quotes/{}/consignment", quote_id.0))?)
             .json(&Body {
                 consignment: consignment_base64,
+                outpoints: consigned_outpoints,
             })
             .send()
             .await

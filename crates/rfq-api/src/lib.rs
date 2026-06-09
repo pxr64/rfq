@@ -72,9 +72,14 @@ pub struct SignQuoteBody {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ConsignmentBody {
-    /// Base64 RGB consignment the taker built against the maker's
-    /// `Quote.maker_rgb_invoice` (sell side). See `docs/swap-flows.md`.
+    /// Base64 RGB **provenance** consignment — proves the taker's RGB + history.
+    /// See `docs/provenance-consignment-proposal.md`.
     pub consignment: String,
+    /// The taker's RGB UTXOs being sold. The consignment proves provenance, not
+    /// *which* outpoints are offered (only the taker knows which it controls), so
+    /// the taker names them here. Optional for older callers.
+    #[serde(default)]
+    pub outpoints: Vec<Outpoint>,
 }
 
 pub fn app() -> Router {
@@ -82,7 +87,7 @@ pub fn app() -> Router {
     let rgb_asset = AssetId {
         network: BitcoinNetwork::Regtest,
         kind: AssetKind::Rgb20,
-        id: "rgb-test-asset".to_owned(),
+        id: "rgb:eejuoPHh-agACtkj-6j2JkSs-cI4PIwm-CzKGJ7v-1s~IrX0".to_owned(),
     };
     let utxo = RgbInventoryUtxo {
         outpoint: Outpoint::new(format!("{:064x}", 0u64), 0),
@@ -431,7 +436,7 @@ async fn deliver_consignment(
         .ok_or(ApiError::MakerNotFound)?;
 
     let intent = maker
-        .deliver_consignment(quote_id, body.consignment)
+        .deliver_consignment(quote_id, body.consignment, body.outpoints)
         .await?;
 
     Ok(Json(intent))
@@ -800,7 +805,7 @@ mod tests {
         AssetId {
             network: BitcoinNetwork::Regtest,
             kind: AssetKind::Rgb20,
-            id: "rgb-test-asset".to_owned(),
+            id: "rgb:eejuoPHh-agACtkj-6j2JkSs-cI4PIwm-CzKGJ7v-1s~IrX0".to_owned(),
         }
     }
 
@@ -951,6 +956,7 @@ mod tests {
             "/quotes/no-such-quote/consignment",
             &ConsignmentBody {
                 consignment: "mock-consignment|sell|".to_owned(),
+                outpoints: vec![],
             },
         )
         .await;
@@ -983,6 +989,7 @@ mod tests {
             &format!("/quotes/{}/consignment", quote.quote_id.0),
             &ConsignmentBody {
                 consignment: "not-a-real-consignment".to_owned(),
+                outpoints: vec![],
             },
         )
         .await;
@@ -1003,7 +1010,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let quotes: Vec<Quote> = serde_json::from_slice(&body).unwrap();
         let quote = &quotes[0];
-        let invoice = quote.maker_rgb_invoice.clone().expect("sell quote invoice");
+        // Provenance model: the sell quote carries no maker invoice.
+        assert!(quote.maker_rgb_invoice.is_none());
 
         let (status, body) = send(
             &app,
@@ -1020,8 +1028,10 @@ mod tests {
         let accepted: SettlementIntent = serde_json::from_slice(&body).unwrap();
         assert_eq!(accepted.status, SettlementStatus::AwaitingConsignment);
 
+        // Provenance consignment (no invoice). The mock reads outpoints from the
+        // blob when `ConsignmentBody.outpoints` is empty.
         let consignment = format!(
-            "mock-consignment|sell|invoice={invoice}|amount={}|outpoints={},{}",
+            "mock-consignment|sell|amount={}|outpoints={},{}",
             quote.amount,
             taker_op(0),
             taker_op(1),
@@ -1029,7 +1039,10 @@ mod tests {
         let (status, body) = send(
             &app,
             &format!("/quotes/{}/consignment", quote.quote_id.0),
-            &ConsignmentBody { consignment },
+            &ConsignmentBody {
+                consignment,
+                outpoints: vec![],
+            },
         )
         .await;
         assert_eq!(status, StatusCode::OK);

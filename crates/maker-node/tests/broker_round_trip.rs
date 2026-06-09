@@ -187,10 +187,11 @@ async fn drive_sell_via_broker(
         .await
         .expect("request_quotes sell");
     let quote = quotes.into_iter().next().expect("maker quotes the sell");
-    let maker_rgb_invoice = quote
-        .maker_rgb_invoice
-        .clone()
-        .expect("sell quote carries maker_rgb_invoice");
+    // TODO(provenance): this e2e still drives the old pay-to-invoice flow. Under the
+    // provenance model (docs/provenance-consignment-proposal.md) the sell quote
+    // carries NO maker invoice; convert this to `export_provenance` + named outpoints
+    // when running Task 4 on regtest. Compiles today; would need conversion to pass.
+    let maker_rgb_invoice = quote.maker_rgb_invoice.clone().unwrap_or_default();
 
     // The taker's RGB input likely exceeds `amount`; supply a change invoice
     // so the maker routes the surplus back. Its amount field is ignored — the
@@ -228,7 +229,7 @@ async fn drive_sell_via_broker(
     };
 
     let delivered = client
-        .submit_consignment(quote.quote_id.clone(), consignment)
+        .submit_consignment(quote.quote_id.clone(), consignment, vec![])
         .await
         .expect("submit consignment");
     let transfer = delivered
