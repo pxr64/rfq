@@ -326,6 +326,24 @@ impl RegtestStack {
         Ok(())
     }
 
+    /// Total confirmed BTC (sats) sitting at `addr`, via `scantxoutset` — works for
+    /// any address without it being in a loaded wallet. Used by the swap e2e to
+    /// assert the BTC payout / change lands at the expected destination (compare a
+    /// before/after delta). Scrapes `"total_amount"` out of the JSON the same
+    /// stringly way the rest of this harness reads bitcoin-cli.
+    pub fn address_btc_sats(&self, addr: &str) -> u64 {
+        let descriptor = format!("[\"addr({addr})\"]");
+        let out = bitcoin_cli(&self.compose_dir, &["scantxoutset", "start", &descriptor])
+            .expect("scantxoutset");
+        let btc: f64 = out
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("\"total_amount\":"))
+            .map(|v| v.trim().trim_end_matches(',').trim())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        (btc * 1e8).round() as u64
+    }
+
     /// Mine one block to the miner wallet. Used by tests that need a
     /// just-broadcast witness tx to confirm so a follow-up swap can spend
     /// its outputs (e.g. issue #27's chain-observer two-buy verification).
@@ -478,6 +496,31 @@ impl<'a> TakerGuard<'a> {
     ) -> Result<String, String> {
         self.taker()
             .create_transfer_to_invoice(recipient_invoice, fee_sats)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Export a provenance consignment for the taker's own `outpoints` — the
+    /// sell-leg primitive (see [`Taker::export_provenance`]).
+    pub fn export_provenance(
+        &self,
+        contract: &str,
+        outpoints: &[String],
+    ) -> Result<String, String> {
+        self.taker()
+            .export_provenance(contract, outpoints)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Absorb a maker-returned consignment into the taker's stash (RGB bought on a
+    /// buy, or change from a sell). See [`Taker::accept_consignment`].
+    pub async fn accept_consignment(
+        &self,
+        asset: &AssetId,
+        consignment_base64: &str,
+    ) -> Result<(), String> {
+        self.taker()
+            .accept_consignment(asset, consignment_base64)
             .await
             .map_err(|e| e.to_string())
     }

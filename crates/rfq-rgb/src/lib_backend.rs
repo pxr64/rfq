@@ -680,19 +680,17 @@ impl LibRgbBackend {
                 "export_provenance: no outpoints supplied".to_owned(),
             ));
         }
-        // Witness-vout: the seal's txid IS the witness tx the consignment anchors to.
-        // If every outpoint shares one witness tx, pass it (the `reconsign` hint);
-        // otherwise let the stock walk the full witness graph.
-        let first = seals[0].txid;
-        let witness_id = if seals.iter().all(|s| s.txid == first) {
-            Some(first)
-        } else {
-            None
-        };
-
+        // `witness_id` MUST be None here. It would be tempting to pass the seal's
+        // txid (the `reconsign` shortcut), but that only equals the witness tx for
+        // witness-vout seals. When the allocation was *received* on a blinded seal
+        // bound to a pre-existing outpoint, the seal's txid is that prior UTXO, while
+        // the transition lives on a *different* witness tx — and `Stock::consign`
+        // filters out every bundle not anchored to `witness_id`, yielding an EMPTY
+        // consignment whose accept registers nothing. None lets `consign` resolve the
+        // bundle from the outpoint (`opouts_by_outputs`) and walk the full graph.
         let stock = self.load_stock()?;
         let transfer = stock
-            .transfer(contract_id, seals, [], [], witness_id)
+            .transfer(contract_id, seals, [], [], None)
             .map_err(|e| RgbError::TransferBuild(format!("export provenance transfer: {e}")))?;
 
         let mut bytes = Vec::new();

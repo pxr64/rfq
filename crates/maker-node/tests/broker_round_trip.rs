@@ -28,8 +28,8 @@ use rfq_client::{RfqClient, Url};
 use rfq_router::{HttpMakerConnector, MakerConnector};
 use rfq_rgb::test_helpers;
 use rfq_types::{
-    AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, CreateRfqRequest, MakerId, Side,
-    SwapLeg,
+    AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, CreateRfqRequest, MakerId, Outpoint,
+    Side, SwapLeg,
 };
 use tokio::net::TcpListener;
 
@@ -118,6 +118,22 @@ async fn drive_buy_via_broker(
     amount: u64,
     stack: &test_helpers::RegtestStack,
 ) -> String {
+    // Snapshot the taker's RGB before the buy, to assert the bought amount lands.
+    let pre_total: u64 = {
+        let taker = stack.taker_backend().await;
+        taker
+            .inventory(asset)
+            .await
+            .expect("taker inventory (pre-buy)")
+            .iter()
+            .map(|u| u.amount)
+            .sum()
+    };
+    // Snapshot BTC at the taker's funding/change address — the buy returns the
+    // taker's BTC change here (keychain-0), funded from keychain-10 inputs.
+    let funding_addr = stack.taker_funding_addr().to_owned();
+    let btc_funding_before = stack.address_btc_sats(&funding_addr);
+
     let rgb_invoice = {
         let taker = stack.taker_backend().await;
         taker
@@ -162,9 +178,58 @@ async fn drive_buy_via_broker(
         .submit_signed_psbt(quote.quote_id, signed)
         .await
         .expect("submit signed buy");
-    settled
+    let txid = settled
         .witness_txid
-        .expect("buy settled intent carries the broadcast witness txid")
+        .clone()
+        .expect("buy settled intent carries the broadcast witness txid");
+
+    // ★ Delivery-landing assertion: the maker's `final_consignment` delivers the
+    // bought RGB to the taker's invoice seal. Mine the swap tx, import it, re-sync,
+    // and confirm the taker now holds pre_total + amount. The buy mirror of the
+    // sell's change-landing check — the RGB lands where it's supposed to.
+    let delivery = settled
+        .final_consignment
+        .clone()
+        .expect("a buy must return the maker-emitted RGB delivery consignment");
+    stack.mine_block().expect("mine the swap tx");
+
+    // ★ BTC payment + change assertion: the taker funds the buy from its funding
+    // address and the surplus returns there as change, so the NET cost is just
+    // price + fee — not a whole consumed UTXO. A lost/misrouted change output would
+    // show up as a far larger drop.
+    let btc_funding_after = stack.address_btc_sats(&funding_addr);
+    let spent = btc_funding_before.saturating_sub(btc_funding_after);
+    assert!(
+        btc_funding_after < btc_funding_before,
+        "taker should pay BTC for the buy ({btc_funding_before} -> {btc_funding_after})"
+    );
+    assert!(
+        spent >= quote.price && spent <= quote.price + 100_000,
+        "buy BTC cost {spent} should be ~price {} + fee (change must return to the \
+         funding address — a lost change output would consume the whole input)",
+        quote.price
+    );
+    {
+        let taker = stack.taker_backend().await;
+        taker
+            .accept_consignment(asset, &delivery)
+            .await
+            .expect("taker imports the bought RGB");
+        taker.sync_wallet().await.expect("taker re-sync after the buy");
+        let post_total: u64 = taker
+            .inventory(asset)
+            .await
+            .expect("taker inventory (post-buy)")
+            .iter()
+            .map(|u| u.amount)
+            .sum();
+        assert_eq!(
+            post_total,
+            pre_total + amount,
+            "taker's RGB after a buy should be pre_total + amount bought"
+        );
+    }
+    txid
 }
 
 /// Sell `amount` RGB through the broker. The maker publishes its RGB invoice
@@ -187,15 +252,34 @@ async fn drive_sell_via_broker(
         .await
         .expect("request_quotes sell");
     let quote = quotes.into_iter().next().expect("maker quotes the sell");
-    // TODO(provenance): this e2e still drives the old pay-to-invoice flow. Under the
-    // provenance model (docs/provenance-consignment-proposal.md) the sell quote
-    // carries NO maker invoice; convert this to `export_provenance` + named outpoints
-    // when running Task 4 on regtest. Compiles today; would need conversion to pass.
-    let maker_rgb_invoice = quote.maker_rgb_invoice.clone().unwrap_or_default();
+    // Provenance model: the sell quote carries no maker invoice.
+    assert!(quote.maker_rgb_invoice.is_none());
 
-    // The taker's RGB input likely exceeds `amount`; supply a change invoice
-    // so the maker routes the surplus back. Its amount field is ignored — the
-    // maker only reads the beneficiary seal off it (see cli.rs sell test).
+    // Snapshot the taker's RGB before the sell, and pick the outpoints to sell
+    // (largest-first, cover `amount`). The maker spends these into the swap tx — it
+    // learns them from us, named on the wire; the consignment proves their provenance.
+    let (pre_total, consignment, outpoints) = {
+        let taker = stack.taker_backend().await;
+        let inv = taker.inventory(asset).await.expect("taker inventory");
+        let pre_total: u64 = inv.iter().map(|u| u.amount).sum();
+        let mut chosen: Vec<Outpoint> = Vec::new();
+        let mut have = 0u64;
+        for u in &inv {
+            if have >= amount {
+                break;
+            }
+            have += u.amount;
+            chosen.push(u.outpoint.clone());
+        }
+        assert!(have >= amount, "taker holds {have} RGB, needs {amount} to sell");
+        let strs: Vec<String> = chosen.iter().map(|o| format!("{}:{}", o.txid, o.vout)).collect();
+        let c = taker
+            .export_provenance(stack.contract_id_str(), &strs)
+            .expect("export_provenance");
+        (pre_total, c, chosen)
+    };
+
+    // Change invoice: the maker routes the surplus (have − amount) back to this seal.
     let rgb_change_invoice = {
         let taker = stack.taker_backend().await;
         taker
@@ -204,11 +288,15 @@ async fn drive_sell_via_broker(
             .expect("taker create_invoice (change)")
     };
 
+    // Snapshot BTC at the taker's payout address — the sell pays the BTC proceeds here.
+    let payout_addr = stack.taker_payout_addr().to_owned();
+    let btc_payout_before = stack.address_btc_sats(&payout_addr);
+
     let accepted = client
         .accept_quote(AcceptQuoteRequest {
             quote_id: quote.quote_id.clone(),
             leg: SwapLeg::Sell {
-                btc_payout_addr: stack.taker_payout_addr().to_owned(),
+                btc_payout_addr: payout_addr.clone(),
                 rgb_change_invoice: Some(rgb_change_invoice),
             },
         })
@@ -219,17 +307,8 @@ async fn drive_sell_via_broker(
         "sell accept awaits the consignment before emitting a PSBT"
     );
 
-    // Build the consignment in-process (the gate on wallet.pay).
-    let consignment = {
-        let taker = stack.taker_backend().await;
-        taker
-            .create_transfer_to_invoice(&maker_rgb_invoice, 1_000)
-            .await
-            .expect("taker create_transfer_to_invoice")
-    };
-
     let delivered = client
-        .submit_consignment(quote.quote_id.clone(), consignment, vec![])
+        .submit_consignment(quote.quote_id.clone(), consignment, outpoints)
         .await
         .expect("submit consignment");
     let transfer = delivered
@@ -247,9 +326,50 @@ async fn drive_sell_via_broker(
         .submit_signed_psbt(quote.quote_id, signed)
         .await
         .expect("submit signed sell");
-    settled
+    let txid = settled
         .witness_txid
-        .expect("sell settled intent carries the broadcast witness txid")
+        .clone()
+        .expect("sell settled intent carries the broadcast witness txid");
+
+    stack.mine_block().expect("mine the swap tx");
+
+    // ★ BTC-payout assertion: the taker's BTC sale proceeds land at its payout address.
+    let btc_payout_after = stack.address_btc_sats(&payout_addr);
+    assert!(
+        btc_payout_after > btc_payout_before,
+        "sell should pay the taker's BTC proceeds to its payout address \
+         ({btc_payout_before} -> {btc_payout_after})"
+    );
+
+    // ★ RGB change-landing assertion: the maker emits a `final_consignment` for the
+    // surplus RGB (pre_total − amount) addressed to the taker's change seal. Import it,
+    // re-sync, and confirm the taker now holds exactly the change. This is "the change
+    // lands where it's supposed to," proven end-to-end.
+    if pre_total > amount {
+        let change = settled
+            .final_consignment
+            .clone()
+            .expect("a surplus sell must return the maker-emitted change consignment");
+        let taker = stack.taker_backend().await;
+        taker
+            .accept_consignment(asset, &change)
+            .await
+            .expect("taker imports its RGB change");
+        taker.sync_wallet().await.expect("taker re-sync after the swap");
+        let post_total: u64 = taker
+            .inventory(asset)
+            .await
+            .expect("taker inventory post-sell")
+            .iter()
+            .map(|u| u.amount)
+            .sum();
+        assert_eq!(
+            post_total,
+            pre_total - amount,
+            "taker's RGB after a sell should be the change (pre_total − amount sold)"
+        );
+    }
+    txid
 }
 
 /// Bind the maker HTTP server to a random port, spawn `axum::serve` + the
