@@ -9,7 +9,8 @@ use futures::stream::{FuturesUnordered, StreamExt};
 pub use reqwest::Url;
 use rfq_core::{is_quote_expired, sort_quotes_best_price, validate_quote_request, RfqCoreError};
 use rfq_types::{
-    AcceptQuoteRequest, MakerId, Outpoint, Quote, QuoteId, QuoteRequest, SettlementIntent,
+    AcceptQuoteRequest, MakerId, OrderPrice, Outpoint, Quote, QuoteId, QuoteRequest,
+    SettlementIntent,
 };
 use thiserror::Error;
 use tokio::time::timeout;
@@ -41,6 +42,14 @@ pub trait MakerConnector: Send + Sync {
     fn maker_id(&self) -> MakerId;
 
     async fn request_quote(&self, request: QuoteRequest) -> Result<Option<Quote>, RouterError>;
+
+    /// The maker's current standing-order prices + live depth, pulled on demand
+    /// for the broker's `GET /prices` feed. The default signals "can't be pulled"
+    /// (HTTP/mock connectors) so the registry keeps the maker's `Register`-time
+    /// prices as last-known rather than blanking them.
+    async fn request_prices(&self) -> Result<Vec<OrderPrice>, RouterError> {
+        Err(RouterError::Maker("request_prices unsupported".to_owned()))
+    }
 
     async fn accept_quote(
         &self,

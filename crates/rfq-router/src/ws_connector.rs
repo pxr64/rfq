@@ -17,7 +17,8 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
 use rfq_types::{
-    AcceptQuoteRequest, MakerId, Outpoint, Quote, QuoteId, QuoteRequest, SettlementIntent,
+    AcceptQuoteRequest, MakerId, OrderPrice, Outpoint, Quote, QuoteId, QuoteRequest,
+    SettlementIntent,
 };
 
 use crate::ws_protocol::{MakerFrame, WsOp, WsRequest, WsResult};
@@ -128,8 +129,8 @@ impl WsMakerConnector {
         match self.call(op).await? {
             WsResult::Settlement { intent } => Ok(intent),
             WsResult::Err { message } => Err(RouterError::Maker(message)),
-            WsResult::Quote { .. } => {
-                Err(RouterError::Maker("unexpected quote response".to_owned()))
+            WsResult::Quote { .. } | WsResult::Prices { .. } => {
+                Err(RouterError::Maker("unexpected non-settlement response".to_owned()))
             }
         }
     }
@@ -145,8 +146,18 @@ impl MakerConnector for WsMakerConnector {
         match self.call(WsOp::RequestQuote { request }).await? {
             WsResult::Quote { quote } => Ok(quote),
             WsResult::Err { message } => Err(RouterError::Maker(message)),
-            WsResult::Settlement { .. } => {
-                Err(RouterError::Maker("unexpected settlement response".to_owned()))
+            WsResult::Settlement { .. } | WsResult::Prices { .. } => {
+                Err(RouterError::Maker("unexpected non-quote response".to_owned()))
+            }
+        }
+    }
+
+    async fn request_prices(&self) -> Result<Vec<OrderPrice>, RouterError> {
+        match self.call(WsOp::RequestPrices).await? {
+            WsResult::Prices { prices } => Ok(prices),
+            WsResult::Err { message } => Err(RouterError::Maker(message)),
+            WsResult::Quote { .. } | WsResult::Settlement { .. } => {
+                Err(RouterError::Maker("unexpected non-prices response".to_owned()))
             }
         }
     }

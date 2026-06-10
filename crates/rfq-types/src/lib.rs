@@ -89,7 +89,15 @@ pub struct OrderPrice {
     pub contract_id: String,
     pub side: Side,
     pub price_sats_per_unit: u64,
+    /// The standing order's configured per-quote size cap (in smallest RGB
+    /// units). The static upper bound — what the maker *would* fill if fully
+    /// stocked.
     pub max_size: u64,
+    /// What the maker can actually fill right now (smallest RGB units), capped
+    /// at `max_size` and bounded by live inventory: RGB on hand for `Buy`, the
+    /// BTC pool's RGB-equivalent for `Sell`. This is the number a client should
+    /// size against — `max_size` alone overstates depth when inventory is low.
+    pub available_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]

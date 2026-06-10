@@ -53,7 +53,7 @@ async fn connect_and_serve(
     // Advertise the RGB contracts this maker serves (with ticker/precision) and
     // their network, so the broker can surface them via `GET /status` + `/assets`.
     let assets = maker.served_assets().await;
-    let prices = maker.order_prices();
+    let prices = maker.order_prices().await;
     let network = assets.first().map(|a| a.id.network.clone());
     let register = serde_json::to_string(&MakerFrame::Register {
         maker_id: maker_id.clone(),
@@ -102,6 +102,9 @@ async fn dispatch(maker: &Maker, op: WsOp) -> WsResult {
         WsOp::SubmitSignedPsbt { quote_id, psbt } => {
             settle(maker.submit_signed_psbt(quote_id, psbt).await)
         }
+        WsOp::RequestPrices => WsResult::Prices {
+            prices: maker.order_prices().await,
+        },
     }
 }
 

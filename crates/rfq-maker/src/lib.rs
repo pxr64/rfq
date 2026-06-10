@@ -410,17 +410,55 @@ impl Maker {
 
     /// The maker's standing-order prices (per contract + side), for the broker's
     /// price feed. Mirrors the PricePolicy the maker quotes from, so the feed is
-    /// consistent with actual quotes.
-    pub fn order_prices(&self) -> Vec<OrderPrice> {
+    /// consistent with actual quotes — including `available_size`, which folds in
+    /// live inventory so a client doesn't size against depth the maker can't fill.
+    pub async fn order_prices(&self) -> Vec<OrderPrice> {
+        // Snapshot inventory once: available RGB per contract (Buy liquidity) and
+        // the BTC pool the maker pays sells from (Sell liquidity).
+        let rgb_utxos = self.store.list_all().await;
+        let btc_available: u64 = self
+            .btc_store
+            .list_available()
+            .await
+            .iter()
+            .map(|u| u.value_sats)
+            .sum();
+
         self.price_policy
             .load()
             .entries()
             .iter()
-            .map(|e| OrderPrice {
-                contract_id: e.asset_id.clone(),
-                side: e.side.clone(),
-                price_sats_per_unit: e.price_sats_per_unit,
-                max_size: e.max_size,
+            .map(|e| {
+                let available_size = match e.side {
+                    // Maker sends RGB → liquidity is its available RGB inventory
+                    // for this contract.
+                    Side::Buy => {
+                        let have: u64 = rgb_utxos
+                            .iter()
+                            .filter(|u| {
+                                u.asset_id.id == e.asset_id
+                                    && matches!(u.status, InventoryStatus::Available)
+                            })
+                            .map(|u| u.amount)
+                            .sum();
+                        e.max_size.min(have)
+                    }
+                    // Maker pays BTC → liquidity is how many RGB units its BTC
+                    // pool covers, net of the per-quote receive anchor.
+                    Side::Sell if e.price_sats_per_unit > 0 => {
+                        let spendable =
+                            btc_available.saturating_sub(rfq_rgb::SEAL_ANCHOR_SATS);
+                        e.max_size.min(spendable / e.price_sats_per_unit)
+                    }
+                    Side::Sell => 0,
+                };
+                OrderPrice {
+                    contract_id: e.asset_id.clone(),
+                    side: e.side.clone(),
+                    price_sats_per_unit: e.price_sats_per_unit,
+                    max_size: e.max_size,
+                    available_size,
+                }
             })
             .collect()
     }
@@ -1146,6 +1184,10 @@ impl Maker {
 impl MakerConnector for Maker {
     fn maker_id(&self) -> MakerId {
         self.maker_id.clone()
+    }
+
+    async fn request_prices(&self) -> Result<Vec<OrderPrice>, RouterError> {
+        Ok(self.order_prices().await)
     }
 
     async fn request_quote(&self, request: QuoteRequest) -> Result<Option<Quote>, RouterError> {

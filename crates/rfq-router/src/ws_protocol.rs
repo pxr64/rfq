@@ -47,6 +47,10 @@ pub enum WsOp {
         quote_id: QuoteId,
         psbt: String,
     },
+    /// Pull the maker's current standing-order prices + live depth, on demand.
+    /// Backs the broker's TTL-cached `GET /prices` feed so the preview reflects
+    /// inventory without the maker having to push updates.
+    RequestPrices,
 }
 
 /// Maker → broker.
@@ -79,5 +83,6 @@ pub enum MakerFrame {
 pub enum WsResult {
     Quote { quote: Option<Quote> },
     Settlement { intent: SettlementIntent },
+    Prices { prices: Vec<OrderPrice> },
     Err { message: String },
 }
