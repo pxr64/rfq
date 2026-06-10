@@ -1,0 +1,20 @@
+# Build artifacts (target/ alone is ~44G) — never ship to the Docker daemon.
+target/
+**/target/
+
+# VCS + OS cruft
+.git/
+**/.DS_Store
+
+# Vendored tooling that is NOT a workspace member (rgb-schemas / rgb-cmd source).
+infra/regtest/tools/
+infra/regtest/fixture-wallets/
+
+# Local state / secrets — must not leak into an image layer.
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/maker.db
+**/node.key
+.env
+**/.env

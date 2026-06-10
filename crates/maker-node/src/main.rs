@@ -1507,7 +1507,7 @@ mod tests {
         assert_eq!(
             Cli::parse_from(["colorex", "maker", "init", "--force"]).command,
             TopCommand::Maker {
-                cmd: MakerCmd::Init(init::InitArgs { force: true }),
+                cmd: MakerCmd::Init(init::InitArgs { force: true, systemd: false }),
             },
         );
     }

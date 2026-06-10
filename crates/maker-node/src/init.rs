@@ -11,7 +11,7 @@
 //! 7. Atomically write `maker.toml`, then the keypair files.
 //! 8. Print the rendered config.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use rfq_wallet::{
@@ -30,6 +30,11 @@ pub struct InitArgs {
     /// Overwrite an existing config without prompting.
     #[arg(long)]
     pub force: bool,
+    /// Also write a systemd service unit (skips the interactive prompt). The
+    /// maker runs outside the broker stack; this only generates the file — it's
+    /// installed on the host with the printed `systemctl` commands.
+    #[arg(long)]
+    pub systemd: bool,
 }
 
 pub async fn run(args: InitArgs, config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -201,6 +206,52 @@ pub async fn run(args: InitArgs, config_path: &Path) -> Result<(), Box<dyn std::
         node_pub_path.display(),
     );
 
+    maybe_write_systemd_unit(args.systemd, config_dir, config_path)?;
+
+    Ok(())
+}
+
+/// Optionally emit a systemd unit for `maker up`, baking in the paths init just
+/// resolved (this binary, the config). Generation only — installing it needs
+/// root, which `init` deliberately doesn't assume; the maker runs outside the
+/// broker stack so the operator wires it up on the host.
+fn maybe_write_systemd_unit(
+    forced: bool,
+    config_dir: &Path,
+    config_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let generate = forced
+        || Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Generate a systemd service unit for `maker up`?")
+            .default(false)
+            .interact()?;
+    if !generate {
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("colorex"));
+    let user = std::env::var("USER").unwrap_or_else(|_| "colorex".to_owned());
+    let unit = render_systemd_unit(
+        &exe.display().to_string(),
+        &user,
+        &absolute(config_path).display().to_string(),
+    );
+
+    let unit_path = config_dir.join("colorex-maker.service");
+    match std::fs::write(&unit_path, unit) {
+        Ok(()) => {
+            println!();
+            println!("Wrote {}", unit_path.display());
+            println!("Install on a Linux host (systemd):");
+            println!(
+                "  sudo cp {} /etc/systemd/system/colorex-maker.service",
+                unit_path.display()
+            );
+            println!("  sudo systemctl daemon-reload && sudo systemctl enable --now colorex-maker");
+            println!("  journalctl -u colorex-maker -f");
+        }
+        Err(e) => output::step_warn(&truncate_error(&e.to_string())),
+    }
     Ok(())
 }
 
@@ -303,6 +354,39 @@ fn render_toml(r: &RenderInput<'_>) -> String {
     out
 }
 
+/// systemd unit for `colorex maker up`, with the resolved binary/config/user
+/// baked in. Kept pure (string in → string out) so it's testable without a tty.
+fn render_systemd_unit(exe: &str, user: &str, config: &str) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Colorex RGB maker daemon (quotes + atomic BTC<->RGB swaps)\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         User={user}\n\
+         ExecStart={exe} --config {config} maker up\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
+    )
+}
+
+/// Absolute form of `path` (joined onto cwd if relative), so the unit's
+/// `--config` works regardless of where `systemd` launches the service.
+fn absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|d| d.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
 fn write_config(path: &Path, contents: &str) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -359,6 +443,20 @@ mod tests {
         let rgb_cfg = cfg.rgb.expect("rgb block parsed");
         assert_eq!(rgb_cfg.contract_id, "rgb:abcd-1234");
         assert_eq!(rgb_cfg.signer.password, "");
+    }
+
+    #[test]
+    fn systemd_unit_bakes_in_exec_config_and_user() {
+        let unit = render_systemd_unit(
+            "/usr/local/bin/colorex",
+            "maker",
+            "/home/maker/.config/colorex/maker.toml",
+        );
+        assert!(unit.contains(
+            "ExecStart=/usr/local/bin/colorex --config /home/maker/.config/colorex/maker.toml maker up"
+        ));
+        assert!(unit.contains("User=maker"));
+        assert!(unit.contains("WantedBy=multi-user.target"));
     }
 
     #[test]

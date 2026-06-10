@@ -64,6 +64,51 @@ services:
       - electrs-data:/data
       - bitcoind-data:/home/bitcoin/.bitcoin:ro
 
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: broker
+      POSTGRES_PASSWORD: broker
+      POSTGRES_DB: broker
+    ports:
+      # 5433 on the host to avoid colliding with a local Postgres on 5432.
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U broker -d broker"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  broker:
+    build:
+      # Repo root — the broker image compiles the whole workspace (see
+      # infra/broker.Dockerfile + the root .dockerignore).
+      context: ../..
+      dockerfile: infra/broker.Dockerfile
+    image: rgb-rfq/broker:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      electrs:
+        # electrs has no healthcheck; a missed electrum connect only disables the
+        # confirmation loop (non-fatal), so service_started is enough.
+        condition: service_started
+    environment:
+      BROKER_LISTEN: 0.0.0.0:3000
+      BROKER_DATABASE_URL: postgres://broker:broker@postgres:5432/broker
+      # electrs's in-container electrum port (50001); host sees it on 60601.
+      BROKER_ELECTRUM_URL: tcp://electrs:50001
+      BROKER_CONFIRMATIONS: "1"
+    ports:
+      # Makers (host processes) dial ws://localhost:3000/maker-stream; the dapp
+      # hits the same host:3000 for the HTTP API.
+      - "3000:3000"
+
 volumes:
   bitcoind-data:
   electrs-data:
+  postgres-data:
