@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use maker_node::{
-    broker_client, build_maker, build_runtime, create_inventory_invoice, init, maker_app, orders,
-    fetch_consignment, output, reconsign_consignment, spawn_chain_observer_loop,
+    broker_client, build_maker, build_runtime, create_inventory_invoice, init, maker_app, now_ms,
+    orders, fetch_consignment, output, reconsign_consignment, spawn_chain_observer_loop,
     spawn_cleanup_loop, spawn_order_reload_loop, spawn_rebalance_loop, MakerNodeConfig,
 };
 use colorex_wallet::{resolve_named, resolve_wallet, WalletConfig, WalletInput};
@@ -191,7 +191,18 @@ enum MakerCmd {
     /// Probe broker health.
     Health,
     /// Print the maker's RGB inventory snapshot.
-    Inventory,
+    Inventory {
+        /// Also dump the BTC inventory across all three layers — the on-chain
+        /// wallet (electrum), the RGB-exclusion filter, and the SQLite cache
+        /// coin-selection reads — to diagnose "no BTC inventory" funding gaps.
+        #[arg(long)]
+        btc: bool,
+        /// Electrum URL to sync before reading on-chain UTXOs (for `--btc`).
+        /// Defaults to the config's `[rgb] electrum_url`; omit to read the
+        /// last-synced wallet cache without a fresh sync.
+        #[arg(long)]
+        electrum: Option<String>,
+    },
     /// Print the two wallet addresses to fund: the keychain-0 BTC address (pays
     /// sell-side takers + tx fees) and the keychain-10 RGB-anchor address (for
     /// minting/receiving RGB seal anchors).
@@ -200,6 +211,31 @@ enum MakerCmd {
         /// for addresses only. Tip: your config's `[rgb] electrum_url`.
         #[arg(long)]
         electrum: Option<String>,
+    },
+    /// Full from-scratch wallet rescan (vs the daemon's incremental sync).
+    /// Re-derives every keychain from index 0 with the descriptor's tapret
+    /// tweaks applied, recovering tapret host outputs the incremental scan
+    /// stranded. Run with the daemon stopped; re-check with `inventory --btc`.
+    Rescan {
+        /// Electrum URL to scan against. Defaults to the config's
+        /// `[rgb] electrum_url`.
+        #[arg(long)]
+        electrum: Option<String>,
+    },
+    /// Recover stranded RGB: sweep allocations the wallet can't see (tapret
+    /// host outputs bp-wallet never tracked) into one fresh output at the pinned
+    /// host, so they become spendable inventory again. Run with the daemon
+    /// stopped; `--dry-run` first to see what would be swept.
+    Recover {
+        /// Electrum URL. Defaults to the config's `[rgb] electrum_url`.
+        #[arg(long)]
+        electrum: Option<String>,
+        /// Tx fee for the sweep, in sats.
+        #[arg(long, default_value_t = 1000)]
+        fee: u64,
+        /// Report what would be swept without building/broadcasting anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Mint an RGB invoice to receive inventory from an issuer.
     Invoice {
@@ -283,10 +319,18 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             MakerCmd::Init(args) => init::run(args, &config_path).await,
             MakerCmd::Up => run(load_config(&config_path)?, &config_path).await,
             MakerCmd::Health => health(load_config(&config_path)?).await,
-            MakerCmd::Inventory => inventory(load_config(&config_path)?).await,
+            MakerCmd::Inventory { btc, electrum } => {
+                inventory(load_config(&config_path)?, btc, electrum).await
+            }
             MakerCmd::Addresses { electrum } => {
                 maker_addresses(load_config(&config_path)?, electrum).await
             }
+            MakerCmd::Rescan { electrum } => maker_rescan(load_config(&config_path)?, electrum).await,
+            MakerCmd::Recover {
+                electrum,
+                fee,
+                dry_run,
+            } => maker_recover(load_config(&config_path)?, electrum, fee, dry_run).await,
             MakerCmd::Invoice { amount } => maker_invoice(load_config(&config_path)?, amount).await,
             MakerCmd::Order { cmd } => match cmd {
                 OrderCmd::Create {
@@ -522,6 +566,191 @@ async fn maker_addresses(
         output::note("Pass --electrum <url> (or set [rgb] electrum_url) to show balances.");
     }
     output::note(&format!("Re-sync after funding: colorex wallet sync --name {wallet} --network {network}"));
+    Ok(())
+}
+
+async fn maker_rescan(
+    config: MakerNodeConfig,
+    electrum: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rgb = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: a wallet is required to rescan")?;
+    let electrum_url = electrum
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| rgb.electrum_url.clone());
+    if electrum_url.is_empty() {
+        return Err("no --electrum given and no [rgb] electrum_url in config".into());
+    }
+    let backend = rfq_rgb::LibRgbBackend::new(
+        rgb.data_dir.clone(),
+        rgb.wallet_name.clone(),
+        rgb.network.clone(),
+        electrum_url.clone(),
+        std::path::PathBuf::new(),
+        String::new(),
+    );
+    output::step(&format!("rescanning wallet from scratch via {electrum_url}"));
+    let tracked = backend.rescan_wallet().await?;
+    output::step_ok();
+    output::kv("tracked UTXOs after rescan", &tracked.to_string());
+    output::note("Re-check recovery with: colorex maker inventory --btc");
+    Ok(())
+}
+
+async fn maker_recover(
+    config: MakerNodeConfig,
+    electrum: Option<String>,
+    fee: u64,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rfq_btc::BitcoinClient as _;
+    let rgb = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: a wallet is required to recover")?;
+    if rgb.contract_id.is_empty() {
+        return Err("no [rgb] contract_id in config".into());
+    }
+    let electrum_url = electrum
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| rgb.electrum_url.clone());
+    if electrum_url.is_empty() {
+        return Err("no --electrum given and no [rgb] electrum_url in config".into());
+    }
+    let asset = rfq_types::AssetId {
+        network: rgb.network.parse()?,
+        kind: rfq_types::AssetKind::Rgb20,
+        id: rgb.contract_id.clone(),
+    };
+    // Recovery SIGNS, so the backend needs the real signer (account + password).
+    let backend = rfq_rgb::LibRgbBackend::new(
+        rgb.data_dir.clone(),
+        rgb.wallet_name.clone(),
+        rgb.network.clone(),
+        electrum_url.clone(),
+        rgb.signer.account_file.clone(),
+        rgb.signer.password.clone(),
+    );
+    let probe = rfq_btc::ElectrumClient::connect(&electrum_url)?;
+
+    output::step("syncing wallet");
+    backend.sync_wallet().await?;
+    output::step_ok();
+
+    // Enumerate stranded allocations: live in the stock, NOT tracked by the
+    // wallet, and provably unspent on-chain.
+    let allocs = backend.debug_contract_allocations(&asset).await?;
+    let mut stranded: Vec<(rfq_types::Outpoint, u64, Vec<u8>, u64)> = Vec::new();
+    let mut probe_failed = 0usize;
+    for (op, amount, in_wallet) in allocs {
+        if in_wallet {
+            continue;
+        }
+        match probe.outpoint_unspent(&op).await {
+            Ok(true) => {
+                let txout = probe.get_outpoint(&op).await?;
+                stranded.push((op, txout.value_sats, txout.script_pubkey, amount));
+            }
+            Ok(false) => continue, // spent — skip
+            Err(_) => {
+                // Couldn't confirm on-chain (even after retries) — skip rather
+                // than risk sweeping a spent output; surfaced below so the user
+                // knows to re-run for the rest.
+                probe_failed += 1;
+            }
+        }
+    }
+    if probe_failed > 0 {
+        output::step_warn(&format!(
+            "{probe_failed} allocation(s) could not be checked on-chain (electrum probe \
+             failed) — skipped this pass; re-run `recover` to retry them"
+        ));
+    }
+
+    if stranded.is_empty() {
+        output::note("no stranded RGB found (nothing unspent + off-wallet to recover)");
+        return Ok(());
+    }
+    let rgb_total: u64 = stranded.iter().map(|(_, _, _, amt)| amt).sum();
+    output::kv(
+        "stranded to sweep",
+        &format!("{} outputs · {} units", stranded.len(), rgb_total),
+    );
+    for (op, sats, _, amt) in &stranded {
+        println!("    {}:{}  {amt} units  ({sats} sats)", op.txid, op.vout);
+    }
+
+    // Pick the largest BTC-only UTXO to fund the fee + the new seal anchor.
+    let now = now_ms();
+    let btc = backend.list_btc_only_utxos(&asset, now).await?;
+    let fee_utxo = btc
+        .iter()
+        .max_by_key(|u| u.value_sats)
+        .ok_or("no BTC-only UTXO available to fund the sweep fee")?;
+    output::kv(
+        "fee input",
+        &format!(
+            "{}:{} · {} sats (fee {fee})",
+            fee_utxo.outpoint.txid, fee_utxo.outpoint.vout, fee_utxo.value_sats
+        ),
+    );
+
+    if dry_run {
+        output::note("dry-run: nothing built or broadcast. Re-run without --dry-run to sweep.");
+        return Ok(());
+    }
+
+    // Keep (outpoint, amount) for post-sweep reporting before consuming `stranded`.
+    let stranded_meta: Vec<(rfq_types::Outpoint, u64)> =
+        stranded.iter().map(|(op, _, _, amt)| (op.clone(), *amt)).collect();
+    let stranded_inputs: Vec<(rfq_types::Outpoint, u64, Vec<u8>)> = stranded
+        .into_iter()
+        .map(|(op, sats, spk, _)| (op, sats, spk))
+        .collect();
+    let fee_input = (
+        fee_utxo.outpoint.clone(),
+        fee_utxo.value_sats,
+        fee_utxo.script_pubkey.clone(),
+    );
+
+    output::step("building + signing recovery sweep");
+    let (raw_tx, witness_txid, swept) = backend
+        .recover_stranded_rgb(&asset, stranded_inputs, fee_input, fee)
+        .await?;
+    output::step_ok();
+
+    // The sweep skips any candidate this wallet can't sign (counterparty
+    // allocations FilterIncludeAll surfaced) — report what actually went in.
+    let swept_set: std::collections::HashSet<(String, u32)> =
+        swept.iter().map(|o| (o.txid.clone(), o.vout)).collect();
+    let swept_units: u64 = stranded_meta
+        .iter()
+        .filter(|(op, _)| swept_set.contains(&(op.txid.clone(), op.vout)))
+        .map(|(_, amt)| *amt)
+        .sum();
+    let skipped = stranded_meta.len() - swept.len();
+    if skipped > 0 {
+        output::step_warn(&format!(
+            "skipped {skipped} allocation(s) not spendable by this wallet (not ours)"
+        ));
+    }
+
+    output::step("broadcasting");
+    let broadcast_txid = probe.broadcast(&raw_tx).await?;
+    output::step_ok();
+    output::kv("recovery tx", &broadcast_txid);
+    if broadcast_txid != witness_txid {
+        output::step_warn(&format!(
+            "broadcast txid {broadcast_txid} != built witness id {witness_txid}"
+        ));
+    }
+    output::note(&format!(
+        "{swept_units} units ({} outputs) swept to the pinned host. Once confirmed: \
+         re-sync and `colorex maker inventory --btc` to see them as sellable.",
+        swept.len()
+    ));
     Ok(())
 }
 
@@ -815,7 +1044,11 @@ async fn broker_health_status(
     Ok(response.status)
 }
 
-async fn inventory(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn inventory(
+    config: MakerNodeConfig,
+    btc: bool,
+    electrum: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let _broker_url = parse_broker_url(&config)?;
     let maker = build_maker(&config).await?;
     let snapshot = maker.inventory_summary().await;
@@ -823,6 +1056,280 @@ async fn inventory(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Er
     println!("colorex maker inventory");
     println!("node_id={}", config.maker.node_id);
     print_inventory_snapshot(&snapshot, maker_contract_spec(&config).as_ref());
+
+    if btc {
+        println!();
+        inventory_btc(&config, electrum).await?;
+    }
+
+    Ok(())
+}
+
+/// Dump the BTC inventory across all three layers so a "maker has no BTC
+/// inventory" report can be localized to the layer that drifted:
+///
+/// - **L1/L2 on-chain wallet** (bp-wallet via electrum) — the real UTXO set.
+/// - **RGB-exclusion filter** (`list_btc_only_utxos`) — which of those are
+///   spendable for funding (not carrying an RGB allocation).
+/// - **L3 SQLite cache** (`maker.db` `btc_utxos`) — what coin-selection
+///   actually reads, with per-status counts (only `Available` is selectable).
+///
+/// Read-only. The drift summary at the end tells you which hypothesis holds:
+/// chain-empty → depletion/sync; chain-has-BTC-but-filter-empty → RGB filter;
+/// filter-has-BTC-but-cache-Available-empty → reservation leak / ingest gap.
+async fn inventory_btc(
+    config: &MakerNodeConfig,
+    electrum: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rfq_store::{BtcInventoryStore, SqliteBtcInventoryStore};
+    use rfq_types::BtcInventoryStatus;
+
+    let rgb = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: a wallet is required for --btc inventory")?;
+
+    let electrum_url = electrum
+        .filter(|s| !s.is_empty())
+        .or_else(|| Some(rgb.electrum_url.clone()).filter(|s| !s.is_empty()));
+
+    println!("colorex maker btc-inventory ({})", rgb.network);
+
+    // --- L1/L2: on-chain wallet (sync against electrum when available) ---
+    let backend = rfq_rgb::LibRgbBackend::new(
+        rgb.data_dir.clone(),
+        rgb.wallet_name.clone(),
+        rgb.network.clone(),
+        electrum_url.clone().unwrap_or_default(),
+        std::path::PathBuf::new(),
+        String::new(),
+    );
+    match &electrum_url {
+        Some(url) => match backend.sync_wallet().await {
+            Ok(()) => output::note(&format!("on-chain wallet — synced via {url}")),
+            Err(e) => output::step_warn(&format!("sync failed (showing stale cache): {e}")),
+        },
+        None => output::note("on-chain wallet — STALE (no --electrum / [rgb] electrum_url)"),
+    }
+
+    let raw = backend.wallet_balance().await?;
+    let (mut k0_sats, mut k0_n, mut other_sats, mut other_n) = (0u64, 0usize, 0u64, 0usize);
+    for u in &raw {
+        if u.keychain == 0 {
+            k0_sats += u.sats;
+            k0_n += 1;
+        } else {
+            other_sats += u.sats;
+            other_n += 1;
+        }
+    }
+    output::kv(
+        "keychain 0 (BTC funding)",
+        &format!("{k0_n} utxos · {k0_sats} sats"),
+    );
+    output::kv(
+        "other keychains (RGB anchor)",
+        &format!("{other_n} utxos · {other_sats} sats"),
+    );
+    for u in &raw {
+        println!("    {}:{}  {} sats  k{}/{}", u.txid, u.vout, u.sats, u.keychain, u.index);
+    }
+
+    // --- RGB-exclusion filter: which on-chain UTXOs are fundable ---
+    println!();
+    let filtered = if rgb.contract_id.is_empty() {
+        output::note("RGB filter skipped — no [rgb] contract_id configured");
+        None
+    } else {
+        let asset = rfq_types::AssetId {
+            network: rgb.network.parse()?,
+            kind: rfq_types::AssetKind::Rgb20,
+            id: rgb.contract_id.clone(),
+        };
+        let now = now_ms();
+        let btc_only = backend.list_btc_only_utxos(&asset, now).await?;
+        let only_total: u64 = btc_only.iter().map(|u| u.value_sats).sum();
+        output::kv(
+            "BTC-only (fundable)",
+            &format!("{} utxos · {} sats", btc_only.len(), only_total),
+        );
+        // Anything on-chain but not in btc_only was excluded as RGB-bearing.
+        let keep: std::collections::HashSet<(String, u32)> = btc_only
+            .iter()
+            .map(|u| (u.outpoint.txid.clone(), u.outpoint.vout))
+            .collect();
+        let excluded: Vec<_> = raw
+            .iter()
+            .filter(|u| !keep.contains(&(u.txid.clone(), u.vout)))
+            .collect();
+        if excluded.is_empty() {
+            output::note("excluded as RGB-bearing: none");
+        } else {
+            output::note(&format!("excluded as RGB-bearing: {}", excluded.len()));
+            for u in excluded {
+                println!("    {}:{}  {} sats  k{}/{}", u.txid, u.vout, u.sats, u.keychain, u.index);
+            }
+        }
+        Some(only_total)
+    };
+
+    // --- L3: SQLite cache (what coin-selection reads) ---
+    println!();
+    let db_path = rgb.data_dir.join(&rgb.network).join("maker.db");
+    let store = SqliteBtcInventoryStore::open(&db_path).await?;
+    let rows = store.list_all().await;
+    output::kv("SQLite cache (maker.db btc_utxos)", &db_path.display().to_string());
+    let now = now_ms();
+    let (mut avail_s, mut avail_n) = (0u64, 0usize);
+    let (mut resv_s, mut resv_n) = (0u64, 0usize);
+    let (mut pend_s, mut pend_n) = (0u64, 0usize);
+    let (mut spent_s, mut spent_n) = (0u64, 0usize);
+    let (mut inval_s, mut inval_n) = (0u64, 0usize);
+    let mut detail: Vec<String> = Vec::new();
+    for u in &rows {
+        let op = format!("{}:{}", u.outpoint.txid, u.outpoint.vout);
+        match &u.status {
+            BtcInventoryStatus::Available => {
+                avail_s += u.value_sats;
+                avail_n += 1;
+            }
+            BtcInventoryStatus::Reserved {
+                quote_id,
+                expires_at_ms,
+                ..
+            } => {
+                resv_s += u.value_sats;
+                resv_n += 1;
+                let flag = if *expires_at_ms <= now {
+                    "EXPIRED — should be released".to_string()
+                } else {
+                    format!("expires_in={}ms", expires_at_ms - now)
+                };
+                detail.push(format!(
+                    "    RESERVED {op}  {} sats  quote={} {flag}",
+                    u.value_sats, quote_id.0
+                ));
+            }
+            BtcInventoryStatus::PendingBitcoinConfirm { witness_txid, .. } => {
+                pend_s += u.value_sats;
+                pend_n += 1;
+                detail.push(format!(
+                    "    PENDING  {op}  {} sats  witness={witness_txid}",
+                    u.value_sats
+                ));
+            }
+            BtcInventoryStatus::Spent { .. } => {
+                spent_s += u.value_sats;
+                spent_n += 1;
+            }
+            BtcInventoryStatus::Invalid { reason } => {
+                inval_s += u.value_sats;
+                inval_n += 1;
+                detail.push(format!("    INVALID  {op}  {} sats  reason={reason}", u.value_sats));
+            }
+        }
+    }
+    println!("    Available:  {avail_n} utxos · {avail_s} sats   <-- selectable for funding");
+    println!("    Reserved:   {resv_n} utxos · {resv_s} sats");
+    println!("    Pending:    {pend_n} utxos · {pend_s} sats");
+    println!("    Spent:      {spent_n} utxos · {spent_s} sats");
+    println!("    Invalid:    {inval_n} utxos · {inval_s} sats");
+    for line in &detail {
+        println!("{line}");
+    }
+
+    // --- Drift summary: localize the fault ---
+    println!();
+    output::kv("DRIFT — on-chain BTC-only", &format!("{} sats", filtered.unwrap_or(k0_sats)));
+    output::kv("DRIFT — SQLite Available", &format!("{avail_s} sats"));
+    let chain_fundable = filtered.unwrap_or(k0_sats);
+    if chain_fundable == 0 && k0_sats == 0 {
+        output::note("=> chain k0 empty: DEPLETION or sync failure (check `maker addresses --electrum`)");
+    } else if chain_fundable == 0 && k0_sats > 0 {
+        output::note("=> k0 has BTC but filter returns none: RGB-FILTER over-inclusion");
+    } else if avail_s == 0 && chain_fundable > 0 {
+        output::note("=> fundable on-chain but SQLite Available empty: RESERVATION LEAK / INGEST GAP");
+    } else if avail_s < chain_fundable {
+        output::note("=> SQLite Available < on-chain fundable: partial ingest/reservation drift");
+    } else {
+        output::note("=> layers agree: inventory looks healthy");
+    }
+
+    // --- RGB allocations: stock vs wallet vs CHAIN ---
+    // The stock's `FilterIncludeAll` lists every allocation it has ever seen,
+    // INCLUDING spent ones — so "not in wallet" alone can't tell stranded from
+    // spent. We probe the chain per outpoint to split them:
+    //   - SPENT on-chain          → history, ignore
+    //   - UNSPENT + in wallet      → sellable (should be Available inventory)
+    //   - UNSPENT + NOT in wallet  → TRULY STRANDED (the recoverable bug)
+    if !rgb.contract_id.is_empty() {
+        println!();
+        let asset = rfq_types::AssetId {
+            network: rgb.network.parse()?,
+            kind: rfq_types::AssetKind::Rgb20,
+            id: rgb.contract_id.clone(),
+        };
+        let allocs = backend.debug_contract_allocations(&asset).await?;
+        output::kv("RGB stock allocations (incl. spent)", &format!("{}", allocs.len()));
+
+        let probe = match &electrum_url {
+            Some(url) => rfq_btc::ElectrumClient::connect(url).ok(),
+            None => None,
+        };
+        if probe.is_none() {
+            output::step_warn("no electrum — cannot probe on-chain spent status; showing wallet view only");
+        }
+
+        let (mut sellable_amt, mut sellable_n) = (0u64, 0usize);
+        let (mut stranded_amt, mut stranded_n) = (0u64, 0usize);
+        let (mut spent_n, mut unknown_n) = (0usize, 0usize);
+        for (op, amount, in_wallet) in &allocs {
+            let unspent = match &probe {
+                Some(c) => c.outpoint_unspent(op).await.ok(),
+                None => None,
+            };
+            let tag = match (unspent, in_wallet) {
+                (Some(true), true) => {
+                    sellable_amt += amount;
+                    sellable_n += 1;
+                    "UNSPENT · in-wallet (sellable)"
+                }
+                (Some(true), false) => {
+                    stranded_amt += amount;
+                    stranded_n += 1;
+                    "UNSPENT · NOT in wallet — STRANDED (recoverable)"
+                }
+                (Some(false), _) => {
+                    spent_n += 1;
+                    continue; // spent history — don't print the noise
+                }
+                (None, true) => "in-wallet (chain unknown)",
+                (None, false) => {
+                    unknown_n += 1;
+                    "NOT in wallet (chain unknown)"
+                }
+            };
+            println!("    {}:{}  {} units  {tag}", op.txid, op.vout, amount);
+        }
+
+        output::kv("  sellable (unspent, in-wallet)", &format!("{sellable_n} · {sellable_amt} units"));
+        output::kv("  STRANDED (unspent, off-wallet)", &format!("{stranded_n} · {stranded_amt} units"));
+        output::kv("  spent (history, hidden)", &format!("{spent_n}"));
+        if unknown_n > 0 {
+            output::kv("  chain-unknown (no probe)", &format!("{unknown_n}"));
+        }
+        if probe.is_some() {
+            if stranded_amt > 0 {
+                output::note(&format!(
+                    "=> RGB: {stranded_amt} units STRANDED on tapret outputs bp-wallet never tracked — RECOVERABLE (index-reuse recognition bug)"
+                ));
+            } else if sellable_amt > 0 {
+                output::note("=> RGB: sellable allocation present but store shows 0 available — STORE/INGEST stale (re-sync/reconcile)");
+            } else {
+                output::note("=> RGB: no unspent allocation on-chain — genuine DEPLETION (re-fund the maker)");
+            }
+        }
+    }
 
     Ok(())
 }
@@ -889,7 +1396,10 @@ mod tests {
         assert_eq!(
             Cli::parse_from(["colorex", "maker", "inventory"]).command,
             TopCommand::Maker {
-                cmd: MakerCmd::Inventory
+                cmd: MakerCmd::Inventory {
+                    btc: false,
+                    electrum: None,
+                }
             },
         );
         assert_eq!(

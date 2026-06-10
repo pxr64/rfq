@@ -24,6 +24,7 @@ use crate::{is_segwit_script, BitcoinClient, BtcError, TxConfirmation, TxOut};
 
 pub struct ElectrumClient {
     client: Arc<Client>,
+    url: String,
 }
 
 impl ElectrumClient {
@@ -36,8 +37,86 @@ impl ElectrumClient {
             .map_err(|e| BtcError::Backend(format!("electrum connect: {e}")))?;
         Ok(Self {
             client: Arc::new(client),
+            url: url.to_owned(),
         })
     }
+
+    /// Is `outpoint` currently unspent on-chain? Resolves the output's own
+    /// scriptPubkey (via `transaction.get`) then queries that script's UTXO
+    /// set (`scripthash.listunspent`) and checks for the outpoint — so it
+    /// works for ANY outpoint without knowing its address ahead of time
+    /// (e.g. a tapret-tweaked output bp-wallet never tracked). Diagnostic-only.
+    pub async fn outpoint_unspent(&self, outpoint: &Outpoint) -> Result<bool, BtcError> {
+        let txid = Txid::from_str(&outpoint.txid)
+            .map_err(|e| BtcError::Backend(format!("invalid txid {}: {e}", outpoint.txid)))?;
+        let vout = outpoint.vout;
+        let client = Arc::clone(&self.client);
+        let target = outpoint.clone();
+        let url = self.url.clone();
+        tokio::task::spawn_blocking(move || {
+            // The electrum protocol over a single socket drops calls under a
+            // rapid sequential sweep (we probe dozens of outpoints back to back).
+            // Retry with backoff, and on the last attempt fall back to a FRESH
+            // connection in case the shared socket itself went bad. Surface the
+            // real error after exhausting retries rather than swallowing it.
+            const ATTEMPTS: usize = 4;
+            let mut last_err: Option<electrum_client::Error> = None;
+            for attempt in 0..ATTEMPTS {
+                let fresh;
+                let c: &Client = if attempt + 1 == ATTEMPTS {
+                    match Client::from_config(&url, ConfigBuilder::new().build()) {
+                        Ok(client) => {
+                            fresh = client;
+                            &fresh
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                            break;
+                        }
+                    }
+                } else {
+                    &client
+                };
+                match probe_outpoint_unspent(c, &txid, vout, &target) {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        last_err = Some(e);
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            200 * (attempt as u64 + 1),
+                        ));
+                    }
+                }
+            }
+            Err(last_err.expect("at least one attempt ran"))
+        })
+        .await
+        .map_err(|e| BtcError::Backend(format!("blocking task join: {e}")))?
+        .map_err(|e: electrum_client::Error| {
+            BtcError::Backend(format!(
+                "electrum outpoint_unspent {} after retries: {e}",
+                outpoint.txid
+            ))
+        })
+    }
+}
+
+/// One probe: resolve the output's scriptPubkey and check it's in that script's
+/// UTXO set. Separated so the retry loop can re-run it on a fresh connection.
+fn probe_outpoint_unspent(
+    client: &Client,
+    txid: &Txid,
+    vout: u32,
+    target: &Outpoint,
+) -> Result<bool, electrum_client::Error> {
+    let tx = client.transaction_get(txid)?;
+    let txout = match tx.output.get(vout as usize) {
+        Some(o) => o,
+        None => return Ok(false),
+    };
+    let unspent = client.script_list_unspent(&txout.script_pubkey)?;
+    Ok(unspent
+        .into_iter()
+        .any(|u| u.tx_hash.to_string() == target.txid && u.tx_pos as u32 == target.vout))
 }
 
 #[async_trait]

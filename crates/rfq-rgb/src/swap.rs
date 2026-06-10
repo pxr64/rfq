@@ -46,9 +46,9 @@ use bpstd::dbc::tapret::TapretProof;
 use bpstd::seals::txout::CloseMethod;
 use bpstd::signers::TestnetRefSigner;
 use bpstd::{
-    Address, ConsensusEncode, Derive, Descriptor, Keychain, LockTime, Outpoint as BpOutpoint, Sats,
-    ScriptPubkey, SeqNo, SigScript, SighashType, Terminal, TxOut as BpTxOut, TxVer, Txid,
-    VarIntArray, Vout,
+    Address, ConsensusEncode, Derive, Descriptor, Keychain, LockTime, NormalIndex,
+    Outpoint as BpOutpoint, Sats, ScriptPubkey, SeqNo, SigScript, SighashType, Terminal,
+    TxOut as BpTxOut, TxVer, Txid, VarIntArray, Vout,
     XprivAccount, XpubDerivable,
 };
 use bpwallet::Wallet;
@@ -255,29 +255,39 @@ pub fn enrich_psbt_input(
     Ok(())
 }
 
-/// Cap on the address scan used to recover a freshly-derived host address's
-/// terminal (see [`next_tapret_host_addr`]). The host is always at the wallet's
-/// highest derived index, but `next_derivation_index` is private so we scan up
-/// from 0. 10k covers thousands of swaps on a regtest/signet wallet; a
-/// high-volume maker would want the index returned directly (upstream gap).
-const TAPRET_HOST_SCAN_LIMIT: usize = 10_000;
+/// The maker pins EVERY tapret commitment host (buy change + sell receive) to
+/// this single low index on the Tapret keychain (10), rather than calling
+/// `next_address` to advance. Why: a tapret host's on-chain scriptPubkey is the
+/// *tweaked* taproot key, which bp-wallet's electrum scan tracks unreliably.
+/// When the host drifts to a sparse high index, the scan's gap limit (it stops
+/// after N consecutive empty addresses) never reaches it and the maker's RGB
+/// change is stranded — every swap's change becomes invisible/unspendable. A
+/// fixed LOW index is always inside the gap window, so the host is always
+/// rescanned. Each swap still produces a distinct on-chain output: the
+/// commitment differs, so the tweaked key differs, even at the same terminal;
+/// the descriptor accumulates all tweaks under this one terminal and the derive
+/// impl emits the plain key + every stored tweak, so the scan finds them all.
+const TAPRET_HOST_INDEX: u16 = 0;
 
-/// Derive a fresh Tapret-keychain address for a tapret commitment host and
-/// recover its [`Terminal`] — which `next_address` discards — so the caller can
-/// enrich the host output with the `tap_internal_key` that `rgb_commit` needs to
-/// tweak it (and the `tap_bip32_derivation` Phase 2 needs to persist the tweak).
-fn next_tapret_host_addr(wallet: &mut MakerWallet) -> Result<(ScriptPubkey, Terminal), RgbError> {
-    let addr = wallet.wallet_mut().next_address(RgbKeychain::Tapret, true);
-    let terminal = wallet
+/// Derive the maker's pinned Tapret-keychain host address (`TAPRET_HOST_INDEX`)
+/// and its [`Terminal`], so the caller can enrich the host output with the
+/// `tap_internal_key` that `rgb_commit` tweaks (and the `tap_bip32_derivation`
+/// the tweak persistence needs). Returns the PLAIN (untweaked) P2TR spk —
+/// `rgb_commit` rewrites it to the committed key. Pinned, NOT advanced; see
+/// [`TAPRET_HOST_INDEX`].
+fn pinned_tapret_host_addr(wallet: &MakerWallet) -> Result<(ScriptPubkey, Terminal), RgbError> {
+    let terminal = Terminal::new(RgbKeychain::Tapret, NormalIndex::from(TAPRET_HOST_INDEX));
+    let derived = wallet
         .wallet()
-        .addresses(RgbKeychain::Tapret)
-        .take(TAPRET_HOST_SCAN_LIMIT)
-        .find(|da| da.addr == addr)
-        .map(|da| da.terminal)
+        .descriptor()
+        .derive(terminal.keychain, terminal.index)
+        // First yield is the plain `TaprootKeyOnly` key (the untweaked host);
+        // any further yields are stored tweaks. We want the plain one.
+        .next()
         .ok_or_else(|| {
-            RgbError::TransferBuild("could not recover tapret host terminal".to_owned())
+            RgbError::TransferBuild("descriptor produced no tapret host script".to_owned())
         })?;
-    Ok((addr.script_pubkey(), terminal))
+    Ok((derived.to_script_pubkey(), terminal))
 }
 
 /// Mark the maker-owned P2TR output at `host_spk` as the tapret commitment host,
@@ -357,7 +367,7 @@ pub(crate) fn prepare_buy_inputs(
     // re-derives tapret-tweaked outputs from. It also carries the maker's
     // RGB-change seal (bound post-sort in `build_buy_transition`). Its terminal
     // is captured so the host output can be enriched with its internal key.
-    let (maker_payout_spk, maker_payout_terminal) = next_tapret_host_addr(wallet)?;
+    let (maker_payout_spk, maker_payout_terminal) = pinned_tapret_host_addr(wallet)?;
     let maker_btc_change_spk = wallet
         .wallet_mut()
         .next_address(Keychain::OUTER, true)
@@ -877,7 +887,7 @@ pub(crate) fn prepare_sell_inputs(
     // carries RGB, stays segregated from BTC payment UTXOs, composes with the
     // anchor-exclusion / `list_btc_only_utxos` logic, and is the output bp-wallet
     // re-derives once the tapret tweak rewrites its key.
-    let (maker_receive_spk, maker_receive_terminal) = next_tapret_host_addr(wallet)?;
+    let (maker_receive_spk, maker_receive_terminal) = pinned_tapret_host_addr(wallet)?;
     // BTC change stays on keychain 0 (a payment output, no RGB).
     let maker_change_spk = wallet
         .wallet_mut()
@@ -1196,7 +1206,14 @@ pub(crate) fn finalize_signed_psbt(
 ) -> Result<(Vec<u8>, Txid), RgbError> {
     let mut psbt = Psbt::from_base64(signed_psbt_base64)
         .map_err(|e| RgbError::FinalizeFailed(format!("decode signed PSBT: {e}")))?;
+    finalize_psbt_in_place(&mut psbt, descriptor)
+}
 
+/// Finalize an already-signed (in-memory) PSBT against `descriptor` and extract
+/// the raw witness tx + txid. Shared by the taker-round-trip path
+/// ([`finalize_signed_psbt`]) and the unilateral recovery sweep (every input is
+/// the maker's, so it signs + finalizes in one shot).
+fn finalize_psbt_in_place(psbt: &mut Psbt, descriptor: &RgbDescr) -> Result<(Vec<u8>, Txid), RgbError> {
     psbt.finalize(descriptor);
 
     // A taker that finalized its input externally (e.g. the browser wallet via
@@ -1215,9 +1232,7 @@ pub(crate) fn finalize_signed_psbt(
 
     if !psbt.is_finalized() {
         return Err(RgbError::FinalizeFailed(
-            "PSBT has unfinalized inputs after maker finalize; \
-             taker submitted partial sigs without finalizing its own inputs"
-                .to_owned(),
+            "PSBT has unfinalized inputs after finalize".to_owned(),
         ));
     }
 
@@ -1226,4 +1241,256 @@ pub(crate) fn finalize_signed_psbt(
         .extract()
         .map_err(|e| RgbError::FinalizeFailed(format!("extract signed tx: {e}")))?;
     Ok((tx.consensus_serialize(), witness_id))
+}
+
+/// An on-chain output the maker controls but bp-wallet's UTXO cache doesn't
+/// track — its `(value, scriptPubkey)` come from the chain (electrum) and its
+/// `terminal` is recovered by matching the spk against descriptor derivations.
+/// This is how the recovery sweep addresses the maker's stranded tapret outputs.
+pub struct RecoveryInput {
+    pub outpoint: Outpoint,
+    pub value_sats: u64,
+    pub script_pubkey: Vec<u8>,
+}
+
+/// Resolve the descriptor [`Terminal`] that produces `spk`, scanning plain +
+/// tweaked derivations across the descriptor's OWN keychains (read from
+/// `keychains()` — e.g. `0;1;10` — not a hardcoded guess) up to `INDEX_SCAN`.
+/// Lets the sweep enrich + sign a stranded output the UTXO cache never tracked.
+/// `None` when no terminal matches — which also means "not this wallet's output"
+/// (e.g. a counterparty allocation the stock has merely seen), so the sweep
+/// skips it rather than trying to sign someone else's coin.
+fn resolve_terminal_for_spk(descriptor: &RgbDescr, spk: &ScriptPubkey) -> Option<Terminal> {
+    const INDEX_SCAN: u16 = 1000;
+    for keychain in descriptor.keychains() {
+        for index in 0..INDEX_SCAN {
+            let terminal = Terminal::new(keychain, NormalIndex::from(index));
+            if descriptor
+                .derive(terminal.keychain, terminal.index)
+                .any(|d| d.to_script_pubkey() == *spk)
+            {
+                return Some(terminal);
+            }
+        }
+    }
+    None
+}
+
+/// Build, sign, and finalize a unilateral RECOVERY sweep: spend the maker's
+/// `stranded` RGB outputs (which bp-wallet doesn't track, so the normal
+/// wallet-selection path can't reach them) plus one BTC `fee_input`, into a
+/// single fresh tapret host output at the PINNED index — re-homing all the RGB
+/// onto a UTXO the wallet will recognise. Returns the raw witness tx + txid for
+/// the caller to broadcast.
+///
+/// Spending the stranded tweaked outputs is mechanically identical to a normal
+/// swap's RGB inputs (`enrich_psbt_input` matches the on-chain spk to the
+/// tweaked derived key, so the signer uses the right key); the only difference
+/// is the inputs are sourced from the chain + stock, not the UTXO cache.
+pub(crate) fn build_recovery_sweep(
+    wallet: &mut MakerWallet,
+    account: &XprivAccount,
+    contract_id: ContractId,
+    stranded: &[RecoveryInput],
+    fee_input: &RecoveryInput,
+    fee_sats: u64,
+) -> Result<(Vec<u8>, Txid, Vec<Outpoint>), RgbError> {
+    if stranded.is_empty() {
+        return Err(RgbError::TransferBuild(
+            "recovery sweep needs at least one stranded RGB input".to_owned(),
+        ));
+    }
+    let descriptor = wallet.wallet().descriptor().clone();
+
+    let resolve = |inp: &RecoveryInput| -> Option<MakerRgbInput> {
+        let spk = ScriptPubkey::from_unsafe(inp.script_pubkey.clone());
+        let terminal = resolve_terminal_for_spk(&descriptor, &spk)?;
+        Some(MakerRgbInput {
+            outpoint: to_bp_outpoint(&inp.outpoint).ok()?,
+            value: Sats(inp.value_sats),
+            terminal,
+            script: spk,
+        })
+    };
+
+    // Keep only the stranded outputs THIS wallet can sign. Unresolvable ones are
+    // not ours (FilterIncludeAll surfaces counterparty allocations the stock has
+    // seen) — skip them rather than abort the whole sweep.
+    let mut rgb_inputs: Vec<MakerRgbInput> = Vec::new();
+    let mut swept: Vec<Outpoint> = Vec::new();
+    for inp in stranded {
+        match resolve(inp) {
+            Some(mi) => {
+                rgb_inputs.push(mi);
+                swept.push(inp.outpoint.clone());
+            }
+            None => continue,
+        }
+    }
+    if rgb_inputs.is_empty() {
+        return Err(RgbError::TransferBuild(
+            "none of the stranded outputs are spendable by this wallet \
+             (no descriptor terminal derives them — not ours)"
+                .to_owned(),
+        ));
+    }
+    let btc_input = resolve(fee_input).ok_or_else(|| {
+        RgbError::TransferBuild(format!(
+            "fee input {}:{} is not derivable by this wallet",
+            fee_input.outpoint.txid, fee_input.outpoint.vout
+        ))
+    })?;
+
+    // The pinned host both carries the RGB seal anchor and hosts the tapret
+    // commitment — the whole point of the sweep is to land the RGB here.
+    let (host_spk, host_terminal) = pinned_tapret_host_addr(wallet)?;
+    let maker_change_spk = wallet
+        .wallet_mut()
+        .next_address(Keychain::OUTER, true)
+        .script_pubkey();
+
+    // BTC math: every input's sats fund a small seal anchor on the host + the
+    // fee, with the surplus returned to a maker change output.
+    let total_in: u64 = rgb_inputs
+        .iter()
+        .map(|i| i.value.into_inner())
+        .sum::<u64>()
+        .saturating_add(btc_input.value.into_inner());
+    let host_anchor = SEAL_ANCHOR_SATS;
+    if total_in < host_anchor.saturating_add(fee_sats) {
+        return Err(RgbError::TransferBuild(format!(
+            "recovery inputs {total_in} sats < anchor {host_anchor} + fee {fee_sats}"
+        )));
+    }
+    let change = total_in - host_anchor - fee_sats;
+
+    // Assemble the unsigned tx: RGB inputs, then the BTC fee input; host output
+    // first (pre-sort), maker BTC change if above dust.
+    let seq = SeqNo::from_consensus_u32(SEQ_FINAL);
+    let tx_inputs: Vec<UnsignedTxIn> = rgb_inputs
+        .iter()
+        .chain(std::iter::once(&btc_input))
+        .map(|i| UnsignedTxIn {
+            prev_output: i.outpoint,
+            sequence: seq,
+        })
+        .collect();
+    let mut tx_outputs = vec![BpTxOut::new(host_spk.clone(), Sats(host_anchor))];
+    if change > DUST_LIMIT_SATS {
+        tx_outputs.push(BpTxOut::new(maker_change_spk, Sats(change)));
+    }
+    let unsigned_tx = UnsignedTx {
+        version: TxVer::V2,
+        inputs: VarIntArray::from_iter_checked(tx_inputs),
+        outputs: VarIntArray::from_iter_checked(tx_outputs),
+        lock_time: LockTime::ZERO,
+    };
+    let mut psbt = Psbt::from_tx(unsigned_tx);
+
+    // Enrich every input (all the maker's) so the signer recognises them.
+    for (i, mi) in rgb_inputs.iter().chain(std::iter::once(&btc_input)).enumerate() {
+        enrich_psbt_input(&mut psbt, i, &descriptor, mi.terminal, mi.value, Some(&mi.script))?;
+    }
+
+    psbt.set_rgb_close_method(CloseMethod::TapretFirst);
+    psbt.set_rgb_tapret_host_on_change();
+    enrich_tapret_host(&mut psbt, &host_spk, &descriptor, host_terminal)?;
+    psbt.sort_outputs_by(|o| !o.is_tapret_host())
+        .expect("PSBT outputs are modifiable");
+    psbt.complete_construction();
+
+    // Build the transition: consume all stranded allocations, assign the full
+    // sum to one change seal bound to the host's post-sort vout.
+    let (batch, change_seal) =
+        build_recovery_transition(wallet, contract_id, &rgb_inputs, &psbt, &host_spk)?;
+
+    // Commit (persists the tweak at the pinned terminal + records the new
+    // allocation in the stock), then sign every input and finalize.
+    commit_and_consign(
+        wallet,
+        &mut psbt,
+        batch,
+        contract_id,
+        DeliverySeal::WitnessVout(change_seal),
+    )?;
+    sign_maker_inputs(&mut psbt, account)?;
+    let (raw_tx, txid) = finalize_psbt_in_place(&mut psbt, &descriptor)?;
+    Ok((raw_tx, txid, swept))
+}
+
+/// The recovery transition: consume every stranded allocation and re-assign the
+/// entire sum to one change seal bound to the pinned host output's post-sort
+/// vout. The unilateral analogue of [`build_buy_transition`] — no counterparty.
+fn build_recovery_transition(
+    wallet: &MakerWallet,
+    contract_id: ContractId,
+    rgb_inputs: &[MakerRgbInput],
+    psbt: &Psbt,
+    host_spk: &ScriptPubkey,
+) -> Result<(Batch, GraphSeal), RgbError> {
+    let host_vout = psbt
+        .outputs()
+        .find(|o| o.script == *host_spk)
+        .map(|o| o.vout())
+        .ok_or_else(|| RgbError::TransferBuild("host output missing after sort".to_owned()))?;
+
+    let contract = wallet
+        .stock()
+        .contract_data(contract_id)
+        .map_err(|e| RgbError::ContractNotFound(e.to_string()))?;
+    let assignment_type = contract
+        .schema
+        .assignment_types_for_state(StateType::Fungible)
+        .first()
+        .map(|t| **t)
+        .ok_or_else(|| RgbError::TransferBuild("contract has no fungible assignment".to_owned()))?;
+    let transition_type = contract
+        .schema
+        .default_transition_for_assignment(&assignment_type);
+
+    let mut builder = wallet
+        .stock()
+        .transition_builder_raw(contract_id, transition_type)
+        .map_err(|e| RgbError::TransferBuild(format!("transition builder: {e}")))?;
+
+    let bp_outpoints: Vec<BpOutpoint> = rgb_inputs.iter().map(|mi| mi.outpoint).collect();
+    let assignments = wallet
+        .stock()
+        .contract_assignments_for(contract_id, bp_outpoints)
+        .map_err(|e| RgbError::TransferBuild(format!("contract assignments: {e}")))?;
+    let mut sum_inputs: u64 = 0;
+    for (_seal, opouts) in assignments {
+        for (opout, state) in opouts {
+            builder = builder
+                .add_input(opout, state.clone())
+                .map_err(|e| RgbError::TransferBuild(format!("add_input: {e}")))?;
+            if let AllocatedState::Amount(value) = state {
+                sum_inputs = sum_inputs.saturating_add(value.as_inner().as_u64());
+            }
+        }
+    }
+    if sum_inputs == 0 {
+        return Err(RgbError::TransferBuild(
+            "no RGB allocations found for the stranded outpoints".to_owned(),
+        ));
+    }
+
+    let change_seal = GraphSeal::with_blinded_vout(host_vout, rand::random());
+    builder = builder
+        .add_fungible_state_raw(
+            assignment_type,
+            BuilderSeal::Revealed(change_seal),
+            Amount::from(sum_inputs),
+        )
+        .map_err(|e| RgbError::TransferBuild(format!("add recovery state: {e}")))?;
+
+    let main = builder
+        .complete_transition()
+        .map_err(|e| RgbError::TransferBuild(format!("complete_transition: {e}")))?;
+    let mut batch = Batch {
+        main,
+        extras: Default::default(),
+    };
+    batch.set_priority(u64::MAX);
+    Ok((batch, change_seal))
 }

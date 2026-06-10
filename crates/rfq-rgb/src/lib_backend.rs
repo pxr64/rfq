@@ -515,6 +515,79 @@ impl LibRgbBackend {
         Ok(())
     }
 
+    /// Full from-scratch rescan (vs `sync_wallet`'s incremental `update`).
+    /// Rebuilds the UTXO cache by re-deriving every keychain from index 0,
+    /// applying the descriptor's stored tapret tweaks (the derive impl emits
+    /// the plain key *and* every stored tweak per terminal). Recovers tapret
+    /// host outputs the incremental scan stranded — within the indexer's gap
+    /// limit (`BATCH_SIZE` consecutive-empty cutoff), so sparse high indexes
+    /// past the gap may still be missed. Returns the count of tracked UTXOs
+    /// after the rescan so callers can report recovery.
+    pub async fn rescan_wallet(&self) -> Result<usize, RgbError> {
+        let _guard = self.guard();
+        use bpwallet::AnyIndexer;
+        let mut wallet = self.load_wallet()?;
+        let client = electrum::Client::new(&self.electrum_url)
+            .map_err(|e| RgbError::StashLoad(format!("electrum connect: {e}")))?;
+        let indexer = AnyIndexer::Electrum(Box::new(client));
+        let result = wallet.wallet_mut().sync_from_scratch(&indexer);
+        if let Some(errors) = result.err {
+            return Err(RgbError::StashLoad(format!(
+                "wallet rescan surfaced {} error(s): {:?}",
+                errors.len(),
+                errors
+            )));
+        }
+        Ok(wallet.wallet().utxos().count())
+    }
+
+    /// Recover stranded RGB: sweep the maker's `stranded` outputs (which
+    /// bp-wallet doesn't track, so normal selection can't reach them) plus one
+    /// BTC `fee_input` into a single fresh tapret host output at the PINNED
+    /// index — re-homing all the RGB onto a UTXO the wallet will recognise.
+    /// Each input is `(outpoint, value_sats, scriptPubkey)` as read from the
+    /// chain; the caller broadcasts the returned raw tx. Returns
+    /// `(raw_tx, witness_txid)`. The stranded outpoints must still be unspent
+    /// and hold live allocations in the stock (use the `inventory --btc`
+    /// diagnostic to enumerate them).
+    pub async fn recover_stranded_rgb(
+        &self,
+        asset: &AssetId,
+        stranded: Vec<(Outpoint, u64, Vec<u8>)>,
+        fee_input: (Outpoint, u64, Vec<u8>),
+        fee_sats: u64,
+    ) -> Result<(Vec<u8>, String, Vec<Outpoint>), RgbError> {
+        let _guard = self.guard();
+        let account = self.load_signer()?;
+        let mut wallet = self.load_wallet()?;
+        let contract_id = ContractId::from_str(&asset.id)
+            .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
+
+        let stranded_inputs: Vec<swap::RecoveryInput> = stranded
+            .into_iter()
+            .map(|(outpoint, value_sats, script_pubkey)| swap::RecoveryInput {
+                outpoint,
+                value_sats,
+                script_pubkey,
+            })
+            .collect();
+        let fee = swap::RecoveryInput {
+            outpoint: fee_input.0,
+            value_sats: fee_input.1,
+            script_pubkey: fee_input.2,
+        };
+
+        let (raw_tx, witness_id, swept) = swap::build_recovery_sweep(
+            &mut wallet,
+            &account,
+            contract_id,
+            &stranded_inputs,
+            &fee,
+            fee_sats,
+        )?;
+        Ok((raw_tx, witness_id.to_string(), swept))
+    }
+
     /// Sync the wallet against electrum, then return its tracked UTXOs (BTC).
     /// Role-agnostic — needs no RGB contract; sum `sats` for the spendable
     /// balance, and the keychain distinguishes the BTC (0) vs RGB-anchor (10)
@@ -764,6 +837,75 @@ impl LibRgbBackend {
             });
         }
         Ok(btc)
+    }
+
+    /// Diagnostic/test: the wallet terminal `(keychain, index)` a tracked UTXO
+    /// derives from, or `None` if bp-wallet doesn't track the outpoint. Used to
+    /// assert the maker's tapret change lands on the pinned host terminal.
+    pub async fn debug_outpoint_terminal(
+        &self,
+        outpoint: &Outpoint,
+    ) -> Result<Option<(u32, u32)>, RgbError> {
+        use bpstd::IdxBase as _;
+        let _guard = self.guard();
+        let wallet = self.load_wallet()?;
+        let terminal = wallet
+            .wallet()
+            .utxos()
+            .find(|u| {
+                u.outpoint.txid.to_string() == outpoint.txid
+                    && u.outpoint.vout.into_u32() == outpoint.vout
+            })
+            .map(|u| (u.terminal.keychain.index(), u.terminal.index.index()));
+        Ok(terminal)
+    }
+
+    /// Diagnostic: every **live** allocation the RGB stock holds for `asset`,
+    /// each tagged with whether its outpoint is in the wallet's UTXO set.
+    /// Unlike `list_inventory_utxos` — which silently drops non-owned
+    /// allocations — this surfaces them, so "the maker has no RGB inventory"
+    /// can be split into *depletion* (no live allocation at all) vs *lost
+    /// change* (a live allocation exists but on an outpoint bp-wallet isn't
+    /// tracking → `in_wallet == false`). Returns `(outpoint, amount, in_wallet)`.
+    pub async fn debug_contract_allocations(
+        &self,
+        asset: &AssetId,
+    ) -> Result<Vec<(Outpoint, u64, bool)>, RgbError> {
+        let _guard = self.guard();
+        let wallet = self.load_wallet()?;
+        let contract_id = ContractId::from_str(&asset.id)
+            .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
+        let contract = wallet
+            .stock()
+            .contract_data(contract_id)
+            .map_err(|e| RgbError::ContractNotFound(e.to_string()))?;
+
+        let owned: std::collections::HashSet<(String, u32)> = wallet
+            .wallet()
+            .utxos()
+            .map(|u| (u.outpoint.txid.to_string(), u.outpoint.vout.into_u32()))
+            .collect();
+
+        let mut out = Vec::new();
+        let filter = FilterIncludeAll;
+        for details in contract.schema.owned_types.values() {
+            if let Ok(allocs) = contract.fungible(details.name.clone(), &filter) {
+                for alloc in allocs {
+                    let op = alloc.seal.to_outpoint();
+                    let key = (op.txid.to_string(), op.vout.into_u32());
+                    let in_wallet = owned.contains(&key);
+                    out.push((
+                        Outpoint {
+                            txid: key.0,
+                            vout: key.1,
+                        },
+                        alloc.state.value(),
+                        in_wallet,
+                    ));
+                }
+            }
+        }
+        Ok(out)
     }
 
     #[allow(dead_code)]

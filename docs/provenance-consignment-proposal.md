@@ -91,10 +91,18 @@ export_provenance(contract_id, outpoints) -> consignment
 - **Spends nothing, touches no bitcoin, references no counterparty seal, needs no
   anchor.** There is no future tx in the artifact, so nothing to resolve.
 - Mechanically: re-derive a consignment for an already-settled receive — in
-  rgb-std terms, `Stock::transfer(contract, [output_seal], [], [], Some(txid))`
-  (the "reconsign" primitive).
-- Requires the allocation to sit on a **witness-vout (explicit `txid:vout`) seal**
-  so it can be addressed.
+  rgb-std terms, `Stock::transfer(contract, [output_seal], [], [], None)`. The
+  witness id **MUST be left unspecified**: a seal's `txid` equals its anchoring
+  witness tx *only for witness-vout receives*. For an allocation **received on a
+  blinded seal** bound to a pre-existing UTXO, the transition lives on a *different*
+  witness tx, so pinning the seal's txid as the witness filter excludes the
+  relevant bundle and yields an **empty consignment**. Leaving it unspecified lets
+  the stock resolve the bundle from the outpoint and walk the full graph to genesis.
+- Works for **any allocation the holder can address by its current `txid:vout`** —
+  i.e. all of the holder's own allocations once revealed in its stash, **regardless
+  of whether they were received via a blinded or a witness-vout invoice**. The only
+  requirement is a known, revealed outpoint (which the holder always has for its own
+  seals).
 
 The **counterparty (tx builder)** then:
 
@@ -184,11 +192,10 @@ right tool for *one-shot coordinated transfers*.
 - Should `export_provenance` be a **first-class wallet API** and/or part of the
   RGB invoicing spec, alongside `pay`/invoice?
 - Is there a **standard wire encoding** for "the outpoints being authorized" to
-  accompany the consignment, or should the counterparty derive them from the
-  consignment's terminals?
-- **Blinded-received allocations** cannot be exported this way (no explicit
-  outpoint to address). Is that an acceptable constraint, or is there a
-  generalization?
+  accompany the consignment? The counterparty **cannot derive them from the
+  consignment** — terminals carry only *secret* (blinded) seals, so explicit
+  witness-vout outpoints never appear there — so an explicit list alongside the
+  consignment is required, not optional.
 - How does this relate to existing/anticipated **RGB swap and PSBT-coordination
   proposals**? We believe "holder-exports-provenance" vs "receiver-anchors-a-seal"
   is a general fork that any RGB DEX or coordinated-tx protocol must resolve on the
