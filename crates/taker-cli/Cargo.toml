@@ -12,7 +12,7 @@ path = "src/main.rs"
 rfq-types = { path = "../rfq-types" }
 rfq-rgb = { path = "../rfq-rgb" }
 rfq-client = { path = "../rfq-client" }
-colorex-wallet = { path = "../colorex-wallet" }
+rfq-wallet = { path = "../rfq-wallet" }
 dialoguer = { version = "0.11", default-features = false, features = ["password"] }
 tokio.workspace = true
 clap = { workspace = true, features = ["derive"] }

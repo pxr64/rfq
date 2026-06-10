@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use colorex_wallet::{resolve_wallet, WalletInput};
+use rfq_wallet::{resolve_wallet, WalletInput};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input};
 use rfq_client::{RfqClient, Url};
 use rfq_rgb::Taker;
@@ -117,7 +117,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Command::Balance => {
-            let rw = colorex_wallet::ResolvedWallet {
+            let rw = rfq_wallet::ResolvedWallet {
                 name: config.rgb.wallet_name.clone(),
                 network: config.rgb.network.clone(),
                 data_dir: config.rgb.data_dir.clone(),
@@ -126,14 +126,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 password: config.rgb.signer.password.clone(),
             };
             let utxos = rw.backend().wallet_balance().await?;
-            print!("{}", colorex_wallet::render_balance(&utxos));
+            print!("{}", rfq_wallet::render_balance(&utxos));
             Ok(())
         }
     }
 }
 
 /// Interactively create the taker wallet + signing account and write `taker.toml`.
-/// Name-keyed via `colorex_wallet::resolve_wallet`, mirroring `colorex maker init`.
+/// Name-keyed via `rfq_wallet::resolve_wallet`, mirroring `colorex maker init`.
 async fn init(config_path: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
     let theme = ColorfulTheme::default();
 
@@ -187,7 +187,7 @@ async fn init(config_path: &Path, force: bool) -> Result<(), Box<dyn std::error:
 
     // Persist the per-wallet config too, so `colorex wallet ...`/`colorex-taker`
     // commands resolve this wallet by --name.
-    colorex_wallet::WalletConfig::from_resolved(&resolved, &contract_id).save()?;
+    rfq_wallet::WalletConfig::from_resolved(&resolved, &contract_id).save()?;
 
     let toml = render_taker_toml(&TakerRender {
         broker_url: &broker_url,

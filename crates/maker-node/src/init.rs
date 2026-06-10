@@ -14,7 +14,7 @@
 use std::path::Path;
 
 use clap::Args;
-use colorex_wallet::{
+use rfq_wallet::{
     default_account_file, default_data_dir, default_electrum_url, expand_tilde, prompt_network,
     ResolvedWallet, WalletConfig,
 };

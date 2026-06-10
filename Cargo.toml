@@ -10,9 +10,7 @@ members = [
     "crates/rfq-store",
     "crates/rfq-client",
     "crates/rfq-wallet",
-    "crates/colorex-wallet",
     "crates/maker-node",
-    "crates/wallet-wasm",
     "crates/taker-cli",
 ]
 resolver = "2"

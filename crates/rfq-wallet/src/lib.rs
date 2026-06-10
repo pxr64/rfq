@@ -1,145 +1,94 @@
-use thiserror::Error;
+//! Role-agnostic wallet setup shared by `colorex` (maker / issuer commands) and
+//! `colorex-taker`: per-network defaults, interactive prompts, and the single
+//! `LibRgbBackend` construction site — so wallet/issuer/taker setup only needs a
+//! wallet name, with everything else derived or prompted (`maker init` style).
+//!
+//! Depends only on `rfq-rgb`; neither binary depends on the other, so this crate
+//! is the natural shared home (a module inside `maker-node` would force
+//! `taker-cli` to depend on the whole maker daemon).
 
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum WalletError {
-    #[error("input cannot be empty")]
-    EmptyInput,
+pub mod config;
+pub mod defaults;
+pub mod interactive;
+
+use std::path::PathBuf;
+
+use rfq_rgb::{LibRgbBackend, RgbError, WalletUtxo};
+
+pub use config::{resolve_named, WalletConfig};
+pub use defaults::{default_account_file, default_data_dir, default_electrum_url, expand_tilde};
+pub use interactive::{prompt_network, resolve_wallet};
+
+/// Human-readable BTC balance for a wallet's UTXOs: a total line plus one line
+/// per UTXO, labelled by keychain (0 = BTC, 10 = RGB anchor). Shared by
+/// `colorex wallet balance` and `colorex-taker balance`.
+pub fn render_balance(utxos: &[WalletUtxo]) -> String {
+    let total: u64 = utxos.iter().map(|u| u.sats).sum();
+    let mut out = format!(
+        "balance: {total} sats ({} utxo{})\n",
+        utxos.len(),
+        if utxos.len() == 1 { "" } else { "s" }
+    );
+    for u in utxos {
+        let label = match u.keychain {
+            0 => "BTC",
+            10 => "RGB-anchor",
+            _ => "other",
+        };
+        out.push_str(&format!(
+            "  {}:{}  {} sats  [keychain {} · {label}]\n",
+            u.txid, u.vout, u.sats, u.keychain
+        ));
+    }
+    out
 }
 
-pub trait KeyProvider {
-    fn public_id(&self) -> String;
-    fn sign_psbt(&self, psbt_base64: &str) -> Result<String, WalletError>;
+/// CLI-provided wallet values; any `None` is filled by [`resolve_wallet`]
+/// (prompt with a name-derived default).
+#[derive(Debug, Default, Clone)]
+pub struct WalletInput {
+    pub name: Option<String>,
+    pub network: Option<String>,
+    pub data_dir: Option<PathBuf>,
+    pub account_file: Option<PathBuf>,
+    pub electrum_url: Option<String>,
+    pub password: Option<String>,
 }
 
-pub trait WalletBackend {
-    fn create_rgb_invoice(&self, contract_id: &str, amount: u64) -> Result<String, WalletError>;
-
-    fn sign_psbt(&self, psbt_base64: &str) -> Result<String, WalletError>;
-
-    fn import_consignment(&self, consignment_base64: &str) -> Result<(), WalletError>;
-}
-
+/// Fully-resolved, tilde-expanded wallet parameters plus a backend factory. The
+/// one place the 6-arg [`LibRgbBackend::new`] call lives now.
 #[derive(Debug, Clone)]
-pub struct MockKeyProvider {
-    public_id: String,
+pub struct ResolvedWallet {
+    pub name: String,
+    pub network: String,
+    pub data_dir: PathBuf,
+    pub account_file: PathBuf,
+    pub electrum_url: String,
+    pub password: String,
 }
 
-impl MockKeyProvider {
-    pub fn new(public_id: impl Into<String>) -> Self {
-        Self {
-            public_id: public_id.into(),
+impl ResolvedWallet {
+    /// Build the role-agnostic RGB backend.
+    pub fn backend(&self) -> LibRgbBackend {
+        LibRgbBackend::new(
+            self.data_dir.clone(),
+            self.name.clone(),
+            self.network.clone(),
+            self.electrum_url.clone(),
+            self.account_file.clone(),
+            self.password.clone(),
+        )
+    }
+
+    /// Create the taproot wallet + signing account if absent, returning the
+    /// keychain-10 funding address. `Ok(None)` if a wallet already existed
+    /// (kept as-is).
+    pub fn create_wallet(&self) -> Result<Option<String>, RgbError> {
+        let backend = self.backend();
+        if backend.wallet_exists() {
+            return Ok(None);
         }
-    }
-}
-
-impl Default for MockKeyProvider {
-    fn default() -> Self {
-        Self::new("mock-key")
-    }
-}
-
-impl KeyProvider for MockKeyProvider {
-    fn public_id(&self) -> String {
-        self.public_id.clone()
-    }
-
-    fn sign_psbt(&self, psbt_base64: &str) -> Result<String, WalletError> {
-        if psbt_base64.is_empty() {
-            return Err(WalletError::EmptyInput);
-        }
-
-        Ok(format!("mock-signed-psbt:{}:{psbt_base64}", self.public_id))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct MockWalletBackend<K = MockKeyProvider> {
-    key_provider: K,
-}
-
-impl MockWalletBackend {
-    pub fn new_default() -> Self {
-        Self {
-            key_provider: MockKeyProvider::default(),
-        }
-    }
-}
-
-impl<K> MockWalletBackend<K> {
-    pub fn new(key_provider: K) -> Self {
-        Self { key_provider }
-    }
-}
-
-impl Default for MockWalletBackend {
-    fn default() -> Self {
-        Self::new_default()
-    }
-}
-
-impl<K> WalletBackend for MockWalletBackend<K>
-where
-    K: KeyProvider,
-{
-    fn create_rgb_invoice(&self, contract_id: &str, amount: u64) -> Result<String, WalletError> {
-        if contract_id.is_empty() {
-            return Err(WalletError::EmptyInput);
-        }
-
-        Ok(format!(
-            "rgb:{}:{}:{}",
-            contract_id,
-            amount,
-            self.key_provider.public_id()
-        ))
-    }
-
-    fn sign_psbt(&self, psbt_base64: &str) -> Result<String, WalletError> {
-        self.key_provider.sign_psbt(psbt_base64)
-    }
-
-    fn import_consignment(&self, consignment_base64: &str) -> Result<(), WalletError> {
-        if consignment_base64.is_empty() {
-            return Err(WalletError::EmptyInput);
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mock_wallet_creates_rgb_invoice() {
-        let wallet = MockWalletBackend::default();
-
-        let invoice = wallet.create_rgb_invoice("contract-1", 42).unwrap();
-
-        assert_eq!(invoice, "rgb:contract-1:42:mock-key");
-    }
-
-    #[test]
-    fn mock_wallet_signs_psbt_deterministically() {
-        let wallet = MockWalletBackend::default();
-
-        let signed = wallet.sign_psbt("cHNidA==").unwrap();
-
-        assert_eq!(signed, "mock-signed-psbt:mock-key:cHNidA==");
-    }
-
-    #[test]
-    fn mock_wallet_imports_non_empty_consignment() {
-        let wallet = MockWalletBackend::default();
-
-        assert_eq!(wallet.import_consignment("Y29uc2lnbm1lbnQ="), Ok(()));
-    }
-
-    #[test]
-    fn mock_wallet_rejects_empty_consignment() {
-        let wallet = MockWalletBackend::default();
-
-        assert_eq!(wallet.import_consignment(""), Err(WalletError::EmptyInput));
+        backend.create_wallet()?;
+        Ok(Some(backend.funding_address(true)?))
     }
 }

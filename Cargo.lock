@@ -799,17 +799,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
-name = "colorex-wallet"
-version = "0.1.0"
-dependencies = [
- "dialoguer",
- "rfq-rgb",
- "serde",
- "shellexpand",
- "toml",
-]
-
-[[package]]
 name = "commit_encoding_derive"
 version = "0.11.1-alpha.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1870,7 +1859,6 @@ dependencies = [
  "bp-std",
  "bp-wallet",
  "clap",
- "colorex-wallet",
  "dialoguer",
  "dirs 5.0.1",
  "futures",
@@ -2539,7 +2527,11 @@ dependencies = [
 name = "rfq-wallet"
 version = "0.1.0"
 dependencies = [
- "thiserror 1.0.69",
+ "dialoguer",
+ "rfq-rgb",
+ "serde",
+ "shellexpand",
+ "toml",
 ]
 
 [[package]]
@@ -3307,11 +3299,11 @@ name = "taker-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "colorex-wallet",
  "dialoguer",
  "rfq-client",
  "rfq-rgb",
  "rfq-types",
+ "rfq-wallet",
  "serde",
  "tokio",
  "toml",
@@ -3791,14 +3783,6 @@ checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
 dependencies = [
  "same-file",
  "winapi-util",
-]
-
-[[package]]
-name = "wallet-wasm"
-version = "0.1.0"
-dependencies = [
- "rfq-wallet",
- "wasm-bindgen",
 ]
 
 [[package]]

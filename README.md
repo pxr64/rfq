@@ -13,17 +13,15 @@ Rust workspace for an RGB↔BTC RFQ atomic-swap architecture. The RGB swap path 
 - `rfq-maker`: maker implementation — RFQ quoting (fixed 1% markup for now), inventory + reservation lifecycle, and real swap settlement.
 - `rfq-api`: Axum HTTP API exposing RFQ and quote acceptance endpoints.
 - `rfq-client`: thin public HTTP SDK over `rfq-api`.
-- `rfq-wallet`: browser-neutral wallet traits and mock wallet backend.
+- `rfq-wallet`: Rust-native wallet toolkit — name-keyed wallet resolution, config, and interactive setup over `rfq-rgb` (shared by the maker + taker CLIs).
 - `maker-node`: the `colorex` operator binary — maker daemon + `wallet` + `issuer` tooling (see the colorex CLI section).
 - `taker-cli`: the `colorex-taker` binary — drives buy/sell atomic swaps through the broker.
-- `wallet-wasm`: wasm-bindgen wrapper around mocked wallet functions.
 
 ## Boundaries
 
 - `rfq-types` stays dependency-free except `serde`.
 - `rfq-core` does not depend on wallet, RGB, API, or node crates.
 - `rfq-api` does not depend on `rfq-wallet`.
-- `rfq-wallet` has no browser-specific code and no RGB/BDK integrations.
 
 ## Commands
 

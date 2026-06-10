@@ -6,7 +6,7 @@ use maker_node::{
     orders, fetch_consignment, output, reconsign_consignment, spawn_chain_observer_loop,
     spawn_cleanup_loop, spawn_order_reload_loop, spawn_rebalance_loop, MakerNodeConfig,
 };
-use colorex_wallet::{resolve_named, resolve_wallet, WalletConfig, WalletInput};
+use rfq_wallet::{resolve_named, resolve_wallet, WalletConfig, WalletInput};
 use rfq_rgb::RgbBackend;
 use rfq_client::{RfqClient, Url};
 use rfq_types::{InventorySnapshot, MakerId};
@@ -467,7 +467,7 @@ async fn wallet_balance(
     };
     let resolved = resolve_named(input)?;
     let utxos = resolved.backend().wallet_balance().await?;
-    print!("{}", colorex_wallet::render_balance(&utxos));
+    print!("{}", rfq_wallet::render_balance(&utxos));
     Ok(())
 }
 
