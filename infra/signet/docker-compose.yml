@@ -108,6 +108,22 @@ services:
       # hits the same host:3000 for the HTTP API.
       - "3000:3000"
 
+  cloudflared:
+    # Token-based ("remotely-managed") tunnel: publishes rfq-signet.colorex.io
+    # over HTTPS with no inbound ports. Create the tunnel in the Cloudflare
+    # Zero Trust dashboard (Networks -> Tunnels), add a Public Hostname
+    #   rfq-signet.colorex.io  ->  http://broker:3000
+    # ("broker" resolves on this compose network), then put the tunnel token in
+    # infra/signet/.env as CLOUDFLARE_TUNNEL_TOKEN.
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in infra/signet/.env}
+    depends_on:
+      broker:
+        condition: service_started
+
 volumes:
   bitcoind-data:
   electrs-data:
