@@ -17,7 +17,10 @@ pub use btc::{
 #[cfg(feature = "sqlite")]
 mod sqlite;
 #[cfg(feature = "sqlite")]
-pub use sqlite::{SqliteBtcInventoryStore, SqliteConsignmentStore, SqliteInventoryStore};
+pub use sqlite::{
+    SqliteBtcInventoryStore, SqliteConsignmentStore, SqliteFillStore, SqliteInventoryStore,
+    SqliteOrderStore,
+};
 
 #[cfg(feature = "postgres")]
 mod pg;
@@ -309,6 +312,225 @@ impl ConsignmentStore for InMemoryConsignmentStore {
             .filter(|r| r.witness_txid == witness_txid)
             .cloned()
             .collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Order store — standing maker orders (moved off orders.json into maker.db so
+// orders + fills + inventory share one durable store and the `order` CLI can
+// write while the daemon reads, via SQLite/WAL).
+// ---------------------------------------------------------------------------
+
+/// Canonical lowercase label for a [`Side`] — the form persisted in SQLite and
+/// used by the order book / CLI.
+pub fn side_str(side: &Side) -> &'static str {
+    match side {
+        Side::Buy => "buy",
+        Side::Sell => "sell",
+    }
+}
+
+/// Parse a side label (case-insensitive) into a [`Side`].
+pub fn parse_side_str(s: &str) -> Option<Side> {
+    match s.to_ascii_lowercase().as_str() {
+        "buy" => Some(Side::Buy),
+        "sell" => Some(Side::Sell),
+        _ => None,
+    }
+}
+
+/// One standing maker order. `price` is sats per smallest RGB unit; `size` is
+/// the largest single quote (smallest RGB units) it backs. `mirror` opts the
+/// order into the auto-mirror strategy: on fill, the opposite-side order is
+/// auto-upserted at `mirror_spread_bps` off the fill price.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderRecord {
+    pub id: String,
+    /// `"buy"` (taker buys RGB) or `"sell"` (taker sells RGB).
+    pub side: String,
+    pub asset_id: String,
+    pub price: u64,
+    pub size: u64,
+    pub created_at_ms: u64,
+    pub mirror: bool,
+    pub mirror_spread_bps: u16,
+}
+
+#[derive(Debug, Clone)]
+pub enum OrderError {
+    Backend(String),
+}
+
+impl std::fmt::Display for OrderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(msg) => write!(f, "order store error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for OrderError {}
+
+/// Durable store of the maker's standing orders — at most one per
+/// `(asset_id, side)` (creating a second upserts the first).
+#[async_trait]
+pub trait OrderStore: Send + Sync {
+    async fn list(&self) -> Result<Vec<OrderRecord>, OrderError>;
+    /// Insert/replace the order for its `(asset_id, side)`.
+    async fn upsert(&self, order: OrderRecord) -> Result<(), OrderError>;
+    /// Remove the order with `id`. Returns true if one was removed.
+    async fn cancel(&self, id: &str) -> Result<bool, OrderError>;
+    async fn get(&self, asset_id: &str, side: &str) -> Result<Option<OrderRecord>, OrderError>;
+}
+
+/// `(asset_id, lowercase side)` — the upsert key.
+fn order_key(asset_id: &str, side: &str) -> (String, String) {
+    (asset_id.to_owned(), side.to_ascii_lowercase())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryOrderStore {
+    by_key: Arc<RwLock<HashMap<(String, String), OrderRecord>>>,
+}
+
+impl InMemoryOrderStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl OrderStore for InMemoryOrderStore {
+    async fn list(&self) -> Result<Vec<OrderRecord>, OrderError> {
+        Ok(self.by_key.read().await.values().cloned().collect())
+    }
+
+    async fn upsert(&self, order: OrderRecord) -> Result<(), OrderError> {
+        let key = order_key(&order.asset_id, &order.side);
+        self.by_key.write().await.insert(key, order);
+        Ok(())
+    }
+
+    async fn cancel(&self, id: &str) -> Result<bool, OrderError> {
+        let mut map = self.by_key.write().await;
+        if let Some(key) = map
+            .iter()
+            .find(|(_, o)| o.id == id)
+            .map(|(k, _)| k.clone())
+        {
+            map.remove(&key);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    async fn get(&self, asset_id: &str, side: &str) -> Result<Option<OrderRecord>, OrderError> {
+        Ok(self.by_key.read().await.get(&order_key(asset_id, side)).cloned())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fill store — one row per settled swap, recorded at broadcast. Feeds the
+// `maker inventory` FILLED counter and the auto-mirror strategy.
+// ---------------------------------------------------------------------------
+
+/// One settled swap fill, recorded at broadcast. `price` is the TOTAL gross BTC
+/// sats of the swap (as on the quote) — divide by `amount` for the per-unit
+/// price. `mirrored` flips true once the strategy has placed the mirror order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FillRecord {
+    pub quote_id: QuoteId,
+    pub asset_id: String,
+    pub side: Side,
+    pub amount: u64,
+    pub price: u64,
+    pub witness_txid: String,
+    pub filled_at_ms: u64,
+    pub mirrored: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum FillError {
+    Backend(String),
+}
+
+impl std::fmt::Display for FillError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(msg) => write!(f, "fill store error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for FillError {}
+
+/// Durable store of settled fills, keyed by `quote_id` (idempotent — a
+/// re-submitted `/sign` for the same quote replaces, never double-counts).
+#[async_trait]
+pub trait FillStore: Send + Sync {
+    async fn record_fill(&self, record: FillRecord) -> Result<(), FillError>;
+    /// Cumulative `amount` for `(asset_id, side)` with `filled_at_ms >= since_ms`.
+    async fn filled_for(
+        &self,
+        asset_id: &str,
+        side: &Side,
+        since_ms: u64,
+    ) -> Result<u64, FillError>;
+    /// Fills not yet mirrored — the strategy loop's work-list.
+    async fn list_unmirrored(&self) -> Result<Vec<FillRecord>, FillError>;
+    async fn mark_mirrored(&self, quote_id: &QuoteId) -> Result<(), FillError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryFillStore {
+    by_quote: Arc<RwLock<HashMap<QuoteId, FillRecord>>>,
+}
+
+impl InMemoryFillStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl FillStore for InMemoryFillStore {
+    async fn record_fill(&self, record: FillRecord) -> Result<(), FillError> {
+        self.by_quote.write().await.insert(record.quote_id.clone(), record);
+        Ok(())
+    }
+
+    async fn filled_for(
+        &self,
+        asset_id: &str,
+        side: &Side,
+        since_ms: u64,
+    ) -> Result<u64, FillError> {
+        Ok(self
+            .by_quote
+            .read()
+            .await
+            .values()
+            .filter(|f| f.asset_id == asset_id && &f.side == side && f.filled_at_ms >= since_ms)
+            .map(|f| f.amount)
+            .sum())
+    }
+
+    async fn list_unmirrored(&self) -> Result<Vec<FillRecord>, FillError> {
+        Ok(self
+            .by_quote
+            .read()
+            .await
+            .values()
+            .filter(|f| !f.mirrored)
+            .cloned()
+            .collect())
+    }
+
+    async fn mark_mirrored(&self, quote_id: &QuoteId) -> Result<(), FillError> {
+        if let Some(f) = self.by_quote.write().await.get_mut(quote_id) {
+            f.mirrored = true;
+        }
+        Ok(())
     }
 }
 

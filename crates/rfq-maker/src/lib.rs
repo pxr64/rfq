@@ -9,9 +9,9 @@ use rfq_rgb::{ContractId, RgbBackend, TxOut};
 use std::str::FromStr as _;
 use rfq_router::{MakerConnector, RouterError};
 use rfq_store::{
-    BtcCoinSelector, BtcInventoryStore, ConsignmentRecord, ConsignmentStore,
+    BtcCoinSelector, BtcInventoryStore, ConsignmentRecord, ConsignmentStore, FillRecord, FillStore,
     GreedyLargestFirstSelector, InMemoryBtcInventoryStore, InMemoryConsignmentStore,
-    InMemoryInventoryStore, InventoryStore,
+    InMemoryFillStore, InMemoryInventoryStore, InventoryStore,
 };
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetInfo, BtcInventoryStatus, BtcInventoryUtxo,
@@ -223,6 +223,10 @@ pub struct Maker {
     /// re-served on recovery. In-memory unless a durable store is injected via
     /// [`Maker::with_consignment_store`].
     consignment_store: Arc<dyn ConsignmentStore>,
+    /// Durable record of every settled fill, recorded at broadcast. Feeds the
+    /// `maker inventory` FILLED counter and the auto-mirror strategy. In-memory
+    /// unless a durable store is injected via [`Maker::with_fills_store`].
+    fills_store: Arc<dyn FillStore>,
     rgb_backend: Arc<dyn RgbBackend>,
     bitcoin_client: Arc<dyn BitcoinClient>,
     pending: Arc<RwLock<HashMap<QuoteId, PendingSettlement>>>,
@@ -283,6 +287,7 @@ impl Maker {
             selector,
             btc_store: Arc::new(InMemoryBtcInventoryStore::new()),
             consignment_store: Arc::new(InMemoryConsignmentStore::new()),
+            fills_store: Arc::new(InMemoryFillStore::new()),
             rgb_backend,
             bitcoin_client,
             pending: Arc::new(RwLock::new(HashMap::new())),
@@ -325,6 +330,52 @@ impl Maker {
     pub fn with_consignment_store(mut self, store: Arc<dyn ConsignmentStore>) -> Self {
         self.consignment_store = store;
         self
+    }
+
+    /// Inject a durable fill store (the SQLite one) so the FILLED counter +
+    /// auto-mirror work-list survive a restart.
+    pub fn with_fills_store(mut self, store: Arc<dyn FillStore>) -> Self {
+        self.fills_store = store;
+        self
+    }
+
+    /// Cumulative RGB units settled for `(asset_id, side)` since `since_ms`.
+    /// Read API for the inventory FILLED display; returns 0 on store error.
+    pub async fn filled_for(&self, asset_id: &str, side: &Side, since_ms: u64) -> u64 {
+        self.fills_store
+            .filled_for(asset_id, side, since_ms)
+            .await
+            .unwrap_or(0)
+    }
+
+    /// Fills the strategy loop hasn't mirrored yet (its work-list).
+    pub async fn list_unmirrored_fills(&self) -> Vec<FillRecord> {
+        self.fills_store.list_unmirrored().await.unwrap_or_default()
+    }
+
+    /// Mark a fill mirrored (after the strategy upserts the opposite order).
+    pub async fn mark_fill_mirrored(&self, quote_id: &QuoteId) {
+        if let Err(e) = self.fills_store.mark_mirrored(quote_id).await {
+            eprintln!("warning: failed to mark fill mirrored for quote {}: {e}", quote_id.0);
+        }
+    }
+
+    /// Best-effort fill record at broadcast. Like [`Self::persist_consignment`],
+    /// a failure is logged but never aborts the (already-broadcast) swap.
+    async fn record_fill(&self, quote: &Quote, witness_txid: &str) {
+        let record = FillRecord {
+            quote_id: quote.quote_id.clone(),
+            asset_id: quote.base_asset.id.clone(),
+            side: quote.side.clone(),
+            amount: quote.amount,
+            price: quote.price,
+            witness_txid: witness_txid.to_owned(),
+            filled_at_ms: now_ms(),
+            mirrored: false,
+        };
+        if let Err(e) = self.fills_store.record_fill(record).await {
+            eprintln!("warning: failed to record fill for quote {}: {e}", quote.quote_id.0);
+        }
     }
 
     /// Best-effort persistence of a produced consignment. A failure is logged but
@@ -1074,6 +1125,9 @@ impl Maker {
         )
         .await;
 
+        // Record the fill (FILLED counter + auto-mirror work-list).
+        self.record_fill(&pending.quote, &finalized.witness_txid).await;
+
         self.pending.write().await.remove(&quote_id);
 
         Ok(SettlementIntent {
@@ -1464,6 +1518,9 @@ impl MakerConnector for Maker {
             &finalized.final_consignment_base64,
         )
         .await;
+
+        // Record the fill (FILLED counter + auto-mirror work-list).
+        self.record_fill(&pending.quote, &finalized.witness_txid).await;
 
         self.pending.write().await.remove(&quote_id);
 

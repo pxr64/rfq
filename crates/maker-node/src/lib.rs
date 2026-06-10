@@ -23,8 +23,9 @@ use rfq_maker::{CoinSelector, GreedyExactFitSelector, Maker, RebalancePolicy};
 use rfq_rgb::{LibRgbBackend, MockRgbBackend, RgbBackend};
 use rfq_router::MakerConnector;
 use rfq_store::{
-    BtcInventoryStore, ConsignmentStore, InMemoryQuoteStore, InventoryStore, QuoteStore,
-    SqliteBtcInventoryStore, SqliteConsignmentStore, SqliteInventoryStore,
+    BtcInventoryStore, ConsignmentStore, InMemoryOrderStore, InMemoryQuoteStore, InventoryStore,
+    OrderStore, QuoteStore, SqliteBtcInventoryStore, SqliteConsignmentStore, SqliteFillStore,
+    SqliteInventoryStore, SqliteOrderStore,
 };
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, BtcInventoryStatus, BtcInventoryUtxo,
@@ -93,6 +94,10 @@ pub struct IntervalsConfig {
     /// real RGB backend is configured (mock has nothing to observe).
     #[serde(with = "humantime_serde", default = "default_chain_observer_interval")]
     pub chain_observer: Duration,
+    /// How often the auto-mirror strategy loop processes unmirrored fills and
+    /// places mirror orders. Matches the order-reload cadence (5s).
+    #[serde(with = "humantime_serde", default = "default_strategy_interval")]
+    pub strategy: Duration,
 }
 
 impl Default for IntervalsConfig {
@@ -101,8 +106,13 @@ impl Default for IntervalsConfig {
             cleanup: default_cleanup_interval(),
             rebalance: default_rebalance_interval(),
             chain_observer: default_chain_observer_interval(),
+            strategy: default_strategy_interval(),
         }
     }
+}
+
+fn default_strategy_interval() -> Duration {
+    Duration::from_secs(5)
 }
 
 fn default_cleanup_interval() -> Duration {
@@ -267,6 +277,9 @@ fn expand_tilde_path(p: &std::path::Path) -> PathBuf {
 pub struct MakerNodeRuntime {
     pub maker: Maker,
     pub chain_observer: Option<ChainObserverDeps>,
+    /// The standing-order store (maker.db `orders` table, or in-memory for the
+    /// mock fallback) — driven by the order-reload + strategy loops in `run()`.
+    pub order_store: Arc<dyn OrderStore>,
 }
 
 /// Shared with the chain observer so it can drive `LibRgbBackend::sync_wallet`
@@ -408,23 +421,29 @@ pub async fn build_runtime(
             let inv_store = SqliteInventoryStore::open(&db_path).await?;
             let btc_store = SqliteBtcInventoryStore::open(&db_path).await?;
             let consignment_store = SqliteConsignmentStore::open(&db_path).await?;
+            let fills_store = SqliteFillStore::open(&db_path).await?;
+            let order_store = SqliteOrderStore::open(&db_path).await?;
             reconcile_rgb_inventory(&inv_store, &asset, &rgb_utxos, now_ms).await?;
             reconcile_btc_inventory(&btc_store, &btc_inventory).await?;
 
             let inv_store: Arc<dyn InventoryStore> = Arc::new(inv_store);
             let btc_store: Arc<dyn BtcInventoryStore> = Arc::new(btc_store);
             let consignment_store: Arc<dyn ConsignmentStore> = Arc::new(consignment_store);
+            let fills_store: Arc<dyn rfq_store::FillStore> = Arc::new(fills_store);
+            let order_store: Arc<dyn OrderStore> = Arc::new(order_store);
             let selector: Arc<dyn CoinSelector> = Arc::new(GreedyExactFitSelector);
             let maker =
                 Maker::with_components(maker_id, inv_store, selector, rgb_backend_trait, bitcoin_client)
                     .with_btc_store(btc_store)
-                    .with_consignment_store(consignment_store);
+                    .with_consignment_store(consignment_store)
+                    .with_fills_store(fills_store);
             Ok(MakerNodeRuntime {
                 maker,
                 chain_observer: Some(ChainObserverDeps {
                     rgb_backend: backend,
                     asset,
                 }),
+                order_store,
             })
         }
         None => {
@@ -447,6 +466,7 @@ pub async fn build_runtime(
             Ok(MakerNodeRuntime {
                 maker,
                 chain_observer: None,
+                order_store: Arc::new(InMemoryOrderStore::new()),
             })
         }
     }
@@ -689,7 +709,7 @@ impl From<rfq_router::RouterError> for MakerNodeHttpError {
 /// sent at WS registration, still lags until reconnect — a later #30 enhancement.)
 pub fn spawn_order_reload_loop(
     maker: Maker,
-    order_path: std::path::PathBuf,
+    order_store: Arc<dyn OrderStore>,
     reload_interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -697,16 +717,101 @@ pub fn spawn_order_reload_loop(
         let mut last: Option<usize> = None;
         loop {
             interval.tick().await;
-            match crate::orders::OrderBook::load(&order_path) {
-                Ok(book) => {
-                    let count = book.orders.len();
-                    maker.reload_price_policy(book.price_policy());
+            match order_store.list().await {
+                Ok(orders) => {
+                    let count = orders.len();
+                    maker.reload_price_policy(crate::orders::price_policy(&orders));
                     if last != Some(count) {
                         println!("reloaded standing orders: {count}");
                         last = Some(count);
                     }
                 }
                 Err(e) => eprintln!("order reload failed: {e}"),
+            }
+        }
+    })
+}
+
+/// Auto-mirror strategy loop: on each tick, for every settled fill not yet
+/// mirrored, if the order that produced it is `mirror`-enabled, upsert the
+/// OPPOSITE-side order (priced off the fill by its spread, sized to the fill).
+/// Marks the fill mirrored only AFTER the upsert persists, so a crash mid-cycle
+/// retries idempotently next tick. Skips (and marks) fills whose source order is
+/// gone or non-mirror, and won't clobber an operator-pinned opposite order.
+pub fn spawn_strategy_loop(
+    maker: Maker,
+    order_store: Arc<dyn OrderStore>,
+    interval: Duration,
+) -> JoinHandle<()> {
+    use crate::orders;
+    use rfq_store::side_str;
+    tokio::spawn(async move {
+        let mut tick = time::interval(interval);
+        loop {
+            tick.tick().await;
+            let fills = maker.list_unmirrored_fills().await;
+            if fills.is_empty() {
+                continue;
+            }
+            let mut placed = false;
+            for f in fills {
+                // Look up the order that produced this fill (same asset+side).
+                let src = match order_store.get(&f.asset_id, side_str(&f.side)).await {
+                    Ok(Some(o)) if o.mirror => o,
+                    Ok(_) => {
+                        // Order gone or not mirror-enabled — nothing to mirror.
+                        maker.mark_fill_mirrored(&f.quote_id).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("strategy: order lookup failed: {e}");
+                        continue; // retry next tick
+                    }
+                };
+                if f.amount == 0 {
+                    maker.mark_fill_mirrored(&f.quote_id).await;
+                    continue;
+                }
+                // Operator-pinned guard: don't overwrite a hand-set opposite order.
+                let opp = orders::opposite(f.side.clone());
+                match order_store.get(&f.asset_id, side_str(&opp)).await {
+                    Ok(Some(existing)) if !existing.mirror => {
+                        eprintln!("strategy: mirror skipped (opposite-side order is operator-pinned)");
+                        maker.mark_fill_mirrored(&f.quote_id).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("strategy: opposite lookup failed: {e}");
+                        continue;
+                    }
+                    _ => {}
+                }
+                let unit = f.price / f.amount;
+                let mirror = orders::build_mirror_order(
+                    &f.asset_id,
+                    f.side.clone(),
+                    unit,
+                    f.amount,
+                    src.mirror_spread_bps,
+                );
+                let mirror_side = mirror.side.clone();
+                let mirror_price = mirror.price;
+                if let Err(e) = order_store.upsert(mirror).await {
+                    eprintln!("strategy: upsert mirror failed: {e}");
+                    continue; // leave fill unmirrored — retry next tick (idempotent)
+                }
+                maker.mark_fill_mirrored(&f.quote_id).await;
+                placed = true;
+                println!(
+                    "mirror placed: {mirror_side} {} @ {mirror_price}/unit (from fill {})",
+                    f.amount, f.quote_id.0
+                );
+            }
+            if placed {
+                // Instant effect (don't wait for the 5s reload tick).
+                if let Ok(orders) = order_store.list().await {
+                    maker.reload_price_policy(orders::price_policy(&orders));
+                }
             }
         }
     })

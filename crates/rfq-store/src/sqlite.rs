@@ -27,9 +27,11 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
 use crate::{
-    BtcInventoryStore, ConsignmentError, ConsignmentRecord, ConsignmentStore,
-    InMemoryBtcInventoryStore, InMemoryInventoryStore, InventoryStore,
+    side_str, BtcInventoryStore, ConsignmentError, ConsignmentRecord, ConsignmentStore, FillError,
+    FillRecord, FillStore, InMemoryBtcInventoryStore, InMemoryInventoryStore, InventoryStore,
+    OrderError, OrderRecord, OrderStore,
 };
+use rfq_types::Side;
 
 fn inv(e: impl std::fmt::Display) -> InventoryError {
     InventoryError::Backend(e.to_string())
@@ -37,6 +39,14 @@ fn inv(e: impl std::fmt::Display) -> InventoryError {
 
 fn cons(e: impl std::fmt::Display) -> ConsignmentError {
     ConsignmentError::Backend(e.to_string())
+}
+
+fn ordr(e: impl std::fmt::Display) -> OrderError {
+    OrderError::Backend(e.to_string())
+}
+
+fn fill(e: impl std::fmt::Display) -> FillError {
+    FillError::Backend(e.to_string())
 }
 
 fn btc(e: impl std::fmt::Display) -> BtcInventoryError {
@@ -608,6 +618,215 @@ impl ConsignmentStore for SqliteConsignmentStore {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Order store
+// ---------------------------------------------------------------------------
+
+/// Durable [`OrderStore`] over SQLite. One row per `(asset_id, side)` (the PK),
+/// so `upsert` is INSERT OR REPLACE. WAL (via `open_pool`) lets the `order` CLI
+/// write while the daemon reads.
+pub struct SqliteOrderStore {
+    pool: SqlitePool,
+}
+
+impl SqliteOrderStore {
+    pub async fn open(path: &Path) -> Result<Self, OrderError> {
+        let pool = open_pool(path).await.map_err(ordr)?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS orders (\
+                 asset_id TEXT NOT NULL, side TEXT NOT NULL, id TEXT NOT NULL, \
+                 price INTEGER NOT NULL, size INTEGER NOT NULL, \
+                 created_at_ms INTEGER NOT NULL, mirror INTEGER NOT NULL DEFAULT 0, \
+                 mirror_spread_bps INTEGER NOT NULL DEFAULT 0, \
+                 PRIMARY KEY (asset_id, side))",
+        )
+        .execute(&pool)
+        .await
+        .map_err(ordr)?;
+        Ok(Self { pool })
+    }
+}
+
+type OrderRow = (String, String, String, i64, i64, i64, i64, i64);
+
+fn row_to_order(r: OrderRow) -> OrderRecord {
+    OrderRecord {
+        id: r.0,
+        side: r.1,
+        asset_id: r.2,
+        price: r.3 as u64,
+        size: r.4 as u64,
+        created_at_ms: r.5 as u64,
+        mirror: r.6 != 0,
+        mirror_spread_bps: r.7 as u16,
+    }
+}
+
+const ORDER_COLS: &str =
+    "SELECT id, side, asset_id, price, size, created_at_ms, mirror, mirror_spread_bps FROM orders";
+
+#[async_trait]
+impl OrderStore for SqliteOrderStore {
+    async fn list(&self) -> Result<Vec<OrderRecord>, OrderError> {
+        let rows: Vec<OrderRow> = sqlx::query_as(ORDER_COLS)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(ordr)?;
+        Ok(rows.into_iter().map(row_to_order).collect())
+    }
+
+    async fn upsert(&self, order: OrderRecord) -> Result<(), OrderError> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO orders \
+                 (asset_id, side, id, price, size, created_at_ms, mirror, mirror_spread_bps) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(&order.asset_id)
+        .bind(order.side.to_ascii_lowercase())
+        .bind(&order.id)
+        .bind(order.price as i64)
+        .bind(order.size as i64)
+        .bind(order.created_at_ms as i64)
+        .bind(order.mirror as i64)
+        .bind(order.mirror_spread_bps as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(ordr)?;
+        Ok(())
+    }
+
+    async fn cancel(&self, id: &str) -> Result<bool, OrderError> {
+        let res = sqlx::query("DELETE FROM orders WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(ordr)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn get(&self, asset_id: &str, side: &str) -> Result<Option<OrderRecord>, OrderError> {
+        let row: Option<OrderRow> =
+            sqlx::query_as(&format!("{ORDER_COLS} WHERE asset_id = ?1 AND side = ?2"))
+                .bind(asset_id)
+                .bind(side.to_ascii_lowercase())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(ordr)?;
+        Ok(row.map(row_to_order))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fill store
+// ---------------------------------------------------------------------------
+
+/// Durable [`FillStore`] over SQLite. One row per `quote_id` (the PK), so
+/// `record_fill` is INSERT OR REPLACE (idempotent on a re-submitted `/sign`).
+pub struct SqliteFillStore {
+    pool: SqlitePool,
+}
+
+impl SqliteFillStore {
+    pub async fn open(path: &Path) -> Result<Self, FillError> {
+        let pool = open_pool(path).await.map_err(fill)?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS fills (\
+                 quote_id TEXT PRIMARY KEY, asset_id TEXT NOT NULL, side TEXT NOT NULL, \
+                 amount INTEGER NOT NULL, price INTEGER NOT NULL, witness_txid TEXT NOT NULL, \
+                 filled_at_ms INTEGER NOT NULL, mirrored INTEGER NOT NULL DEFAULT 0)",
+        )
+        .execute(&pool)
+        .await
+        .map_err(fill)?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_fills_asset_side ON fills (asset_id, side)")
+            .execute(&pool)
+            .await
+            .map_err(fill)?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_fills_mirrored ON fills (mirrored)")
+            .execute(&pool)
+            .await
+            .map_err(fill)?;
+        Ok(Self { pool })
+    }
+}
+
+type FillRow = (String, String, String, i64, i64, String, i64, i64);
+
+fn row_to_fill(r: FillRow) -> FillRecord {
+    FillRecord {
+        quote_id: QuoteId(r.0),
+        asset_id: r.1,
+        side: crate::parse_side_str(&r.2).unwrap_or(Side::Buy),
+        amount: r.3 as u64,
+        price: r.4 as u64,
+        witness_txid: r.5,
+        filled_at_ms: r.6 as u64,
+        mirrored: r.7 != 0,
+    }
+}
+
+const FILL_COLS: &str =
+    "SELECT quote_id, asset_id, side, amount, price, witness_txid, filled_at_ms, mirrored FROM fills";
+
+#[async_trait]
+impl FillStore for SqliteFillStore {
+    async fn record_fill(&self, record: FillRecord) -> Result<(), FillError> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO fills \
+                 (quote_id, asset_id, side, amount, price, witness_txid, filled_at_ms, mirrored) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(&record.quote_id.0)
+        .bind(&record.asset_id)
+        .bind(side_str(&record.side))
+        .bind(record.amount as i64)
+        .bind(record.price as i64)
+        .bind(&record.witness_txid)
+        .bind(record.filled_at_ms as i64)
+        .bind(record.mirrored as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(fill)?;
+        Ok(())
+    }
+
+    async fn filled_for(
+        &self,
+        asset_id: &str,
+        side: &Side,
+        since_ms: u64,
+    ) -> Result<u64, FillError> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(amount), 0) FROM fills \
+                 WHERE asset_id = ?1 AND side = ?2 AND filled_at_ms >= ?3",
+        )
+        .bind(asset_id)
+        .bind(side_str(side))
+        .bind(since_ms as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(fill)?;
+        Ok(total as u64)
+    }
+
+    async fn list_unmirrored(&self) -> Result<Vec<FillRecord>, FillError> {
+        let rows: Vec<FillRow> = sqlx::query_as(&format!("{FILL_COLS} WHERE mirrored = 0"))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(fill)?;
+        Ok(rows.into_iter().map(row_to_fill).collect())
+    }
+
+    async fn mark_mirrored(&self, quote_id: &QuoteId) -> Result<(), FillError> {
+        sqlx::query("UPDATE fills SET mirrored = 1 WHERE quote_id = ?1")
+            .bind(&quote_id.0)
+            .execute(&self.pool)
+            .await
+            .map_err(fill)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,6 +1028,73 @@ mod tests {
             .is_none());
         let by_wit = store.get_by_witness("wt-1").await.unwrap();
         assert_eq!(by_wit, vec![rec]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn order(id: &str, side: &str, price: u64, mirror: bool) -> OrderRecord {
+        OrderRecord {
+            id: id.into(),
+            side: side.into(),
+            asset_id: "rgb:contract-A".into(),
+            price,
+            size: 1000,
+            created_at_ms: NOW_MS,
+            mirror,
+            mirror_spread_bps: if mirror { 200 } else { 0 },
+        }
+    }
+
+    #[tokio::test]
+    async fn order_store_upsert_cancel_survive_reopen() {
+        let path = temp_db();
+        {
+            let store = SqliteOrderStore::open(&path).await.unwrap();
+            store.upsert(order("ord-a", "buy", 20, true)).await.unwrap();
+            store.upsert(order("ord-b", "sell", 18, false)).await.unwrap();
+            // Upsert same (asset, side) replaces (one per side).
+            store.upsert(order("ord-c", "buy", 25, true)).await.unwrap();
+        }
+        let store = SqliteOrderStore::open(&path).await.unwrap();
+        let all = store.list().await.unwrap();
+        assert_eq!(all.len(), 2, "buy was replaced, sell coexists");
+        let buy = store.get("rgb:contract-A", "buy").await.unwrap().unwrap();
+        assert_eq!((buy.id.as_str(), buy.price, buy.mirror, buy.mirror_spread_bps), ("ord-c", 25, true, 200));
+        assert!(store.cancel("ord-b").await.unwrap());
+        assert!(!store.cancel("nope").await.unwrap());
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn fill_store_sums_and_tracks_mirrored() {
+        let path = temp_db();
+        let mk = |q: &str, side: Side, amount: u64| FillRecord {
+            quote_id: QuoteId(q.into()),
+            asset_id: "rgb:contract-A".into(),
+            side,
+            amount,
+            price: amount * 20,
+            witness_txid: "wt".into(),
+            filled_at_ms: NOW_MS,
+            mirrored: false,
+        };
+        {
+            let store = SqliteFillStore::open(&path).await.unwrap();
+            store.record_fill(mk("q1", Side::Buy, 100)).await.unwrap();
+            store.record_fill(mk("q2", Side::Buy, 50)).await.unwrap();
+            store.record_fill(mk("q3", Side::Sell, 30)).await.unwrap();
+            // Idempotent: re-recording q1 doesn't double-count.
+            store.record_fill(mk("q1", Side::Buy, 100)).await.unwrap();
+        }
+        let store = SqliteFillStore::open(&path).await.unwrap();
+        assert_eq!(store.filled_for("rgb:contract-A", &Side::Buy, 0).await.unwrap(), 150);
+        assert_eq!(store.filled_for("rgb:contract-A", &Side::Sell, 0).await.unwrap(), 30);
+        assert_eq!(store.filled_for("rgb:contract-A", &Side::Buy, NOW_MS + 1).await.unwrap(), 0);
+        assert_eq!(store.list_unmirrored().await.unwrap().len(), 3);
+        store.mark_mirrored(&QuoteId("q1".into())).await.unwrap();
+        let unmirrored = store.list_unmirrored().await.unwrap();
+        assert_eq!(unmirrored.len(), 2);
+        assert!(unmirrored.iter().all(|f| f.quote_id.0 != "q1"));
         let _ = std::fs::remove_file(&path);
     }
 }

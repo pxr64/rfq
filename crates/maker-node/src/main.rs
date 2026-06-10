@@ -4,10 +4,12 @@ use clap::{Args, Parser, Subcommand};
 use maker_node::{
     broker_client, build_maker, build_runtime, create_inventory_invoice, init, maker_app, now_ms,
     orders, fetch_consignment, output, reconsign_consignment, spawn_chain_observer_loop,
-    spawn_cleanup_loop, spawn_order_reload_loop, spawn_rebalance_loop, MakerNodeConfig,
+    spawn_cleanup_loop, spawn_order_reload_loop, spawn_rebalance_loop, spawn_strategy_loop,
+    MakerNodeConfig,
 };
 use rfq_wallet::{resolve_named, resolve_wallet, WalletConfig, WalletInput};
 use rfq_rgb::RgbBackend;
+use rfq_store::OrderStore as _;
 use rfq_client::{RfqClient, Url};
 use rfq_types::{InventorySnapshot, MakerId};
 use tokio::{net::TcpListener, sync::oneshot};
@@ -292,6 +294,14 @@ enum OrderCmd {
         /// Max single-quote size (smallest RGB units) this order backs.
         #[arg(long)]
         size: u64,
+        /// Auto-mirror: on each fill of this order, place the opposite-side order
+        /// (buy⇄sell) at `--mirror-spread-bps` off the fill price.
+        #[arg(long)]
+        mirror: bool,
+        /// Spread (basis points) for the mirror order's price. Buy-back is
+        /// cheaper / re-sell is dearer by this much. Required for a useful mirror.
+        #[arg(long, default_value_t = 0)]
+        mirror_spread_bps: u16,
     },
     /// List standing orders.
     List,
@@ -338,9 +348,14 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                     asset,
                     price,
                     size,
-                } => order_create(&config_path, side, asset, price, size),
-                OrderCmd::List => order_list(&config_path),
-                OrderCmd::Cancel { id } => order_cancel(&config_path, &id),
+                    mirror,
+                    mirror_spread_bps,
+                } => {
+                    order_create(&config_path, side, asset, price, size, mirror, mirror_spread_bps)
+                        .await
+                }
+                OrderCmd::List => order_list(&config_path).await,
+                OrderCmd::Cancel { id } => order_cancel(&config_path, &id).await,
             },
             MakerCmd::Reconsign {
                 contract,
@@ -794,12 +809,34 @@ async fn maker_get_consignment(
     Ok(())
 }
 
-fn order_create(
+/// Open the maker.db `orders` store from the config's `[rgb]` db path, importing
+/// any legacy orders.json first. Orders live in maker.db, so this requires an
+/// `[rgb]` section (mock-only makers have no shared order store).
+async fn open_order_store(
+    config_path: &Path,
+) -> Result<rfq_store::SqliteOrderStore, Box<dyn std::error::Error>> {
+    let config = load_config(config_path)?;
+    let rgb = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: standing orders live in maker.db, which needs a wallet")?;
+    let db_path = rgb.data_dir.join(&rgb.network).join("maker.db");
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let store = rfq_store::SqliteOrderStore::open(&db_path).await?;
+    orders::migrate_orders_json(&store, config_path).await?;
+    Ok(store)
+}
+
+async fn order_create(
     config_path: &Path,
     side: String,
     asset: Option<String>,
     price: u64,
     size: u64,
+    mirror: bool,
+    mirror_spread_bps: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if orders::parse_side(&side).is_none() {
         return Err(format!("invalid --side '{side}': expected 'buy' or 'sell'").into());
@@ -812,41 +849,49 @@ fn order_create(
             .filter(|id| !id.is_empty())
             .ok_or("no --asset given and no [rgb] contract_id in config")?,
     };
-    let path = orders::OrderBook::path_for(config_path);
-    let mut book = orders::OrderBook::load(&path)?;
-    let order = orders::new_order(&side, asset_id, price, size);
+    if mirror && mirror_spread_bps == 0 {
+        output::step_warn(
+            "--mirror with --mirror-spread-bps 0 ping-pongs at the same price (no margin)",
+        );
+    }
+    let store = open_order_store(config_path).await?;
+    let order = orders::new_order(&side, asset_id, price, size, mirror, mirror_spread_bps);
     let id = order.id.clone();
-    match book.upsert(order) {
-        Some(old) => println!("created order {id} (replaced {old})"),
+    let replaced = store.get(&order.asset_id, &order.side).await?;
+    store.upsert(order).await?;
+    match replaced {
+        Some(old) => println!("created order {id} (replaced {})", old.id),
         None => println!("created order {id}"),
     }
-    book.save(&path)?;
     Ok(())
 }
 
-fn order_list(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let path = orders::OrderBook::path_for(config_path);
-    let book = orders::OrderBook::load(&path)?;
-    if book.orders.is_empty() {
-        println!("no standing orders ({})", path.display());
+async fn order_list(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_order_store(config_path).await?;
+    let orders = store.list().await?;
+    if orders.is_empty() {
+        println!("no standing orders (maker.db)");
         return Ok(());
     }
-    for o in &book.orders {
+    for o in &orders {
+        let mirror = if o.mirror {
+            format!("  mirror=on spread_bps={}", o.mirror_spread_bps)
+        } else {
+            String::new()
+        };
         println!(
-            "{}  side={}  asset={}  price/unit={}  size={}",
+            "{}  side={}  asset={}  price/unit={}  size={}{mirror}",
             o.id, o.side, o.asset_id, o.price, o.size
         );
     }
     Ok(())
 }
 
-fn order_cancel(config_path: &Path, id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let path = orders::OrderBook::path_for(config_path);
-    let mut book = orders::OrderBook::load(&path)?;
-    if !book.cancel(id) {
+async fn order_cancel(config_path: &Path, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_order_store(config_path).await?;
+    if !store.cancel(id).await? {
         return Err(format!("no order with id '{id}'").into());
     }
-    book.save(&path)?;
     println!("cancelled order {id}");
     Ok(())
 }
@@ -919,13 +964,15 @@ async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _client = RfqClient::new(parse_broker_url(&config)?);
 
-    // Load the operator's standing orders and feed their prices into the maker.
-    let order_path = orders::OrderBook::path_for(config_path);
-    let book = orders::OrderBook::load(&order_path)?;
-    let order_count = book.orders.len();
-
     let runtime = build_runtime(&config).await?;
-    let maker = runtime.maker.with_price_policy(book.price_policy());
+    let order_store = runtime.order_store;
+    // One-time import of any legacy orders.json into the maker.db `orders` table.
+    orders::migrate_orders_json(order_store.as_ref(), config_path).await?;
+
+    // Seed the maker's price policy from the standing orders in maker.db.
+    let standing = order_store.list().await?;
+    let order_count = standing.len();
+    let maker = runtime.maker.with_price_policy(orders::price_policy(&standing));
     let chain_observer_deps = runtime.chain_observer;
     let app = maker_app(maker.clone());
     let listener = TcpListener::bind(&config.maker.listen_addr).await?;
@@ -946,10 +993,7 @@ async fn run(
     println!("colorex maker up");
     output::info(&format!("node {node_short}… on {network}"));
     output::info(&format!("broker {}", config.maker.broker_url));
-    output::info(&format!(
-        "standing orders {order_count} ({})",
-        order_path.display()
-    ));
+    output::info(&format!("standing orders {order_count} (maker.db)"));
     // Funding addresses, so the operator can top up without a separate command.
     if let Ok((btc, anchor)) = maker_funding_addresses(&config) {
         output::kv("fund BTC  · keychain 0 ", &btc);
@@ -968,8 +1012,13 @@ async fn run(
 
     // Hot-reload standing orders so `order create`/`cancel` take effect without a
     // maker restart.
-    let order_reload_task =
-        spawn_order_reload_loop(maker.clone(), order_path.clone(), std::time::Duration::from_secs(5));
+    let order_reload_task = spawn_order_reload_loop(
+        maker.clone(),
+        order_store.clone(),
+        std::time::Duration::from_secs(5),
+    );
+    let strategy_task =
+        spawn_strategy_loop(maker.clone(), order_store.clone(), config.intervals.strategy);
     let cleanup_task = spawn_cleanup_loop(maker.clone(), config.intervals.cleanup);
     let rebalance_task = spawn_rebalance_loop(
         maker.clone(),
@@ -1002,6 +1051,7 @@ async fn run(
 
     let _ = shutdown_tx.send(());
     order_reload_task.abort();
+    strategy_task.abort();
     cleanup_task.abort();
     rebalance_task.abort();
     broker_task.abort();
@@ -1011,6 +1061,7 @@ async fn run(
     let _ = server_task.await;
     let _ = broker_task.await;
     let _ = order_reload_task.await;
+    let _ = strategy_task.await;
     let _ = cleanup_task.await;
     let _ = rebalance_task.await;
     if let Some(t) = chain_observer_task {
@@ -1057,11 +1108,62 @@ async fn inventory(
     println!("node_id={}", config.maker.node_id);
     print_inventory_snapshot(&snapshot, maker_contract_spec(&config).as_ref());
 
+    inventory_orders(&config).await?;
+
     if btc {
         println!();
         inventory_btc(&config, electrum).await?;
     }
 
+    Ok(())
+}
+
+/// Print the standing orders with each one's cumulative FILLED amount (per
+/// `(asset, side)`, lifetime). Reads the maker.db `orders` + `fills` tables
+/// directly (works whether or not the daemon is running). No-op for a mock /
+/// no-`[rgb]` maker, which has no shared store.
+async fn inventory_orders(config: &MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    use rfq_store::{FillStore as _, OrderStore as _};
+    let Some(rgb) = config.rgb.as_ref() else {
+        return Ok(());
+    };
+    let db_path = rgb.data_dir.join(&rgb.network).join("maker.db");
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let order_store = rfq_store::SqliteOrderStore::open(&db_path).await?;
+    let orders = order_store.list().await?;
+    if orders.is_empty() {
+        return Ok(());
+    }
+    let fills = rfq_store::SqliteFillStore::open(&db_path).await?;
+    let spec = maker_contract_spec(config);
+    let amt = |v: u64| match &spec {
+        Some((ticker, precision)) => format!("{ticker} {}", rfq_types::format_amount(v, *precision)),
+        None => v.to_string(),
+    };
+
+    println!();
+    println!("standing orders ({})", orders.len());
+    for o in &orders {
+        let filled = match orders::parse_side(&o.side) {
+            Some(s) => fills.filled_for(&o.asset_id, &s, 0).await.unwrap_or(0),
+            None => 0,
+        };
+        let mirror = if o.mirror {
+            format!("  mirror=on/{}bps", o.mirror_spread_bps)
+        } else {
+            String::new()
+        };
+        println!(
+            "    {} {}  price/unit={}  size={}  FILLED={}{mirror}",
+            o.side,
+            o.id,
+            o.price,
+            o.size,
+            amt(filled)
+        );
+    }
     Ok(())
 }
 

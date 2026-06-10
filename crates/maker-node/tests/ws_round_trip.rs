@@ -47,6 +47,7 @@ async fn maker_autoregisters_then_quotes_and_accepts_over_ws() {
             cleanup: Duration::from_secs(60),
             rebalance: Duration::from_secs(60),
             chain_observer: Duration::from_secs(60),
+            strategy: Duration::from_millis(500),
         },
         rebalance: RebalancePolicyConfig::default(),
         rgb: None,

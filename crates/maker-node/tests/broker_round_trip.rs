@@ -53,6 +53,7 @@ async fn broker_routes_buy_and_sell_to_remote_maker() {
             cleanup: Duration::from_secs(60),
             rebalance: Duration::from_secs(60),
             chain_observer: Duration::from_millis(500),
+            strategy: Duration::from_millis(500),
         },
         rebalance: RebalancePolicyConfig::default(),
         rgb: Some(RgbConfig {
@@ -381,6 +382,7 @@ async fn spawn_maker_node(
     let MakerNodeRuntime {
         maker,
         chain_observer,
+        ..
     } = runtime;
     let chain_observer = chain_observer.expect("RGB config present → chain observer must spawn");
 

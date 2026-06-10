@@ -39,6 +39,7 @@ async fn http_two_consecutive_buys_via_chain_observer() {
             // between swaps. 500ms is fast enough that the wait_for_observer
             // sleep below catches the post-broadcast tick.
             chain_observer: Duration::from_millis(500),
+            strategy: Duration::from_millis(500),
         },
         rebalance: RebalancePolicyConfig::default(),
         rgb: Some(RgbConfig {
@@ -126,6 +127,7 @@ async fn spawn_maker_node(
     let MakerNodeRuntime {
         maker,
         chain_observer,
+        ..
     } = runtime;
     let chain_observer = chain_observer.expect("RGB config present → chain observer must spawn");
 
