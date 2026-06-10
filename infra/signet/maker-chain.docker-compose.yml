@@ -1,0 +1,75 @@
+# Chain backend for running a Colorex maker on signet: bitcoind + electrs only.
+#
+# A maker is a host process (`colorex maker up`) that talks to electrs over the
+# Electrum protocol and dials a broker over WebSocket. It does NOT run the broker
+# — that's the network operator's (e.g. Colorex at rfq-signet.colorex.io). This
+# stack just gives the maker its own signet chain access.
+#
+#   docker compose -f infra/signet/maker-chain.docker-compose.yml up -d --build
+#
+# Then in `colorex maker init`, set the electrum URL to 127.0.0.1:60601.
+
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:31.0
+    restart: unless-stopped
+    command:
+      - -signet=1
+      - -server=1
+      - -txindex=1
+      - -fallbackfee=0.00001000
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      # No -rpcuser/-rpcpassword: bitcoind writes a .cookie that electrs reads via
+      # the shared volume (romanz/electrs only supports --cookie-file auth).
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+    # No host ports: electrs reaches bitcoind over the internal compose network.
+    volumes:
+      - bitcoind-data:/home/bitcoin/.bitcoin
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bitcoin-cli",
+          "-signet",
+          "-datadir=/home/bitcoin/.bitcoin",
+          "getblockchaininfo",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+
+  electrs:
+    # romanz/electrs built from source — REQUIRED. bp-wallet + the rgb-ops
+    # resolver need the verbose `blockchain.transaction.get`, which the
+    # blockstream/mempool forks reject -> bp-wallet's `expect("broken logic")`.
+    build:
+      context: ../regtest
+      dockerfile: electrs.Dockerfile
+    image: rgb-rfq/electrs:0.11.1
+    restart: unless-stopped
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    entrypoint: electrs
+    command:
+      - --network=signet
+      - --daemon-rpc-addr=bitcoind:38332
+      - --daemon-p2p-addr=bitcoind:38333
+      - --daemon-dir=/home/bitcoin/.bitcoin
+      - --cookie-file=/home/bitcoin/.bitcoin/signet/.cookie
+      - --electrum-rpc-addr=0.0.0.0:50001
+      - --db-dir=/data
+      - --log-filters=INFO
+    ports:
+      # Loopback only — the maker (a local host process) connects to
+      # 127.0.0.1:60601. Nothing else needs it.
+      - "127.0.0.1:60601:50001"
+    volumes:
+      - electrs-data:/data
+      - bitcoind-data:/home/bitcoin/.bitcoin:ro
+
+volumes:
+  bitcoind-data:
+  electrs-data:

@@ -1,13 +1,39 @@
 # Running a maker with `colorex`
 
 A maker quotes RFQs and settles atomic BTC↔RGB swaps. This walks the full
-lifecycle: bootstrap → fund → inventory → standing orders → live daemon. All
-Rust-native via `colorex` (no `rgb-cmd`, no docker), network-agnostic
-(`regtest` / `signet` / `testnet` / `mainnet`).
+lifecycle: chain backend → bootstrap → fund → inventory → standing orders → live
+daemon. The maker itself is Rust-native via `colorex` (no `rgb-cmd`); the only
+Docker is an optional bitcoind + electrs chain backend. Network-agnostic
+(`regtest` / `signet` / `testnet` / `mainnet`); the examples below are signet.
 
 > **Status.** Commands + flags are verified against the current CLI. The full
 > public-network round-trip is **not yet live-validated** (Phase 4). Treat the
 > public-network steps as "should work", not a verified runbook.
+
+## 0. Chain backend — bitcoind + electrs
+
+A maker needs its own signet chain access: a `bitcoind` (signet) and a **romanz**
+`electrs`. romanz specifically — the maker's bp-wallet + RGB resolver need the
+verbose `blockchain.transaction.get` that the blockstream/mempool electrs forks
+don't serve. The bundled compose runs just these two:
+
+```bash
+docker compose -f infra/signet/maker-chain.docker-compose.yml up -d --build
+```
+
+- `bitcoind` (signet) stays internal — electrs reaches it over the compose network.
+- `electrs` is published on **`127.0.0.1:60601`** — the electrum endpoint you give
+  `maker init` below.
+
+⚠️ Signet **initial sync takes a while**; electrs only answers wallet queries once
+bitcoind has caught up. Watch progress:
+
+```bash
+docker compose -f infra/signet/maker-chain.docker-compose.yml logs -f bitcoind electrs
+```
+
+You do **not** run the broker — you connect to one (e.g. Colorex signet at
+`https://rfq-signet.colorex.io`). Run your own broker only for a fully local setup.
 
 ## 1. Bootstrap — `maker init`
 
@@ -22,12 +48,21 @@ account** (one-shot — skipped if they already exist), and writes:
 - `~/.config/colorex/maker.toml` — the daemon config (`[maker]` + `[rgb]`).
 - `node.key` / `node.pub` — the node identity.
 
+Answer the prompts with:
+
+- **network** — `signet`
+- **broker URL** — the network you're joining, e.g. `https://rfq-signet.colorex.io`
+  (the maker derives `wss://…/maker-stream` from it). Use `http://127.0.0.1:3000`
+  only if you're also running a local broker.
+- **electrum URL** — `tcp://127.0.0.1:60601` (the electrs from step 0). Your local
+  romanz electrs is **plaintext TCP** — no TLS on loopback. The URL takes a
+  `tcp://`/`ssl://` scheme; no prefix also means tcp, so bare `127.0.0.1:60601`
+  works too. `ssl://` is only for remote TLS servers (e.g. the signet default
+  `ssl://mempool.space:60602`, which is fine for BTC but breaks the RGB resolver
+  — so a maker uses its own romanz electrs over tcp).
+
 It prints a **keychain-10** address to fund. Leave `RGB contract id` empty for
 now if you haven't issued the asset yet — set it after step 3.
-
-> The electrum URL here is a **bare** `host:port` (the daemon resolves via
-> bp-electrum). There is no public Blockstream signet server — point signet at
-> your own `electrs`.
 
 ## 2. Fund + sync
 
@@ -67,7 +102,14 @@ colorex maker invoice --amount 1000000
 ```
 
 Hand that invoice to the issuer; they run `colorex issuer transfer` against it and
-give you back a consignment to accept (see [issuing-tokens.md](issuing-tokens.md)).
+return a base64 **consignment**. Once its anchoring tx confirms, import it:
+
+```bash
+colorex maker accept --path consignment.b64      # --contract defaults to [rgb] contract_id
+```
+
+This absorbs the transfer into the maker's stash, so `maker up` counts it as
+inventory (see [issuing-tokens.md](issuing-tokens.md)).
 
 ## 4. Set standing orders (pricing)
 
@@ -94,8 +136,9 @@ colorex maker order cancel <id>
   request above it is **declined**, not quoted at the fallback.
 - `--asset`: optional; defaults to the config's `contract_id`.
 
-Orders persist to `orders.json` next to the config, and `maker up` loads them.
-Creating a second order for the same (asset, side) **replaces** the first.
+Orders persist to `maker.db` (the maker's SQLite store, next to the config), and
+`maker up` loads them. Creating a second order for the same (asset, side)
+**replaces** the first.
 
 > **Current limits (v1):** one standing order per (asset, side); `--size` is a
 > per-quote cap, not a running fill total; actual fills are still bounded by
@@ -103,12 +146,15 @@ Creating a second order for the same (asset, side) **replaces** the first.
 
 ## 5. Run the daemon
 
-Start the broker, then the maker:
+Just start the maker — it dials the broker from `maker.toml` and auto-registers:
 
 ```bash
-cargo run -p rfq-api        # the broker (separate process)
 colorex maker up
 ```
+
+(Only run a broker yourself for a fully local setup: `cargo run -p rfq-api` in a
+separate process, with `broker_url = http://127.0.0.1:3000`. Joining Colorex
+signet, you skip this.)
 
 The startup banner echoes `standing_orders=<n>`. The daemon serves quotes (priced
 from your orders), and runs the cleanup / rebalance / chain-observer loops.

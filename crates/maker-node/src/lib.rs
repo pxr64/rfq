@@ -9,7 +9,7 @@ pub mod node_key;
 pub mod orders;
 pub mod output;
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use axum::{
     extract::{Path, State},
@@ -20,7 +20,7 @@ use axum::{
 };
 use rfq_btc::{BitcoinClient, ElectrumClient, MockBitcoinClient};
 use rfq_maker::{CoinSelector, GreedyExactFitSelector, Maker, RebalancePolicy};
-use rfq_rgb::{LibRgbBackend, MockRgbBackend, RgbBackend};
+use rfq_rgb::{ContractId, LibRgbBackend, MockRgbBackend, RgbBackend};
 use rfq_router::MakerConnector;
 use rfq_store::{
     BtcInventoryStore, ConsignmentStore, InMemoryOrderStore, InMemoryQuoteStore, InventoryStore,
@@ -324,6 +324,42 @@ pub async fn create_inventory_invoice(
         rgb.signer.password.clone(),
     );
     Ok(backend.create_invoice(&asset, amount).await?)
+}
+
+/// Accept an incoming consignment into the maker's stash — the receive-side
+/// counterpart to [`create_inventory_invoice`]. After `maker invoice` and the
+/// issuer's `issuer transfer`, the issuer hands back a consignment; this verifies
+/// + absorbs it so `maker up` picks the RGB up as inventory (once the anchoring
+/// tx confirms). `contract` defaults to the config's `[rgb] contract_id`. See
+/// [`LibRgbBackend::accept_incoming_transfer`].
+pub async fn accept_inventory_consignment(
+    config: &MakerNodeConfig,
+    contract: Option<String>,
+    consignment_base64: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rgb = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: a wallet is required to accept a consignment")?;
+    let contract_id = match contract {
+        Some(c) if !c.is_empty() => c,
+        _ if !rgb.contract_id.is_empty() => rgb.contract_id.clone(),
+        _ => return Err("no --contract given and no [rgb] contract_id in maker.toml".into()),
+    };
+    let contract_id = ContractId::from_str(&contract_id)
+        .map_err(|e| format!("invalid contract id {contract_id}: {e}"))?;
+    let backend = LibRgbBackend::new(
+        rgb.data_dir.clone(),
+        rgb.wallet_name.clone(),
+        rgb.network.clone(),
+        rgb.electrum_url.clone(),
+        rgb.signer.account_file.clone(),
+        rgb.signer.password.clone(),
+    );
+    backend
+        .accept_incoming_transfer(consignment_base64, contract_id)
+        .await?;
+    Ok(())
 }
 
 /// Re-derive a consignment the maker already produced, for recovery. `contract`

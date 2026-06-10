@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use maker_node::{
-    broker_client, build_maker, build_runtime, create_inventory_invoice, init, maker_app, now_ms,
-    orders, fetch_consignment, output, reconsign_consignment, spawn_chain_observer_loop,
-    spawn_cleanup_loop, spawn_order_reload_loop, spawn_rebalance_loop, spawn_strategy_loop,
-    MakerNodeConfig,
+    accept_inventory_consignment, broker_client, build_maker, build_runtime,
+    create_inventory_invoice, init, maker_app, now_ms, orders, fetch_consignment, output,
+    reconsign_consignment, spawn_chain_observer_loop, spawn_cleanup_loop, spawn_order_reload_loop,
+    spawn_rebalance_loop, spawn_strategy_loop, MakerNodeConfig,
 };
 use rfq_wallet::{resolve_named, resolve_wallet, WalletConfig, WalletInput};
 use rfq_rgb::RgbBackend;
@@ -245,6 +245,18 @@ enum MakerCmd {
         #[arg(long)]
         amount: u64,
     },
+    /// Accept an incoming consignment into the maker's stash — the receive-side
+    /// counterpart to `invoice`. After you `invoice` and the issuer runs
+    /// `issuer transfer` against it, they return a consignment; this imports it
+    /// so `maker up` sees the RGB as inventory (once the anchoring tx confirms).
+    Accept {
+        /// Path to the base64 consignment file the issuer returned.
+        #[arg(long)]
+        path: PathBuf,
+        /// RGB contract id. Defaults to the config's `[rgb] contract_id`.
+        #[arg(long)]
+        contract: Option<String>,
+    },
     /// Manage standing orders — the prices the maker quotes per (asset, side).
     Order {
         #[command(subcommand)]
@@ -342,6 +354,9 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 dry_run,
             } => maker_recover(load_config(&config_path)?, electrum, fee, dry_run).await,
             MakerCmd::Invoice { amount } => maker_invoice(load_config(&config_path)?, amount).await,
+            MakerCmd::Accept { path, contract } => {
+                maker_accept(load_config(&config_path)?, path, contract).await
+            }
             MakerCmd::Order { cmd } => match cmd {
                 OrderCmd::Create {
                     side,
@@ -766,6 +781,20 @@ async fn maker_recover(
          re-sync and `colorex maker inventory --btc` to see them as sellable.",
         swept.len()
     ));
+    Ok(())
+}
+
+async fn maker_accept(
+    config: MakerNodeConfig,
+    path: PathBuf,
+    contract: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let consignment = std::fs::read_to_string(&path)?;
+    accept_inventory_consignment(&config, contract, consignment.trim()).await?;
+    println!(
+        "accepted consignment from {} into the maker stash",
+        path.display()
+    );
     Ok(())
 }
 
