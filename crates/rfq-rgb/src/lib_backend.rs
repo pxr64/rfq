@@ -782,28 +782,35 @@ impl LibRgbBackend {
     /// scriptPubkey is derived from the wallet descriptor + the UTXO's
     /// terminal — same path `swap::enrich_psbt_input` uses on the maker
     /// side, so the bytes round-trip cleanly into PSBT inputs.
+    /// Wallet UTXOs that carry NO RGB for ANY of `assets` — the maker's spendable
+    /// BTC pool. Multi-asset: every registered contract's allocations are excluded,
+    /// so an output bound to asset B is never handed back as plain BTC when the
+    /// maker also trades asset A (which would let a swap/fee spend destroy B's RGB).
     pub async fn list_btc_only_utxos(
         &self,
-        asset: &AssetId,
+        assets: &[AssetId],
         now_ms: u64,
     ) -> Result<Vec<rfq_types::BtcInventoryUtxo>, RgbError> {
         let _guard = self.guard();
         use bpstd::Derive as _;
         let wallet = self.load_wallet()?;
-        let contract_id = ContractId::from_str(&asset.id)
-            .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
 
-        // Build the set of outpoints carrying RGB for `contract_id` in this
-        // maker's wallet (matches `list_inventory_utxos`'s filter).
+        // Build the set of outpoints carrying RGB for ANY traded contract in this
+        // maker's wallet (matches `list_inventory_utxos`'s per-contract filter,
+        // unioned across all assets).
         let mut rgb_outpoints: std::collections::HashSet<(String, u32)> =
             std::collections::HashSet::new();
-        if let Ok(contract) = wallet.stock().contract_data(contract_id) {
-            let filter = FilterIncludeAll;
-            for details in contract.schema.owned_types.values() {
-                if let Ok(allocs) = contract.fungible(details.name.clone(), &filter) {
-                    for alloc in allocs {
-                        let op = alloc.seal.to_outpoint();
-                        rgb_outpoints.insert((op.txid.to_string(), op.vout.into_u32()));
+        for asset in assets {
+            let contract_id = ContractId::from_str(&asset.id)
+                .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
+            if let Ok(contract) = wallet.stock().contract_data(contract_id) {
+                let filter = FilterIncludeAll;
+                for details in contract.schema.owned_types.values() {
+                    if let Ok(allocs) = contract.fungible(details.name.clone(), &filter) {
+                        for alloc in allocs {
+                            let op = alloc.seal.to_outpoint();
+                            rgb_outpoints.insert((op.txid.to_string(), op.vout.into_u32()));
+                        }
                     }
                 }
             }

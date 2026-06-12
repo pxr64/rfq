@@ -20,8 +20,6 @@ use rfq_wallet::{
 };
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password};
 use rfq_client::{RfqClient, Url};
-use rfq_rgb::RgbBackend;
-use rfq_types::{AssetId, AssetKind, BitcoinNetwork};
 
 use crate::{node_key::NodeKey, output};
 
@@ -91,10 +89,6 @@ pub async fn run(args: InitArgs, config_path: &Path) -> Result<(), Box<dyn std::
             .with_prompt("RGB wallet name")
             .default("maker".into())
             .interact_text()?;
-        let contract_id: String = Input::with_theme(&ColorfulTheme::default())
-            .with_prompt("RGB contract id (leave empty to set later)")
-            .allow_empty(true)
-            .interact_text()?;
         let account_file: String = Input::with_theme(&ColorfulTheme::default())
             .with_prompt("signer account file")
             .default(
@@ -112,7 +106,6 @@ pub async fn run(args: InitArgs, config_path: &Path) -> Result<(), Box<dyn std::
             electrum_url,
             data_dir,
             wallet_name,
-            contract_id,
             account_file,
             password,
         })
@@ -144,32 +137,20 @@ pub async fn run(args: InitArgs, config_path: &Path) -> Result<(), Box<dyn std::
         }
         // Persist the per-wallet config so `colorex wallet`/`issuer` commands
         // resolve this wallet by --name (no flags/prompts).
-        if let Err(e) = WalletConfig::from_resolved(&resolved_from(r), &r.contract_id).save() {
+        if let Err(e) = WalletConfig::from_resolved(&resolved_from(r), "").save() {
             output::step_warn(&truncate_error(&e.to_string()));
         }
     }
 
-    output::step("probing rgb20 inventory");
-    match &rgb {
-        Some(r) if !r.contract_id.is_empty() => match probe_rgb_inventory(r).await {
-            Ok(n) => println!(
-                "[ok] (found {n} UTXO{}, contract {})",
-                if n == 1 { "" } else { "s" },
-                truncate_contract(&r.contract_id),
-            ),
-            Err(e) => {
-                output::step_warn(&truncate_error(&e.to_string()));
-                let cont = Confirm::with_theme(&ColorfulTheme::default())
-                    .with_prompt("Continue anyway?")
-                    .default(true)
-                    .interact()?;
-                if !cont {
-                    return Err("init aborted: RGB probe failed".into());
-                }
-            }
-        },
-        // RGB configured but no contract id yet, or no RGB at all.
-        _ => output::step_skip(),
+    // Contracts are no longer a TOML field — they live in the registry. After
+    // funding the wallet, register the asset(s) to trade with
+    // `colorex maker contract import <id>` (or `--consignment` to accept one).
+    if rgb.is_some() {
+        output::step("contracts");
+        output::step_skip();
+        output::note(
+            "register assets to trade after funding: colorex maker contract import <id>",
+        );
     }
 
     output::step("subscribing to broker");
@@ -260,7 +241,6 @@ struct RgbAnswers {
     electrum_url: String,
     data_dir: String,
     wallet_name: String,
-    contract_id: String,
     account_file: String,
     password: String,
 }
@@ -287,16 +267,6 @@ fn resolved_from(r: &RgbAnswers) -> ResolvedWallet {
     }
 }
 
-async fn probe_rgb_inventory(r: &RgbAnswers) -> Result<usize, Box<dyn std::error::Error>> {
-    let backend = resolved_from(r).backend();
-    let asset = AssetId {
-        network: parse_network(&r.network).ok_or("unknown network")?,
-        kind: AssetKind::Rgb20,
-        id: r.contract_id.clone(),
-    };
-    let utxos = backend.list_inventory_utxos(&asset).await?;
-    Ok(utxos.len())
-}
 
 async fn probe_broker(broker_url: &str) -> Result<String, Box<dyn std::error::Error>> {
     let url = Url::parse(broker_url)?;
@@ -305,17 +275,7 @@ async fn probe_broker(broker_url: &str) -> Result<String, Box<dyn std::error::Er
     Ok(response.status)
 }
 
-fn parse_network(s: &str) -> Option<BitcoinNetwork> {
-    match s {
-        "regtest" => Some(BitcoinNetwork::Regtest),
-        "signet" => Some(BitcoinNetwork::Signet),
-        "testnet" => Some(BitcoinNetwork::Testnet),
-        "mainnet" => Some(BitcoinNetwork::Mainnet),
-        _ => None,
-    }
-}
-
-fn truncate_contract(id: &str) -> String {
+pub fn truncate_contract(id: &str) -> String {
     if id.len() <= 12 {
         id.to_owned()
     } else {
@@ -345,7 +305,6 @@ fn render_toml(r: &RenderInput<'_>) -> String {
         out.push_str(&format!("data_dir     = \"{}\"\n", rgb.data_dir));
         out.push_str(&format!("wallet_name  = \"{}\"\n", rgb.wallet_name));
         out.push_str(&format!("electrum_url = \"{}\"\n", rgb.electrum_url));
-        out.push_str(&format!("contract_id  = \"{}\"\n", rgb.contract_id));
         out.push('\n');
         out.push_str("[rgb.signer]\n");
         out.push_str(&format!("account_file = \"{}\"\n", rgb.account_file));
@@ -428,7 +387,6 @@ mod tests {
             electrum_url: "localhost:60001".into(),
             data_dir: "/tmp/data".into(),
             wallet_name: "maker".into(),
-            contract_id: "rgb:abcd-1234".into(),
             account_file: "/tmp/maker.account".into(),
             password: "".into(),
         };
@@ -438,10 +396,12 @@ mod tests {
             broker_url: "http://127.0.0.1:3000",
             rgb: Some(&rgb),
         });
+        // Contracts are no longer a TOML field — they live in the registry.
+        assert!(!toml.contains("contract_id"));
         let cfg = crate::MakerNodeConfig::load_str(&toml).expect("rendered TOML parses");
         assert_eq!(cfg.maker.node_id, "node·beef");
         let rgb_cfg = cfg.rgb.expect("rgb block parsed");
-        assert_eq!(rgb_cfg.contract_id, "rgb:abcd-1234");
+        assert_eq!(rgb_cfg.wallet_name, "maker");
         assert_eq!(rgb_cfg.signer.password, "");
     }
 

@@ -509,6 +509,14 @@ impl Maker {
         ExtendedInventorySnapshot::from_utxos(utxos.iter())
     }
 
+    /// Per-asset inventory snapshot — the multi-asset view, for a maker trading
+    /// more than one contract. `inventory_summary` aggregates ALL assets; this
+    /// scopes to one (so amounts render in that contract's ticker/precision).
+    pub async fn inventory_summary_for(&self, asset: &AssetId) -> InventorySnapshot {
+        self.store.release_expired_reservations(now_ms()).await;
+        (&self.store.extended_snapshot(asset).await).into()
+    }
+
     /// Bulk-ingest BTC UTXOs discovered out-of-band (e.g. by the chain
     /// observer's periodic re-list of wallet-derived BTC inventory) into
     /// the BTC store. Existing outpoints are silently skipped — the store's

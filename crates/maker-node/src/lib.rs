@@ -23,9 +23,10 @@ use rfq_maker::{CoinSelector, GreedyExactFitSelector, Maker, RebalancePolicy};
 use rfq_rgb::{ContractId, LibRgbBackend, MockRgbBackend, RgbBackend};
 use rfq_router::MakerConnector;
 use rfq_store::{
-    BtcInventoryStore, ConsignmentStore, InMemoryOrderStore, InMemoryQuoteStore, InventoryStore,
-    OrderStore, QuoteStore, SqliteBtcInventoryStore, SqliteConsignmentStore, SqliteFillStore,
-    SqliteInventoryStore, SqliteOrderStore,
+    BtcInventoryStore, ConsignmentStore, ContractRecord, ContractStore, InMemoryOrderStore,
+    InMemoryQuoteStore, InventoryStore, OrderStore, QuoteStore, SqliteBtcInventoryStore,
+    SqliteConsignmentStore, SqliteContractStore, SqliteFillStore, SqliteInventoryStore,
+    SqliteOrderStore,
 };
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, BtcInventoryStatus, BtcInventoryUtxo,
@@ -176,7 +177,6 @@ pub struct RgbConfig {
     pub data_dir: PathBuf,
     pub wallet_name: String,
     pub electrum_url: String,
-    pub contract_id: String,
     pub signer: SignerConfig,
 }
 
@@ -283,11 +283,13 @@ pub struct MakerNodeRuntime {
 }
 
 /// Shared with the chain observer so it can drive `LibRgbBackend::sync_wallet`
-/// + `list_btc_only_utxos` against the same RGB stash + asset the maker uses.
-/// `None` for the mock fallback (nothing on-chain to observe).
+/// + `list_btc_only_utxos` against the same RGB stash + assets the maker trades.
+/// `assets` is every registered contract (the observer refreshes each one's RGB
+/// inventory and excludes all of them from the BTC pool). `None` for the mock
+/// fallback (nothing on-chain to observe).
 pub struct ChainObserverDeps {
     pub rgb_backend: Arc<LibRgbBackend>,
-    pub asset: AssetId,
+    pub assets: Vec<AssetId>,
 }
 
 /// Thin compatibility shim around [`build_runtime`] for tests + the
@@ -296,24 +298,52 @@ pub async fn build_maker(config: &MakerNodeConfig) -> Result<Maker, Box<dyn std:
     Ok(build_runtime(config).await?.maker)
 }
 
-/// Mint an RGB invoice for the maker's configured contract — the receive side
-/// of acquiring inventory from an issuer (`colorex maker invoice`). Requires an
-/// `[rgb]` section with a `contract_id`.
+/// Register a contract into the maker's on-disk registry (`maker.db`) so the
+/// daemon seeds + trades it on the next `build_runtime`. The CLI's `contract
+/// import` reads `ticker`/`precision` from the stock; this lower-level seed (used
+/// by setup code + e2e tests) leaves them blank since the daemon keys off the
+/// contract id alone.
+pub async fn seed_contract_registry(
+    config: &MakerNodeConfig,
+    contract_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rgb = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: the contract registry lives in maker.db")?;
+    let db_path = rgb.data_dir.join(&rgb.network).join("maker.db");
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    SqliteContractStore::open(&db_path)
+        .await?
+        .upsert(ContractRecord {
+            contract_id: contract_id.to_owned(),
+            ticker: String::new(),
+            precision: 0,
+            network: rgb.network.clone(),
+            added_at_ms: now_ms(),
+        })
+        .await?;
+    Ok(())
+}
+
+/// Mint an RGB invoice for `contract_id` — the receive side of acquiring
+/// inventory from an issuer (`colorex maker wallet invoice`). The contract is
+/// resolved from the registry by the CLI layer.
 pub async fn create_inventory_invoice(
     config: &MakerNodeConfig,
+    contract_id: String,
     amount: u64,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let rgb = config
         .rgb
         .as_ref()
         .ok_or("no [rgb] config: a wallet is required to create an invoice")?;
-    if rgb.contract_id.is_empty() {
-        return Err("set contract_id in maker.toml [rgb] before creating an invoice".into());
-    }
     let asset = AssetId {
         network: rgb.network.parse::<BitcoinNetwork>()?,
         kind: AssetKind::Rgb20,
-        id: rgb.contract_id.clone(),
+        id: contract_id,
     };
     let backend = LibRgbBackend::new(
         rgb.data_dir.clone(),
@@ -330,22 +360,17 @@ pub async fn create_inventory_invoice(
 /// counterpart to [`create_inventory_invoice`]. After `maker invoice` and the
 /// issuer's `issuer transfer`, the issuer hands back a consignment; this verifies
 /// + absorbs it so `maker up` picks the RGB up as inventory (once the anchoring
-/// tx confirms). `contract` defaults to the config's `[rgb] contract_id`. See
-/// [`LibRgbBackend::accept_incoming_transfer`].
+/// tx confirms). `contract_id` is resolved from the registry by the CLI layer.
+/// See [`LibRgbBackend::accept_incoming_transfer`].
 pub async fn accept_inventory_consignment(
     config: &MakerNodeConfig,
-    contract: Option<String>,
+    contract_id: String,
     consignment_base64: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rgb = config
         .rgb
         .as_ref()
         .ok_or("no [rgb] config: a wallet is required to accept a consignment")?;
-    let contract_id = match contract {
-        Some(c) if !c.is_empty() => c,
-        _ if !rgb.contract_id.is_empty() => rgb.contract_id.clone(),
-        _ => return Err("no --contract given and no [rgb] contract_id in maker.toml".into()),
-    };
     let contract_id = ContractId::from_str(&contract_id)
         .map_err(|e| format!("invalid contract id {contract_id}: {e}"))?;
     let backend = LibRgbBackend::new(
@@ -362,23 +387,18 @@ pub async fn accept_inventory_consignment(
     Ok(())
 }
 
-/// Re-derive a consignment the maker already produced, for recovery. `contract`
-/// defaults to the config's `[rgb] contract_id` when omitted. Reads the stash only
-/// — no chain access, no signing. See [`LibRgbBackend::reconsign`].
+/// Re-derive a consignment the maker already produced, for recovery.
+/// `contract_id` is resolved from the registry by the CLI layer. Reads the stash
+/// only — no chain access, no signing. See [`LibRgbBackend::reconsign`].
 pub fn reconsign_consignment(
     config: &MakerNodeConfig,
-    contract: Option<String>,
+    contract_id: String,
     outpoint: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let rgb = config
         .rgb
         .as_ref()
         .ok_or("no [rgb] config: a wallet is required to reconsign")?;
-    let contract_id = match contract {
-        Some(c) if !c.is_empty() => c,
-        _ if !rgb.contract_id.is_empty() => rgb.contract_id.clone(),
-        _ => return Err("no --contract given and no [rgb] contract_id in maker.toml".into()),
-    };
     let backend = LibRgbBackend::new(
         rgb.data_dir.clone(),
         rgb.wallet_name.clone(),
@@ -413,23 +433,10 @@ pub async fn build_runtime(
     config: &MakerNodeConfig,
 ) -> Result<MakerNodeRuntime, Box<dyn std::error::Error>> {
     let maker_id = MakerId(config.maker.node_id.clone());
-    let asset = AssetId {
-        // Network comes from the RGB config (signet/mainnet/...); the mock path
-        // (no [rgb] section) stays on regtest.
-        network: match &config.rgb {
-            Some(r) => r.network.parse::<BitcoinNetwork>()?,
-            None => BitcoinNetwork::Regtest,
-        },
-        kind: AssetKind::Rgb20,
-        id: config
-            .rgb
-            .as_ref()
-            .map(|r| r.contract_id.clone())
-            .unwrap_or_else(|| "rgb-test-asset".to_owned()),
-    };
 
     match &config.rgb {
         Some(rgb_cfg) => {
+            let network = rgb_cfg.network.parse::<BitcoinNetwork>()?;
             // Production-ish path: real RGB stash + real electrum-backed
             // chain access + real wallet-derived BTC inventory.
             let backend = Arc::new(LibRgbBackend::new(
@@ -440,12 +447,6 @@ pub async fn build_runtime(
                 rgb_cfg.signer.account_file.clone(),
                 rgb_cfg.signer.password.clone(),
             ));
-            let rgb_utxos = backend.list_inventory_utxos(&asset).await?;
-            let now_ms = now_ms();
-            let btc_inventory = backend.list_btc_only_utxos(&asset, now_ms).await?;
-            let bitcoin_client: Arc<dyn BitcoinClient> =
-                Arc::new(ElectrumClient::connect(&rgb_cfg.electrum_url)?);
-            let rgb_backend_trait: Arc<dyn RgbBackend> = backend.clone();
 
             // Durable inventory: `maker.db` sits under the wallet-name namespace
             // AND the network sub-dir (alongside the rgb stock), so the same
@@ -454,12 +455,27 @@ pub async fn build_runtime(
             if let Some(parent) = db_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
+            let contract_store = SqliteContractStore::open(&db_path).await?;
+            let assets = load_registered_assets(&contract_store, network).await?;
+
+            let now_ms = now_ms();
+            let bitcoin_client: Arc<dyn BitcoinClient> =
+                Arc::new(ElectrumClient::connect(&rgb_cfg.electrum_url)?);
+            let rgb_backend_trait: Arc<dyn RgbBackend> = backend.clone();
+
             let inv_store = SqliteInventoryStore::open(&db_path).await?;
             let btc_store = SqliteBtcInventoryStore::open(&db_path).await?;
             let consignment_store = SqliteConsignmentStore::open(&db_path).await?;
             let fills_store = SqliteFillStore::open(&db_path).await?;
             let order_store = SqliteOrderStore::open(&db_path).await?;
-            reconcile_rgb_inventory(&inv_store, &asset, &rgb_utxos, now_ms).await?;
+
+            // Seed/reconcile each traded contract's RGB inventory independently;
+            // the BTC pool excludes every contract's allocations at once.
+            for asset in &assets {
+                let rgb_utxos = backend.list_inventory_utxos(asset).await?;
+                reconcile_rgb_inventory(&inv_store, asset, &rgb_utxos, now_ms).await?;
+            }
+            let btc_inventory = backend.list_btc_only_utxos(&assets, now_ms).await?;
             reconcile_btc_inventory(&btc_store, &btc_inventory).await?;
 
             let inv_store: Arc<dyn InventoryStore> = Arc::new(inv_store);
@@ -477,7 +493,7 @@ pub async fn build_runtime(
                 maker,
                 chain_observer: Some(ChainObserverDeps {
                     rgb_backend: backend,
-                    asset,
+                    assets,
                 }),
                 order_store,
             })
@@ -487,6 +503,11 @@ pub async fn build_runtime(
             // without infra. Seeds a single RGB allocation and the
             // deterministic mock BTC inventory the docs/swap-flows.md
             // round trip walks through.
+            let asset = AssetId {
+                network: BitcoinNetwork::Regtest,
+                kind: AssetKind::Rgb20,
+                id: "rgb-test-asset".to_owned(),
+            };
             let utxo = RgbInventoryUtxo {
                 outpoint: Outpoint::new(format!("{:064x}", 0u64), 0),
                 asset_id: asset,
@@ -508,10 +529,32 @@ pub async fn build_runtime(
     }
 }
 
-/// Reconcile the durable RGB inventory with on-chain UTXOs. A fresh db is
-/// seeded outright; a populated one (restart) keeps its persisted reservations
-/// and settlement statuses and only ingests UTXOs it isn't already tracking —
-/// the chain observer owns confirmation/spend transitions.
+/// Resolve the assets the maker trades from the contract registry. The registry
+/// (`colorex maker contract import`) is the sole source of truth — an empty
+/// registry means the maker trades nothing yet (the daemon still runs; it just
+/// quotes no RGB until a contract is imported).
+async fn load_registered_assets(
+    contract_store: &SqliteContractStore,
+    network: BitcoinNetwork,
+) -> Result<Vec<AssetId>, Box<dyn std::error::Error>> {
+    Ok(contract_store
+        .list()
+        .await?
+        .into_iter()
+        .map(|c| AssetId {
+            network,
+            kind: AssetKind::Rgb20,
+            id: c.contract_id,
+        })
+        .collect())
+}
+
+/// Reconcile one contract's durable RGB inventory with on-chain UTXOs. A
+/// not-yet-tracked asset is seeded outright; an already-tracked one (restart, or
+/// another asset already in the db) keeps its persisted reservations and
+/// settlement statuses and only ingests UTXOs it isn't tracking — the chain
+/// observer owns confirmation/spend transitions. The empty-check is per-asset
+/// (not the whole store) so seeding a second contract never trips the merge path.
 async fn reconcile_rgb_inventory(
     store: &SqliteInventoryStore,
     asset: &AssetId,
@@ -528,7 +571,7 @@ async fn reconcile_rgb_inventory(
         updated_at_ms: now_ms,
         pending_txid: None,
     };
-    if store.is_empty().await {
+    if store.list_for_asset(asset).await.is_empty() {
         store
             .replace_for_asset(asset, rgb_utxos.iter().map(to_inv).collect())
             .await?;
@@ -912,6 +955,45 @@ mod tests {
         }
     }
 
+    /// Multi-asset seeding: each contract's inventory reconciles independently.
+    /// Seeding a SECOND asset into a store that already holds the first must NOT
+    /// trip the merge path (which keys off per-asset emptiness, not the whole
+    /// store), or the second contract would never seed.
+    #[tokio::test]
+    async fn reconcile_seeds_each_asset_independently() {
+        use rfq_types::{AssetKind, BitcoinNetwork};
+        let path =
+            std::env::temp_dir().join(format!("maker-reconcile-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteInventoryStore::open(&path).await.unwrap();
+
+        let asset = |id: &str| AssetId {
+            network: BitcoinNetwork::Signet,
+            kind: AssetKind::Rgb20,
+            id: id.to_owned(),
+        };
+        let utxo = |a: AssetId, vout: u32, amount: u64| RgbInventoryUtxo {
+            outpoint: Outpoint::new(format!("{:064x}", vout as u64), vout),
+            asset_id: a,
+            amount,
+            btc_sats: 546,
+        };
+
+        reconcile_rgb_inventory(&store, &asset("rgb:a"), &[utxo(asset("rgb:a"), 0, 100)], 1)
+            .await
+            .unwrap();
+        // Second asset into a NON-empty store — still seeds (per-asset gate).
+        reconcile_rgb_inventory(&store, &asset("rgb:b"), &[utxo(asset("rgb:b"), 1, 200)], 1)
+            .await
+            .unwrap();
+
+        assert_eq!(store.list_for_asset(&asset("rgb:a")).await.len(), 1);
+        assert_eq!(store.list_for_asset(&asset("rgb:b")).await.len(), 1);
+        let total: u64 = store.list_all().await.iter().map(|u| u.amount).sum();
+        assert_eq!(total, 300, "both assets seeded, neither dropped");
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn loads_minimal_config_uses_defaults() {
         let cfg = MakerNodeConfig::load_str("").expect("empty TOML parses with defaults");
@@ -931,10 +1013,7 @@ mod tests {
         assert_eq!(cfg.maker.node_id, "node·7af2");
         let rgb = cfg.rgb.expect("example has [rgb] block");
         assert_eq!(rgb.network, "regtest");
-        assert_eq!(
-            rgb.contract_id,
-            "rgb:HvGfPj8l-7PK6bkl-WgWvEPH-_zV4VSZ-v2EPZ_p-6Wr7PvM---"
-        );
+        assert_eq!(rgb.wallet_name, "maker");
         // Tilde expansion fires at load time.
         assert!(
             !rgb.data_dir.to_string_lossy().starts_with('~'),
@@ -1141,7 +1220,8 @@ pub fn spawn_chain_observer_loop(
                 continue;
             }
             let now = now_ms();
-            match deps.rgb_backend.list_btc_only_utxos(&deps.asset, now).await {
+            // BTC pool excludes EVERY traded contract's allocations in one call.
+            match deps.rgb_backend.list_btc_only_utxos(&deps.assets, now).await {
                 Ok(utxos) => {
                     let added = maker.ingest_btc_change_utxos(utxos).await;
                     if added > 0 {
@@ -1152,20 +1232,22 @@ pub fn spawn_chain_observer_loop(
                     eprintln!("chain_observer list_btc_only_utxos failed: {e}");
                 }
             }
-            // Refresh RGB inventory too — consecutive maker-side swaps
-            // would otherwise stall after the first one. The maker's `/sign`
-            // intentionally does *not* ingest the change UTXO; the chain
-            // observer adds it here with `Available` status once `sync_wallet`
-            // sees the new outpoint, mirroring `ingest_btc_change_utxos`.
-            match deps.rgb_backend.list_inventory_utxos(&deps.asset).await {
-                Ok(utxos) => {
-                    let added = maker.ingest_rgb_change_utxos(utxos).await;
-                    if added > 0 {
-                        println!("chain_observer ingested_rgb_utxos={added}");
+            // Refresh each contract's RGB inventory too — consecutive maker-side
+            // swaps would otherwise stall after the first one. The maker's `/sign`
+            // intentionally does *not* ingest the change UTXO; the chain observer
+            // adds it here with `Available` status once `sync_wallet` sees the new
+            // outpoint, mirroring `ingest_btc_change_utxos`.
+            for asset in &deps.assets {
+                match deps.rgb_backend.list_inventory_utxos(asset).await {
+                    Ok(utxos) => {
+                        let added = maker.ingest_rgb_change_utxos(utxos).await;
+                        if added > 0 {
+                            println!("chain_observer ingested_rgb_utxos={added}");
+                        }
                     }
-                }
-                Err(e) => {
-                    eprintln!("chain_observer list_inventory_utxos failed: {e}");
+                    Err(e) => {
+                        eprintln!("chain_observer list_inventory_utxos failed: {e}");
+                    }
                 }
             }
             let spent = maker.sweep_confirmations().await;

@@ -47,7 +47,6 @@ async fn http_two_consecutive_buys_via_chain_observer() {
             data_dir: stack.maker_stash_dir().to_owned(),
             wallet_name: "maker".to_owned(),
             electrum_url: stack.electrum_url().to_owned(),
-            contract_id: stack.contract_id_str().to_owned(),
             signer: SignerConfig {
                 account_file: stack.maker_account_file().to_owned(),
                 password: String::new(),
@@ -55,6 +54,9 @@ async fn http_two_consecutive_buys_via_chain_observer() {
         }),
     };
 
+    maker_node::seed_contract_registry(&config, stack.contract_id_str())
+        .await
+        .expect("seed contract registry");
     // --- Spin up the maker_app on a random port + spawn the chain observer
     let (maker, observer_handle, base_url) = spawn_maker_node(&mut config).await;
 

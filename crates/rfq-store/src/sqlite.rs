@@ -27,9 +27,10 @@ use sqlx::SqlitePool;
 use tokio::sync::Mutex;
 
 use crate::{
-    side_str, BtcInventoryStore, ConsignmentError, ConsignmentRecord, ConsignmentStore, FillError,
-    FillRecord, FillStore, InMemoryBtcInventoryStore, InMemoryInventoryStore, InventoryStore,
-    OrderError, OrderRecord, OrderStore,
+    side_str, BtcInventoryStore, ConsignmentError, ConsignmentRecord, ConsignmentStore,
+    ContractError, ContractRecord, ContractStore, FillError, FillRecord, FillStore,
+    InMemoryBtcInventoryStore, InMemoryInventoryStore, InventoryStore, OrderError, OrderRecord,
+    OrderStore,
 };
 use rfq_types::Side;
 
@@ -43,6 +44,10 @@ fn cons(e: impl std::fmt::Display) -> ConsignmentError {
 
 fn ordr(e: impl std::fmt::Display) -> OrderError {
     OrderError::Backend(e.to_string())
+}
+
+fn ctr(e: impl std::fmt::Display) -> ContractError {
+    ContractError::Backend(e.to_string())
 }
 
 fn fill(e: impl std::fmt::Display) -> FillError {
@@ -725,6 +730,94 @@ impl OrderStore for SqliteOrderStore {
 }
 
 // ---------------------------------------------------------------------------
+// Contract registry
+// ---------------------------------------------------------------------------
+
+type ContractRow = (String, String, i64, String, i64);
+
+fn row_to_contract(r: ContractRow) -> ContractRecord {
+    ContractRecord {
+        contract_id: r.0,
+        ticker: r.1,
+        precision: r.2 as u8,
+        network: r.3,
+        added_at_ms: r.4 as u64,
+    }
+}
+
+const CONTRACT_COLS: &str =
+    "SELECT contract_id, ticker, precision, network, added_at_ms FROM contracts";
+
+/// Durable [`ContractStore`] over SQLite. One row per `contract_id` (the PK),
+/// so `upsert` is INSERT OR REPLACE (idempotent on re-import).
+pub struct SqliteContractStore {
+    pool: SqlitePool,
+}
+
+impl SqliteContractStore {
+    pub async fn open(path: &Path) -> Result<Self, ContractError> {
+        let pool = open_pool(path).await.map_err(ctr)?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS contracts (\
+                 contract_id TEXT NOT NULL PRIMARY KEY, ticker TEXT NOT NULL, \
+                 precision INTEGER NOT NULL, network TEXT NOT NULL, \
+                 added_at_ms INTEGER NOT NULL)",
+        )
+        .execute(&pool)
+        .await
+        .map_err(ctr)?;
+        Ok(Self { pool })
+    }
+}
+
+#[async_trait]
+impl ContractStore for SqliteContractStore {
+    async fn list(&self) -> Result<Vec<ContractRecord>, ContractError> {
+        let rows: Vec<ContractRow> = sqlx::query_as(&format!("{CONTRACT_COLS} ORDER BY added_at_ms"))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(ctr)?;
+        Ok(rows.into_iter().map(row_to_contract).collect())
+    }
+
+    async fn upsert(&self, contract: ContractRecord) -> Result<(), ContractError> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO contracts \
+                 (contract_id, ticker, precision, network, added_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(&contract.contract_id)
+        .bind(&contract.ticker)
+        .bind(contract.precision as i64)
+        .bind(&contract.network)
+        .bind(contract.added_at_ms as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(ctr)?;
+        Ok(())
+    }
+
+    async fn remove(&self, contract_id: &str) -> Result<bool, ContractError> {
+        let res = sqlx::query("DELETE FROM contracts WHERE contract_id = ?1")
+            .bind(contract_id)
+            .execute(&self.pool)
+            .await
+            .map_err(ctr)?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn get(&self, contract_id: &str) -> Result<Option<ContractRecord>, ContractError> {
+        let row: Option<ContractRow> =
+            sqlx::query_as(&format!("{CONTRACT_COLS} WHERE contract_id = ?1"))
+                .bind(contract_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(ctr)?;
+        Ok(row.map(row_to_contract))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fill store
 // ---------------------------------------------------------------------------
 
@@ -874,6 +967,38 @@ mod tests {
             updated_at_ms: NOW_MS,
             pending_txid: None,
         }
+    }
+
+    #[tokio::test]
+    async fn contract_registry_round_trips_and_survives_reopen() {
+        let path = temp_db();
+        let rec = |id: &str, ticker: &str, added: u64| ContractRecord {
+            contract_id: id.to_owned(),
+            ticker: ticker.to_owned(),
+            precision: 2,
+            network: "signet".to_owned(),
+            added_at_ms: added,
+        };
+        {
+            let store = SqliteContractStore::open(&path).await.unwrap();
+            store.upsert(rec("rgb:aaa", "COLX", 100)).await.unwrap();
+            store.upsert(rec("rgb:bbb", "FOO", 200)).await.unwrap();
+            // Re-import upserts in place (no duplicate row), updating fields.
+            store.upsert(rec("rgb:aaa", "COLX2", 100)).await.unwrap();
+        }
+        let store = SqliteContractStore::open(&path).await.unwrap();
+        let all = store.list().await.unwrap();
+        assert_eq!(all.len(), 2, "re-import upserts, not duplicates");
+        // Ordered by added_at_ms.
+        assert_eq!(all[0].contract_id, "rgb:aaa");
+        assert_eq!(all[0].ticker, "COLX2");
+        assert_eq!(all[1].contract_id, "rgb:bbb");
+
+        assert_eq!(store.get("rgb:bbb").await.unwrap().unwrap().ticker, "FOO");
+        assert!(store.remove("rgb:bbb").await.unwrap());
+        assert!(!store.remove("rgb:bbb").await.unwrap(), "second remove is a no-op");
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

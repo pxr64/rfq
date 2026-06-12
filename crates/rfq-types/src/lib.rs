@@ -100,7 +100,7 @@ pub struct OrderPrice {
     pub available_size: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, ToSchema)]
 pub enum BitcoinNetwork {
     Mainnet,
     Testnet,
@@ -432,6 +432,14 @@ impl ExtendedInventorySnapshot {
     /// the spec for `InventoryStore::extended_snapshot` — backends should
     /// either delegate to this or match its output exactly.
     ///
+    /// `total_*` is CURRENT controllable inventory (`available + reserved +
+    /// pending_settlement`). `Spent` allocations are deliberately excluded: in a
+    /// UTXO change-chain a spent allocation's value already flowed into its
+    /// successor, so summing spent rows double-counts the same coins hopping
+    /// UTXOs across swaps (e.g. one ~5k-unit lump spent 5×, summed to ~25k of
+    /// phantom inventory). `Invalid` is excluded too (unspendable). `spent_*`
+    /// stays as an independent lifetime diagnostic, NOT a component of the total.
+    ///
     /// `fragmentation_score = 1.0 - (largest_available / total_available)`,
     /// with a 0.0 fallback when no available amount exists. `average_input_count`
     /// and `average_change_ratio` are rolling settlement metrics fed externally
@@ -444,8 +452,6 @@ impl ExtendedInventorySnapshot {
         let mut largest_available: u64 = 0;
 
         for utxo in utxos {
-            snap.total_amount = snap.total_amount.saturating_add(utxo.amount);
-            snap.total_utxos += 1;
             match &utxo.status {
                 InventoryStatus::Available => {
                     snap.available_amount = snap.available_amount.saturating_add(utxo.amount);
@@ -475,6 +481,16 @@ impl ExtendedInventorySnapshot {
                 }
             }
         }
+
+        // Total = current controllable inventory only (see method doc): the live
+        // states summed, with Spent/Invalid excluded so superseded change-chain
+        // links don't inflate it.
+        snap.total_amount = snap
+            .available_amount
+            .saturating_add(snap.reserved_amount)
+            .saturating_add(snap.pending_settlement_amount);
+        snap.total_utxos =
+            snap.available_utxos + snap.reserved_utxos + snap.pending_settlement_utxos;
 
         snap.fragmentation_score = if snap.available_amount > 0 {
             1.0 - (largest_available as f64 / snap.available_amount as f64)

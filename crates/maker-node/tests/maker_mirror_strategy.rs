@@ -56,7 +56,6 @@ async fn fill_records_and_auto_mirrors_the_opposite_order() {
             data_dir: stack.maker_stash_dir().to_owned(),
             wallet_name: "maker".to_owned(),
             electrum_url: stack.electrum_url().to_owned(),
-            contract_id: stack.contract_id_str().to_owned(),
             signer: SignerConfig {
                 account_file: stack.maker_account_file().to_owned(),
                 password: String::new(),
@@ -64,6 +63,9 @@ async fn fill_records_and_auto_mirrors_the_opposite_order() {
         }),
     };
 
+    maker_node::seed_contract_registry(&config, stack.contract_id_str())
+        .await
+        .expect("seed contract registry");
     // Build the runtime, seed a mirror-enabled BUY order, spawn the daemon +
     // the order-reload + strategy loops (the bits `run()` wires up).
     let runtime: MakerNodeRuntime = build_runtime(&config).await.expect("build_runtime");

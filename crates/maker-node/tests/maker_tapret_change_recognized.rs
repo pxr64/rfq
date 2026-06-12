@@ -84,7 +84,6 @@ async fn maker_recognizes_pinned_tapret_change_after_swap() {
             data_dir: stack.maker_stash_dir().to_owned(),
             wallet_name: "maker".to_owned(),
             electrum_url: stack.electrum_url().to_owned(),
-            contract_id: stack.contract_id_str().to_owned(),
             signer: SignerConfig {
                 account_file: stack.maker_account_file().to_owned(),
                 password: String::new(),
@@ -92,6 +91,9 @@ async fn maker_recognizes_pinned_tapret_change_after_swap() {
         }),
     };
 
+    maker_node::seed_contract_registry(&config, stack.contract_id_str())
+        .await
+        .expect("seed contract registry");
     let (maker, observer_handle, maker_base_url) = spawn_maker_node(&mut config).await;
     let broker_base_url = spawn_broker(&maker_base_url, MAKER_NODE_ID).await;
     let client = RfqClient::new(Url::parse(&broker_base_url).expect("broker url parses"));

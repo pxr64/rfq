@@ -9,7 +9,7 @@ use maker_node::{
 };
 use rfq_wallet::{resolve_named, resolve_wallet, WalletConfig, WalletInput};
 use rfq_rgb::RgbBackend;
-use rfq_store::{BtcInventoryStore as _, InventoryStore as _, OrderStore as _};
+use rfq_store::{BtcInventoryStore as _, ContractStore as _, InventoryStore as _, OrderStore as _};
 use rfq_client::{RfqClient, Url};
 use rfq_types::{InventorySnapshot, MakerId, Side};
 use tokio::{net::TcpListener, sync::oneshot};
@@ -205,67 +205,23 @@ enum MakerCmd {
         #[arg(long)]
         electrum: Option<String>,
     },
-    /// Print the two wallet addresses to fund: the keychain-0 BTC address (pays
-    /// sell-side takers + tx fees) and the keychain-10 RGB-anchor address (for
-    /// minting/receiving RGB seal anchors).
-    /// Print the maker's funding addresses (BTC keychain 0 + RGB anchor keychain
-    /// 10). Offline — derived from the wallet, no chain access. Use `balances` to
-    /// also fetch the funded amounts.
-    Addresses,
-    /// Show funded balances per keychain (BTC payment + RGB anchor), syncing the
-    /// wallet against electrum. `--electrum` overrides the config's electrum_url.
-    Balances {
-        /// Electrum URL to sync against. Defaults to the config's `[rgb] electrum_url`.
-        #[arg(long)]
-        electrum: Option<String>,
-    },
-    /// Full from-scratch wallet rescan (vs the daemon's incremental sync).
-    /// Re-derives every keychain from index 0 with the descriptor's tapret
-    /// tweaks applied, recovering tapret host outputs the incremental scan
-    /// stranded. Run with the daemon stopped; re-check with `inventory --btc`.
-    Rescan {
-        /// Electrum URL to scan against. Defaults to the config's
-        /// `[rgb] electrum_url`.
-        #[arg(long)]
-        electrum: Option<String>,
-    },
-    /// Recover stranded RGB: sweep allocations the wallet can't see (tapret
-    /// host outputs bp-wallet never tracked) into one fresh output at the pinned
-    /// host, so they become spendable inventory again. Run with the daemon
-    /// stopped; `--dry-run` first to see what would be swept.
-    Recover {
-        /// Electrum URL. Defaults to the config's `[rgb] electrum_url`.
-        #[arg(long)]
-        electrum: Option<String>,
-        /// Tx fee for the sweep, in sats.
-        #[arg(long, default_value_t = 1000)]
-        fee: u64,
-        /// Report what would be swept without building/broadcasting anything.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Mint an RGB invoice to receive inventory from an issuer.
-    Invoice {
-        /// Amount (in smallest RGB units) the invoice requests.
-        #[arg(long)]
-        amount: u64,
-    },
-    /// Accept an incoming consignment into the maker's stash — the receive-side
-    /// counterpart to `invoice`. After you `invoice` and the issuer runs
-    /// `issuer transfer` against it, they return a consignment; this imports it
-    /// so `maker up` sees the RGB as inventory (once the anchoring tx confirms).
-    Accept {
-        /// Path to the base64 consignment file the issuer returned.
-        #[arg(long)]
-        path: PathBuf,
-        /// RGB contract id. Defaults to the config's `[rgb] contract_id`.
-        #[arg(long)]
-        contract: Option<String>,
+    /// Maker wallet + funding ops: addresses, balances, rescan, recover, and
+    /// inventory invoice/accept — everything that touches the maker's wallet.
+    Wallet {
+        #[command(subcommand)]
+        cmd: MakerWalletCmd,
     },
     /// Manage standing orders — the prices the maker quotes per (asset, side).
     Order {
         #[command(subcommand)]
         cmd: OrderCmd,
+    },
+    /// Manage the contract registry — the RGB assets this maker trades. Replaces
+    /// the single `[rgb] contract_id` in the TOML; the daemon seeds + quotes
+    /// every registered contract.
+    Contract {
+        #[command(subcommand)]
+        cmd: ContractCmd,
     },
     /// Re-derive a consignment for an already-settled transfer (recovery). Reads
     /// the maker's stash only — no chain access, no signing. Use when a recipient
@@ -331,6 +287,92 @@ enum OrderCmd {
     Clear,
 }
 
+#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+enum ContractCmd {
+    /// Register an RGB asset to trade. The contract must be in the maker's stock
+    /// (mint it, or `--consignment` to accept one first). Ticker + precision are
+    /// read from the stock and cached. Re-importing updates in place.
+    Import {
+        /// RGB contract id (`rgb:...`).
+        id: String,
+        /// Optional base64 consignment to accept into the stock before
+        /// registering — the "I was handed a new asset" path (folds in `accept`).
+        #[arg(long)]
+        consignment: Option<PathBuf>,
+    },
+    /// List the registered contracts.
+    List,
+    /// Stop trading a contract (leaves its stock + inventory untouched).
+    Remove {
+        /// RGB contract id (`rgb:...`).
+        id: String,
+    },
+}
+
+#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+enum MakerWalletCmd {
+    /// Print the maker's funding addresses (BTC keychain 0 + RGB anchor keychain
+    /// 10). Offline — derived from the wallet, no chain access. Use `balances` to
+    /// also fetch the funded amounts.
+    Addresses,
+    /// Show funded balances per keychain (BTC payment + RGB anchor), syncing the
+    /// wallet against electrum. `--electrum` overrides the config's electrum_url.
+    Balances {
+        /// Electrum URL to sync against. Defaults to the config's `[rgb] electrum_url`.
+        #[arg(long)]
+        electrum: Option<String>,
+    },
+    /// Full from-scratch wallet rescan (vs the daemon's incremental sync).
+    /// Re-derives every keychain from index 0 with the descriptor's tapret
+    /// tweaks applied, recovering tapret host outputs the incremental scan
+    /// stranded. Run with the daemon stopped; re-check with `inventory --btc`.
+    Rescan {
+        /// Electrum URL to scan against. Defaults to the config's
+        /// `[rgb] electrum_url`.
+        #[arg(long)]
+        electrum: Option<String>,
+    },
+    /// Recover stranded RGB: sweep allocations the wallet can't see (tapret
+    /// host outputs bp-wallet never tracked) into one fresh output at the pinned
+    /// host, so they become spendable inventory again. Run with the daemon
+    /// stopped; `--dry-run` first to see what would be swept.
+    Recover {
+        /// RGB contract id. Defaults to the sole registered contract.
+        #[arg(long)]
+        contract: Option<String>,
+        /// Electrum URL. Defaults to the config's `[rgb] electrum_url`.
+        #[arg(long)]
+        electrum: Option<String>,
+        /// Tx fee for the sweep, in sats.
+        #[arg(long, default_value_t = 1000)]
+        fee: u64,
+        /// Report what would be swept without building/broadcasting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Mint an RGB invoice to receive inventory from an issuer.
+    Invoice {
+        /// RGB contract id. Defaults to the sole registered contract.
+        #[arg(long)]
+        contract: Option<String>,
+        /// Amount (in smallest RGB units) the invoice requests.
+        #[arg(long)]
+        amount: u64,
+    },
+    /// Accept an incoming consignment into the maker's stash — the receive-side
+    /// counterpart to `invoice`. After you `invoice` and the issuer runs
+    /// `issuer transfer` against it, they return a consignment; this imports it
+    /// so `maker up` sees the RGB as inventory (once the anchoring tx confirms).
+    Accept {
+        /// Path to the base64 consignment file the issuer returned.
+        #[arg(long)]
+        path: PathBuf,
+        /// RGB contract id. Defaults to the sole registered contract.
+        #[arg(long)]
+        contract: Option<String>,
+    },
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run_cli().await {
@@ -351,20 +393,27 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             MakerCmd::Inventory { btc, electrum } => {
                 inventory(load_config(&config_path)?, btc, electrum).await
             }
-            MakerCmd::Addresses => maker_addresses(load_config(&config_path)?),
-            MakerCmd::Balances { electrum } => {
-                maker_balances(load_config(&config_path)?, electrum).await
-            }
-            MakerCmd::Rescan { electrum } => maker_rescan(load_config(&config_path)?, electrum).await,
-            MakerCmd::Recover {
-                electrum,
-                fee,
-                dry_run,
-            } => maker_recover(load_config(&config_path)?, electrum, fee, dry_run).await,
-            MakerCmd::Invoice { amount } => maker_invoice(load_config(&config_path)?, amount).await,
-            MakerCmd::Accept { path, contract } => {
-                maker_accept(load_config(&config_path)?, path, contract).await
-            }
+            MakerCmd::Wallet { cmd } => match cmd {
+                MakerWalletCmd::Addresses => maker_addresses(load_config(&config_path)?),
+                MakerWalletCmd::Balances { electrum } => {
+                    maker_balances(load_config(&config_path)?, electrum).await
+                }
+                MakerWalletCmd::Rescan { electrum } => {
+                    maker_rescan(load_config(&config_path)?, electrum).await
+                }
+                MakerWalletCmd::Recover {
+                    contract,
+                    electrum,
+                    fee,
+                    dry_run,
+                } => maker_recover(load_config(&config_path)?, contract, electrum, fee, dry_run).await,
+                MakerWalletCmd::Invoice { contract, amount } => {
+                    maker_invoice(load_config(&config_path)?, contract, amount).await
+                }
+                MakerWalletCmd::Accept { path, contract } => {
+                    maker_accept(load_config(&config_path)?, path, contract).await
+                }
+            },
             MakerCmd::Order { cmd } => match cmd {
                 OrderCmd::Create {
                     side,
@@ -381,11 +430,18 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 OrderCmd::Cancel { id } => order_cancel(&config_path, &id).await,
                 OrderCmd::Clear => order_clear(&config_path).await,
             },
+            MakerCmd::Contract { cmd } => match cmd {
+                ContractCmd::Import { id, consignment } => {
+                    contract_import(load_config(&config_path)?, id, consignment).await
+                }
+                ContractCmd::List => contract_list(load_config(&config_path)?).await,
+                ContractCmd::Remove { id } => contract_remove(load_config(&config_path)?, id).await,
+            },
             MakerCmd::Reconsign {
                 contract,
                 outpoint,
                 out,
-            } => maker_reconsign(load_config(&config_path)?, contract, outpoint, out),
+            } => maker_reconsign(load_config(&config_path)?, contract, outpoint, out).await,
             MakerCmd::Consignment { quote_id, out } => {
                 maker_get_consignment(load_config(&config_path)?, quote_id, out).await
             }
@@ -512,9 +568,11 @@ async fn wallet_balance(
 
 async fn maker_invoice(
     config: MakerNodeConfig,
+    contract: Option<String>,
     amount: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let invoice = create_inventory_invoice(&config, amount).await?;
+    let contract_id = resolve_contract_id(&config, contract).await?;
+    let invoice = create_inventory_invoice(&config, contract_id, amount).await?;
     println!("{invoice}");
     Ok(())
 }
@@ -569,12 +627,12 @@ fn maker_addresses(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Er
     let (btc, anchor) = maker_funding_addresses(&config)?;
     let network = config.rgb.as_ref().map(|r| r.network.as_str()).unwrap_or("");
 
-    println!("colorex maker addresses ({network})");
+    println!("colorex maker wallet addresses ({network})");
     output::kv("BTC payment · keychain 0", &btc);
     output::kv("RGB anchor · keychain 10", &anchor);
     output::note("");
     output::note("Fund BTC to pay sell-side takers + tx fees; fund RGB-anchor to mint/receive RGB.");
-    output::note("Show funded balances: colorex maker balances");
+    output::note("Show funded balances: colorex maker wallet balances");
     Ok(())
 }
 
@@ -596,7 +654,7 @@ async fn maker_balances(
 
     let (k0, k10) = maker_keychain_balances(&config, &electrum_url).await?;
 
-    println!("colorex maker balances ({network})");
+    println!("colorex maker wallet balances ({network})");
     output::kv(&format!("BTC payment · keychain 0 · {k0} sats"), &btc);
     output::kv(&format!("RGB anchor · keychain 10 · {k10} sats"), &anchor);
     Ok(())
@@ -634,18 +692,17 @@ async fn maker_rescan(
 
 async fn maker_recover(
     config: MakerNodeConfig,
+    contract: Option<String>,
     electrum: Option<String>,
     fee: u64,
     dry_run: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use rfq_btc::BitcoinClient as _;
+    let contract_id = resolve_contract_id(&config, contract).await?;
     let rgb = config
         .rgb
         .as_ref()
         .ok_or("no [rgb] config: a wallet is required to recover")?;
-    if rgb.contract_id.is_empty() {
-        return Err("no [rgb] contract_id in config".into());
-    }
     let electrum_url = electrum
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| rgb.electrum_url.clone());
@@ -655,7 +712,7 @@ async fn maker_recover(
     let asset = rfq_types::AssetId {
         network: rgb.network.parse()?,
         kind: rfq_types::AssetKind::Rgb20,
-        id: rgb.contract_id.clone(),
+        id: contract_id,
     };
     // Recovery SIGNS, so the backend needs the real signer (account + password).
     let backend = rfq_rgb::LibRgbBackend::new(
@@ -717,7 +774,7 @@ async fn maker_recover(
 
     // Pick the largest BTC-only UTXO to fund the fee + the new seal anchor.
     let now = now_ms();
-    let btc = backend.list_btc_only_utxos(&asset, now).await?;
+    let btc = backend.list_btc_only_utxos(std::slice::from_ref(&asset), now).await?;
     let fee_utxo = btc
         .iter()
         .max_by_key(|u| u.value_sats)
@@ -793,7 +850,8 @@ async fn maker_accept(
     contract: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let consignment = std::fs::read_to_string(&path)?;
-    accept_inventory_consignment(&config, contract, consignment.trim()).await?;
+    let contract_id = resolve_contract_id(&config, contract).await?;
+    accept_inventory_consignment(&config, contract_id, consignment.trim()).await?;
     println!(
         "accepted consignment from {} into the maker stash",
         path.display()
@@ -801,13 +859,14 @@ async fn maker_accept(
     Ok(())
 }
 
-fn maker_reconsign(
+async fn maker_reconsign(
     config: MakerNodeConfig,
     contract: Option<String>,
     outpoint: String,
     out: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let consignment = reconsign_consignment(&config, contract, &outpoint)?;
+    let contract_id = resolve_contract_id(&config, contract).await?;
+    let consignment = reconsign_consignment(&config, contract_id, &outpoint)?;
     match out {
         Some(path) => {
             std::fs::write(&path, &consignment)?;
@@ -861,6 +920,179 @@ async fn open_order_store(
     Ok(store)
 }
 
+/// Open the maker.db contract registry from the config's `[rgb]` db path.
+async fn open_contract_store(
+    config: &MakerNodeConfig,
+) -> Result<rfq_store::SqliteContractStore, Box<dyn std::error::Error>> {
+    let rgb = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: the contract registry lives in maker.db, which needs a wallet")?;
+    let db_path = rgb.data_dir.join(&rgb.network).join("maker.db");
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(rfq_store::SqliteContractStore::open(&db_path).await?)
+}
+
+/// Resolve which contract a single-asset command operates on. An explicit
+/// `--contract`/`--asset` wins; otherwise the registry must hold exactly one
+/// contract (the unambiguous default). Zero or many → an actionable error rather
+/// than a silent guess. Replaces the old `[rgb] contract_id` default.
+async fn resolve_contract_id(
+    config: &MakerNodeConfig,
+    explicit: Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let registered = open_contract_store(config)
+        .await?
+        .list()
+        .await?
+        .into_iter()
+        .map(|c| c.contract_id)
+        .collect();
+    pick_contract(explicit, registered).map_err(Into::into)
+}
+
+/// Pure resolution core (testable without a store): explicit id wins; else the
+/// registry must hold exactly one contract; zero or many is an actionable error.
+fn pick_contract(explicit: Option<String>, registered: Vec<String>) -> Result<String, String> {
+    if let Some(id) = explicit.filter(|s| !s.is_empty()) {
+        return Ok(id);
+    }
+    match registered.len() {
+        0 => Err("no contracts registered — run `colorex maker contract import <id>` first".into()),
+        1 => Ok(registered.into_iter().next().unwrap()),
+        n => Err(format!("{n} contracts registered — pass --contract <id> to choose one")),
+    }
+}
+
+/// All registered contracts as `AssetId`s (empty if none / no `[rgb]` network).
+async fn registered_assets(config: &MakerNodeConfig) -> Vec<rfq_types::AssetId> {
+    let Some(network) = config.rgb.as_ref().and_then(|r| r.network.parse().ok()) else {
+        return Vec::new();
+    };
+    let Ok(store) = open_contract_store(config).await else {
+        return Vec::new();
+    };
+    store
+        .list()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| rfq_types::AssetId {
+            network,
+            kind: rfq_types::AssetKind::Rgb20,
+            id: c.contract_id,
+        })
+        .collect()
+}
+
+/// Read `(ticker, precision)` for `contract_id` from the maker's RGB stock.
+/// Errors if the contract isn't in the stock — the signal that it must be minted
+/// or its consignment accepted before it can be registered/traded.
+fn contract_spec_for(
+    config: &MakerNodeConfig,
+    contract_id: &str,
+) -> Result<(String, u8), Box<dyn std::error::Error>> {
+    let r = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: a wallet stock is required to read a contract")?;
+    let backend = rfq_rgb::LibRgbBackend::new(
+        r.data_dir.clone(),
+        r.wallet_name.clone(),
+        r.network.clone(),
+        String::new(),
+        std::path::PathBuf::new(),
+        String::new(),
+    );
+    let asset = rfq_types::AssetId {
+        network: r
+            .network
+            .parse()
+            .map_err(|_| format!("invalid [rgb] network '{}'", r.network))?,
+        kind: rfq_types::AssetKind::Rgb20,
+        id: contract_id.to_owned(),
+    };
+    backend.contract_spec(&asset).map_err(|e| {
+        format!("contract {contract_id} not found in the maker's stock ({e}) — mint it or import its consignment first (--consignment)").into()
+    })
+}
+
+async fn contract_import(
+    config: MakerNodeConfig,
+    id: String,
+    consignment: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate the id parses before any side effects.
+    id.parse::<rfq_rgb::ContractId>()
+        .map_err(|e| format!("invalid contract id {id}: {e}"))?;
+
+    // `--consignment` folds in `accept`: absorb the contract into the stock first,
+    // so a freshly-handed-over asset registers in one step.
+    if let Some(path) = consignment {
+        let base64 = std::fs::read_to_string(&path)?;
+        accept_inventory_consignment(&config, id.clone(), base64.trim()).await?;
+        output::step_ok_with(&format!(
+            "accepted consignment for {}",
+            init::truncate_contract(&id)
+        ));
+    }
+
+    // Cache ticker + precision from the stock (also verifies it's actually there).
+    let (ticker, precision) = contract_spec_for(&config, &id)?;
+    let network = config
+        .rgb
+        .as_ref()
+        .map(|r| r.network.clone())
+        .unwrap_or_default();
+
+    let store = open_contract_store(&config).await?;
+    let existed = store.get(&id).await?.is_some();
+    store
+        .upsert(rfq_store::ContractRecord {
+            contract_id: id.clone(),
+            ticker: ticker.clone(),
+            precision,
+            network,
+            added_at_ms: now_ms(),
+        })
+        .await?;
+    let verb = if existed { "updated" } else { "imported" };
+    println!("{verb} contract {ticker} ({})", init::truncate_contract(&id));
+    Ok(())
+}
+
+async fn contract_list(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_contract_store(&config).await?;
+    let contracts = store.list().await?;
+    if contracts.is_empty() {
+        output::note("no contracts registered — add one with: colorex maker contract import <id>");
+        return Ok(());
+    }
+    println!("registered contracts ({})", contracts.len());
+    for c in contracts {
+        output::kv(
+            &format!("{} · precision {}", c.ticker, c.precision),
+            &c.contract_id,
+        );
+    }
+    Ok(())
+}
+
+async fn contract_remove(
+    config: MakerNodeConfig,
+    id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_contract_store(&config).await?;
+    if store.remove(&id).await? {
+        println!("removed contract {}", init::truncate_contract(&id));
+    } else {
+        return Err(format!("no registered contract {id}").into());
+    }
+    Ok(())
+}
+
 async fn order_create(
     config_path: &Path,
     side: String,
@@ -873,15 +1105,7 @@ async fn order_create(
     let parsed_side = orders::parse_side(&side)
         .ok_or_else(|| format!("invalid --side '{side}': expected 'buy' or 'sell'"))?;
     let config = load_config(config_path)?;
-    let asset_id = match asset {
-        Some(a) => a,
-        None => config
-            .rgb
-            .as_ref()
-            .map(|r| r.contract_id.clone())
-            .filter(|id| !id.is_empty())
-            .ok_or("no --asset given and no [rgb] contract_id in config")?,
-    };
+    let asset_id = resolve_contract_id(&config, asset).await?;
     if mirror && mirror_spread_bps == 0 {
         output::step_warn(
             "--mirror with --mirror-spread-bps 0 ping-pongs at the same price (no margin)",
@@ -1027,7 +1251,7 @@ fn issuer_issue(
     )?;
     println!("issued contract: {id}");
     println!("  genesis seal: {genesis_seal}");
-    println!("  put this contract_id in maker.toml / taker.toml [rgb]");
+    println!("  register it on a maker with: colorex maker contract import {id}");
     Ok(())
 }
 
@@ -1206,11 +1430,37 @@ async fn inventory(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _broker_url = parse_broker_url(&config)?;
     let maker = build_maker(&config).await?;
-    let snapshot = maker.inventory_summary().await;
 
     println!("colorex maker inventory");
     println!("node_id={}", config.maker.node_id);
-    print_inventory_snapshot(&snapshot, maker_contract_spec(&config).as_ref());
+
+    // Per-contract snapshots from the registry; fall back to the aggregate view
+    // when nothing is registered (mock maker / fresh install pre-migration).
+    let contracts = match open_contract_store(&config).await {
+        Ok(store) => store.list().await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let network = config.rgb.as_ref().and_then(|r| r.network.parse().ok());
+    match network {
+        Some(network) if !contracts.is_empty() => {
+            for c in &contracts {
+                let asset = rfq_types::AssetId {
+                    network,
+                    kind: rfq_types::AssetKind::Rgb20,
+                    id: c.contract_id.clone(),
+                };
+                let snapshot = maker.inventory_summary_for(&asset).await;
+                println!();
+                println!("[{} · {}]", c.ticker, init::truncate_contract(&c.contract_id));
+                print_inventory_snapshot(&snapshot, Some(&(c.ticker.clone(), c.precision)));
+            }
+        }
+        _ => {
+            // No registry (mock maker / fresh install): aggregate, raw amounts.
+            let snapshot = maker.inventory_summary().await;
+            print_inventory_snapshot(&snapshot, None);
+        }
+    }
 
     inventory_orders(&config).await?;
 
@@ -1241,11 +1491,19 @@ async fn inventory_orders(config: &MakerNodeConfig) -> Result<(), Box<dyn std::e
         return Ok(());
     }
     let fills = rfq_store::SqliteFillStore::open(&db_path).await?;
-    let spec = maker_contract_spec(config);
-    let amt = |v: u64| match &spec {
-        Some((ticker, precision)) => format!("{ticker} {}", rfq_types::format_amount(v, *precision)),
-        None => v.to_string(),
-    };
+    // Per-asset ticker/precision from the registry, so each order's FILLED amount
+    // renders in its own contract's units (orders are multi-asset).
+    let specs: std::collections::HashMap<String, (String, u8)> =
+        match open_contract_store(config).await {
+            Ok(s) => s
+                .list()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| (c.contract_id, (c.ticker, c.precision)))
+                .collect(),
+            Err(_) => Default::default(),
+        };
 
     println!();
     println!("standing orders ({})", orders.len());
@@ -1254,6 +1512,12 @@ async fn inventory_orders(config: &MakerNodeConfig) -> Result<(), Box<dyn std::e
             Some(s) => fills.filled_for(&o.asset_id, &s, 0).await.unwrap_or(0),
             None => 0,
         };
+        let filled_str = match specs.get(&o.asset_id) {
+            Some((ticker, precision)) => {
+                format!("{ticker} {}", rfq_types::format_amount(filled, *precision))
+            }
+            None => filled.to_string(),
+        };
         let mirror = if o.mirror {
             format!("  mirror=on/{}bps", o.mirror_spread_bps)
         } else {
@@ -1261,11 +1525,7 @@ async fn inventory_orders(config: &MakerNodeConfig) -> Result<(), Box<dyn std::e
         };
         println!(
             "    {} {}  price/unit={}  size={}  FILLED={}{mirror}",
-            o.side,
-            o.id,
-            o.price,
-            o.size,
-            amt(filled)
+            o.side, o.id, o.price, o.size, filled_str
         );
     }
     Ok(())
@@ -1343,17 +1603,13 @@ async fn inventory_btc(
 
     // --- RGB-exclusion filter: which on-chain UTXOs are fundable ---
     println!();
-    let filtered = if rgb.contract_id.is_empty() {
-        output::note("RGB filter skipped — no [rgb] contract_id configured");
+    let assets = registered_assets(config).await;
+    let filtered = if assets.is_empty() {
+        output::note("RGB filter skipped — no contracts registered");
         None
     } else {
-        let asset = rfq_types::AssetId {
-            network: rgb.network.parse()?,
-            kind: rfq_types::AssetKind::Rgb20,
-            id: rgb.contract_id.clone(),
-        };
         let now = now_ms();
-        let btc_only = backend.list_btc_only_utxos(&asset, now).await?;
+        let btc_only = backend.list_btc_only_utxos(&assets, now).await?;
         let only_total: u64 = btc_only.iter().map(|u| u.value_sats).sum();
         output::kv(
             "BTC-only (fundable)",
@@ -1468,13 +1724,9 @@ async fn inventory_btc(
     //   - SPENT on-chain          → history, ignore
     //   - UNSPENT + in wallet      → sellable (should be Available inventory)
     //   - UNSPENT + NOT in wallet  → TRULY STRANDED (the recoverable bug)
-    if !rgb.contract_id.is_empty() {
+    for asset in registered_assets(config).await {
         println!();
-        let asset = rfq_types::AssetId {
-            network: rgb.network.parse()?,
-            kind: rfq_types::AssetKind::Rgb20,
-            id: rgb.contract_id.clone(),
-        };
+        output::kv("contract", &asset.id);
         let allocs = backend.debug_contract_allocations(&asset).await?;
         output::kv("RGB stock allocations (incl. spent)", &format!("{}", allocs.len()));
 
@@ -1540,29 +1792,6 @@ async fn inventory_btc(
     Ok(())
 }
 
-/// Best-effort ticker + precision for the configured contract, for display.
-/// `None` (mock / no contract id) → raw amounts.
-fn maker_contract_spec(config: &MakerNodeConfig) -> Option<(String, u8)> {
-    let r = config.rgb.as_ref()?;
-    if r.contract_id.is_empty() {
-        return None;
-    }
-    let backend = rfq_rgb::LibRgbBackend::new(
-        r.data_dir.clone(),
-        r.wallet_name.clone(),
-        r.network.clone(),
-        String::new(),
-        std::path::PathBuf::new(),
-        String::new(),
-    );
-    let asset = rfq_types::AssetId {
-        network: r.network.parse().ok()?,
-        kind: rfq_types::AssetKind::Rgb20,
-        id: r.contract_id.clone(),
-    };
-    backend.contract_spec(&asset).ok()
-}
-
 fn parse_broker_url(config: &MakerNodeConfig) -> Result<Url, Box<dyn std::error::Error>> {
     Url::parse(&config.maker.broker_url).map_err(|e| e.into())
 }
@@ -1572,10 +1801,14 @@ fn print_inventory_snapshot(snapshot: &InventorySnapshot, spec: Option<&(String,
         Some((ticker, precision)) => format!("{ticker} {}", rfq_types::format_amount(v, *precision)),
         None => v.to_string(),
     };
+    // `total_*` is current controllable inventory (available + reserved +
+    // pending); spent allocations are excluded upstream. `spent_amount` is NOT
+    // printed: in a UTXO change-chain it sums superseded links and balloons to a
+    // phantom multiple of real holdings — `spent_allocations` (a count of
+    // settled-away allocations) is the only spent diagnostic worth surfacing.
     println!("total_amount={}", amt(snapshot.total_amount));
     println!("available_amount={}", amt(snapshot.available_amount));
     println!("reserved_amount={}", amt(snapshot.reserved_amount));
-    println!("spent_amount={}", amt(snapshot.spent_amount));
     println!("total_allocations={}", snapshot.total_allocations);
     println!("available_allocations={}", snapshot.available_allocations);
     println!("reserved_allocations={}", snapshot.reserved_allocations);
@@ -1620,6 +1853,82 @@ mod tests {
     fn cli_accepts_global_config_flag() {
         let cli = Cli::parse_from(["colorex", "--config", "/tmp/x.toml", "maker", "up"]);
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/x.toml")));
+    }
+
+    #[test]
+    fn cli_parses_contract_subcommands() {
+        assert_eq!(
+            Cli::parse_from(["colorex", "maker", "contract", "import", "rgb:abc"]).command,
+            TopCommand::Maker {
+                cmd: MakerCmd::Contract {
+                    cmd: ContractCmd::Import {
+                        id: "rgb:abc".into(),
+                        consignment: None,
+                    }
+                }
+            },
+        );
+        assert_eq!(
+            Cli::parse_from(["colorex", "maker", "contract", "list"]).command,
+            TopCommand::Maker {
+                cmd: MakerCmd::Contract {
+                    cmd: ContractCmd::List
+                }
+            },
+        );
+        assert_eq!(
+            Cli::parse_from(["colorex", "maker", "contract", "remove", "rgb:abc"]).command,
+            TopCommand::Maker {
+                cmd: MakerCmd::Contract {
+                    cmd: ContractCmd::Remove { id: "rgb:abc".into() }
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn cli_parses_maker_wallet_group() {
+        // Funding/wallet ops now live under `maker wallet`.
+        assert_eq!(
+            Cli::parse_from(["colorex", "maker", "wallet", "addresses"]).command,
+            TopCommand::Maker {
+                cmd: MakerCmd::Wallet {
+                    cmd: MakerWalletCmd::Addresses
+                }
+            },
+        );
+        assert_eq!(
+            Cli::parse_from(["colorex", "maker", "wallet", "invoice", "--amount", "100"]).command,
+            TopCommand::Maker {
+                cmd: MakerCmd::Wallet {
+                    cmd: MakerWalletCmd::Invoice {
+                        contract: None,
+                        amount: 100,
+                    }
+                }
+            },
+        );
+        // The old flat paths are gone — `maker addresses` must NOT parse.
+        assert!(Cli::try_parse_from(["colorex", "maker", "addresses"]).is_err());
+    }
+
+    #[test]
+    fn pick_contract_resolution() {
+        // Explicit id always wins.
+        assert_eq!(
+            pick_contract(Some("rgb:x".into()), vec!["rgb:a".into()]).unwrap(),
+            "rgb:x"
+        );
+        // Empty explicit falls through to the registry.
+        assert_eq!(
+            pick_contract(Some(String::new()), vec!["rgb:a".into()]).unwrap(),
+            "rgb:a"
+        );
+        // Sole registered contract is the unambiguous default.
+        assert_eq!(pick_contract(None, vec!["rgb:a".into()]).unwrap(), "rgb:a");
+        // Zero and many are errors (must import / must disambiguate).
+        assert!(pick_contract(None, vec![]).is_err());
+        assert!(pick_contract(None, vec!["rgb:a".into(), "rgb:b".into()]).is_err());
     }
 
     #[test]

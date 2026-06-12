@@ -60,7 +60,7 @@ async fn recovers_rgb_into_pinned_host() {
     let (raw_tx, recovery_txid, swept) = {
         let maker = stack.maker_backend().await;
         let fee_utxo = maker
-            .list_btc_only_utxos(&asset, 0)
+            .list_btc_only_utxos(std::slice::from_ref(&asset), 0)
             .await
             .expect("btc-only utxos")
             .into_iter()

@@ -61,7 +61,6 @@ async fn broker_routes_buy_and_sell_to_remote_maker() {
             data_dir: stack.maker_stash_dir().to_owned(),
             wallet_name: "maker".to_owned(),
             electrum_url: stack.electrum_url().to_owned(),
-            contract_id: stack.contract_id_str().to_owned(),
             signer: SignerConfig {
                 account_file: stack.maker_account_file().to_owned(),
                 password: String::new(),
@@ -69,6 +68,11 @@ async fn broker_routes_buy_and_sell_to_remote_maker() {
         }),
     };
 
+    // Register the contract so build_runtime seeds its inventory (the registry
+    // replaced the old [rgb] contract_id config field).
+    maker_node::seed_contract_registry(&config, stack.contract_id_str())
+        .await
+        .expect("seed contract registry");
     // Maker daemon (HTTP + chain observer) on a random port.
     let (maker, observer_handle, maker_base_url) = spawn_maker_node(&mut config).await;
 

@@ -79,8 +79,8 @@ colorex wallet sync \
 Two helpers:
 
 ```bash
-colorex maker addresses   # the BTC (keychain 0) + RGB-anchor (keychain 10) addresses — offline, no chain
-colorex maker balances    # the same, with funded sats per keychain (syncs against electrum)
+colorex maker wallet addresses   # the BTC (keychain 0) + RGB-anchor (keychain 10) addresses — offline, no chain
+colorex maker wallet balances    # the same, with funded sats per keychain (syncs against electrum)
 ```
 
 `addresses` never touches the chain, so it's instant even before electrs has
@@ -101,26 +101,49 @@ colorex issuer issue \
   --ticker FOO --asset-name "Foo Token" --precision 2 --supply 1000000
 ```
 
-Put the printed `rgb:...` contract id in `maker.toml` `[rgb] contract_id`. See
-[issuing-tokens.md](issuing-tokens.md) for detail.
+Register the printed `rgb:...` contract id so the maker trades it (the registry
+lives in `maker.db`, not the TOML):
+
+```bash
+colorex maker contract import rgb:...
+```
+
+See [issuing-tokens.md](issuing-tokens.md) for detail.
 
 ### B. Receive from a separate issuer
 
-Set `contract_id` in `maker.toml` first, then mint a receive-invoice:
+Mint a receive-invoice (`--contract` defaults to the sole registered contract;
+pass it explicitly if you trade several):
 
 ```bash
-colorex maker invoice --amount 1000000
+colorex maker wallet invoice --amount 1000000 --contract rgb:...
 ```
 
 Hand that invoice to the issuer; they run `colorex issuer transfer` against it and
-return a base64 **consignment**. Once its anchoring tx confirms, import it:
+return a base64 **consignment**. Import it — in one step, this accepts the
+consignment into the stash *and* registers the contract:
 
 ```bash
-colorex maker accept --path consignment.b64      # --contract defaults to [rgb] contract_id
+colorex maker contract import rgb:... --consignment consignment.b64
 ```
 
-This absorbs the transfer into the maker's stash, so `maker up` counts it as
-inventory (see [issuing-tokens.md](issuing-tokens.md)).
+(Or, if the contract is already registered: `colorex maker wallet accept --path consignment.b64`.)
+Once its anchoring tx confirms, `maker up` counts it as inventory (see
+[issuing-tokens.md](issuing-tokens.md)).
+
+### The contract registry
+
+The assets a maker trades live in a registry in `maker.db` — there is no
+`contract_id` in the TOML. Manage it with:
+
+```bash
+colorex maker contract list              # registered assets (ticker · precision · id)
+colorex maker contract import rgb:...    # register one (must be in the stock; --consignment to accept first)
+colorex maker contract remove rgb:...    # stop trading it (stock/inventory untouched)
+```
+
+The daemon seeds and quotes **every** registered contract; registry changes take
+effect on the next `colorex maker up`.
 
 ## 4. Set standing orders (pricing)
 
@@ -145,7 +168,8 @@ colorex maker order cancel <id>
 - `--price`: sats per **smallest RGB unit**.
 - `--size`: the largest single quote (smallest RGB units) the order backs — a
   request above it is **declined**, not quoted at the fallback.
-- `--asset`: optional; defaults to the config's `contract_id`.
+- `--asset`: optional; defaults to the sole registered contract (pass it
+  explicitly if the maker trades more than one).
 
 Orders persist to `maker.db` (the maker's SQLite store, next to the config), and
 `maker up` loads them. Creating a second order for the same (asset, side)

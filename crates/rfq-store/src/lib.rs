@@ -18,8 +18,8 @@ pub use btc::{
 mod sqlite;
 #[cfg(feature = "sqlite")]
 pub use sqlite::{
-    SqliteBtcInventoryStore, SqliteConsignmentStore, SqliteFillStore, SqliteInventoryStore,
-    SqliteOrderStore,
+    SqliteBtcInventoryStore, SqliteConsignmentStore, SqliteContractStore, SqliteFillStore,
+    SqliteInventoryStore, SqliteOrderStore,
 };
 
 #[cfg(feature = "postgres")]
@@ -435,6 +435,90 @@ impl OrderStore for InMemoryOrderStore {
 
     async fn get(&self, asset_id: &str, side: &str) -> Result<Option<OrderRecord>, OrderError> {
         Ok(self.by_key.read().await.get(&order_key(asset_id, side)).cloned())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Contract registry — the assets this maker trades. Replaces the single
+// `[rgb] contract_id` in the TOML: imported at runtime, persisted in maker.db,
+// and read by the daemon (to seed/observe per-asset inventory) and the CLI
+// (default asset for `inventory`/`invoice`/`accept`/`order`). `ticker` +
+// `precision` are cached from the RGB stock at import so display doesn't reload
+// the stash each call.
+// ---------------------------------------------------------------------------
+
+/// A tradeable RGB asset the maker has imported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractRecord {
+    /// RGB contract id (`rgb:...`) — the registry key.
+    pub contract_id: String,
+    /// Display ticker (e.g. `COLX`), cached from the contract spec at import.
+    pub ticker: String,
+    /// Decimal places, cached from the contract spec at import.
+    pub precision: u8,
+    /// Network the contract lives on (matches the maker's `[rgb] network`).
+    pub network: String,
+    pub added_at_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum ContractError {
+    Backend(String),
+}
+
+impl std::fmt::Display for ContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backend(msg) => write!(f, "contract store error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ContractError {}
+
+/// Durable registry of the assets the maker trades — at most one row per
+/// `contract_id` (re-importing upserts).
+#[async_trait]
+pub trait ContractStore: Send + Sync {
+    async fn list(&self) -> Result<Vec<ContractRecord>, ContractError>;
+    /// Insert/replace the record for its `contract_id`.
+    async fn upsert(&self, contract: ContractRecord) -> Result<(), ContractError>;
+    /// Remove the contract with `contract_id`. Returns true if one was removed.
+    async fn remove(&self, contract_id: &str) -> Result<bool, ContractError>;
+    async fn get(&self, contract_id: &str) -> Result<Option<ContractRecord>, ContractError>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryContractStore {
+    by_id: Arc<RwLock<HashMap<String, ContractRecord>>>,
+}
+
+impl InMemoryContractStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl ContractStore for InMemoryContractStore {
+    async fn list(&self) -> Result<Vec<ContractRecord>, ContractError> {
+        Ok(self.by_id.read().await.values().cloned().collect())
+    }
+
+    async fn upsert(&self, contract: ContractRecord) -> Result<(), ContractError> {
+        self.by_id
+            .write()
+            .await
+            .insert(contract.contract_id.clone(), contract);
+        Ok(())
+    }
+
+    async fn remove(&self, contract_id: &str) -> Result<bool, ContractError> {
+        Ok(self.by_id.write().await.remove(contract_id).is_some())
+    }
+
+    async fn get(&self, contract_id: &str) -> Result<Option<ContractRecord>, ContractError> {
+        Ok(self.by_id.read().await.get(contract_id).cloned())
     }
 }
 
@@ -1485,6 +1569,43 @@ mod tests {
         assert_eq!(snap.pending_settlements, 1);
         // largest available is 300 / total available 500 → fragmentation 0.4
         assert!((snap.fragmentation_score - 0.4).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn spent_allocations_excluded_from_total() {
+        // A swap consumes an input and leaves change: the input is marked Spent
+        // while its value re-appears in the successor allocation. Summing the
+        // spent row would double-count the same coins (the change-chain phantom),
+        // so `total_*` must reflect current holdings only — `spent_*` stays a
+        // separate diagnostic.
+        let store = seeded_store(vec![
+            utxo(asset(), 0, 5000), // the input that will be spent
+            utxo(asset(), 1, 4990), // the change left behind, still available
+        ])
+        .await;
+        let rid = store
+            .reserve_utxos(
+                &RfqId("rfq-1".into()),
+                &QuoteId("q-1".into()),
+                &[outpoint(0)],
+                NOW_MS + 30_000,
+                NOW_MS,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_spent(&rid, "wt-1".into(), NOW_MS + 100)
+            .await
+            .unwrap();
+
+        let snap = store.extended_snapshot(&asset()).await;
+        // Total is the live allocation only — NOT 5000 + 4990 = 9990.
+        assert_eq!(snap.total_amount, 4990);
+        assert_eq!(snap.total_utxos, 1);
+        assert_eq!(snap.available_amount, 4990);
+        // Spent is tracked independently, decoupled from the total.
+        assert_eq!(snap.spent_amount, 5000);
+        assert_eq!(snap.spent_utxos, 1);
     }
 
     #[tokio::test]
