@@ -1,6 +1,9 @@
 # Proposal: Provenance Consignments — a wallet operation for receiving via counterparty-built transactions
 
-**Status:** Draft proposal for discussion with the RGB community.
+**Status:** Draft proposal for the RGB community — **implemented in colorex** for
+the sell-leg flow (`export_provenance` in `rfq-rgb` + `create_transfer` in
+rgb-wasm; the maker mints no invoice). This is the live sell-side model in
+[swap-flows.md](swap-flows.md); kept here as the design write-up.
 **Scope:** RGB wallet capabilities + transfer patterns. Complements, does not
 replace, the invoice/`pay` model.
 

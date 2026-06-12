@@ -10,12 +10,8 @@ concrete public-network case; swap it for any other network (and the matching
 electrum endpoint) without changing the command shapes.
 
 > **Status.** Every command + flag below is verified against the current CLI
-> (`crates/maker-node/src/main.rs`). The full public-network round-trip has **not
-> yet been live-validated** — `issuer transfer` (distribution) compiles and is
-> wired, but it has not been exercised against a real recipient on signet/mainnet.
-> Treat this as a "should work" guide, not a verified runbook. Live validation is
-> the deferred Phase 4 of the operator-toolkit plan
-> (`docs/operator-toolkit-signet-plan.md`).
+> (`crates/maker-node/src/main.rs`), and the issue → fund → distribute round-trip
+> has been exercised live on signet.
 
 ## Prerequisites
 
@@ -92,8 +88,10 @@ colorex issuer issue \
 - Optional: `--details "..."`, `--seal <txid:vout>` to pin the genesis UTXO
   (otherwise auto-picked), `--issuer ssi:<label>` for the genesis identity.
 
-It prints the new `rgb:...` **contract id** — put this in each `maker.toml` /
-`taker.toml` `[rgb]` section. Confirm with:
+It prints the new `rgb:...` **contract id**. Register it on a maker with
+`colorex maker contract import rgb:...` — the assets a maker trades live in a
+registry (`maker.db`), not the TOML (see [running-a-maker.md](running-a-maker.md) §3);
+a taker passes the id to `colorex-taker`. Confirm the issued contract with:
 
 ```bash
 colorex issuer contracts --network "$NET" --data-dir "$DIR/issuer" --name issuer

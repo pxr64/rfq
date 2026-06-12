@@ -1,6 +1,10 @@
 # Consignment delivery & recovery — plan
 
-Status: **planned (next session)**. Spans rgb-rfq (maker + broker) and colorex-wallet.
+Status: **partially implemented.** The maker-side recovery commands shipped —
+`colorex maker reconsign` (re-derive a settled consignment), `maker consignment`
+(re-serve one recorded at settlement), and `maker wallet recover` (sweep stranded
+RGB). Still planned: the wallet-side import queue + the broker consignment stash.
+Spans rgb-rfq (maker + broker) and colorex-wallet.
 
 ## Why
 

@@ -4,10 +4,10 @@ This document is the canonical spec for the buy-side (taker buys RGB with BTC) a
 
 ## Protocol invariant
 
-> **Receiver of RGB assets creates the RGB invoice. Maker constructs the PSBT in both flows.**
+> **Maker constructs the PSBT and broadcasts in both flows.** On the **buy** side the taker (the RGB receiver) creates an RGB invoice. On the **sell** side the maker mints **nothing** — the taker proves the RGB it's selling with a **provenance consignment** for its own outpoints (see [provenance-consignment-proposal.md](provenance-consignment-proposal.md)).
 
-- Buy side: taker is the RGB receiver → taker generates the invoice.
-- Sell side: maker is the RGB receiver → maker generates the invoice.
+- Buy side: taker is the RGB receiver → taker generates the invoice; the RGB lands on the taker's seal.
+- Sell side: the maker mints no invoice. The taker exports a **provenance consignment** for the RGB outpoints it is selling and names them on the wire; the maker receives the RGB on a fresh maker-controlled output of the swap tx.
 - In both flows the maker assembles the PSBT (it's the party with simultaneous visibility into RGB inventory, BTC inventory where needed, and chain state).
 - In both flows the **maker broadcasts** the final witness transaction. The taker always returns a signed PSBT back to the maker; the maker is the broker's single broadcast point.
 
@@ -49,7 +49,10 @@ Failure transitions: `mark_broadcast_failed` (release) at any pre-broadcast fail
 
 ## Sell side: taker sells RGB for BTC
 
-Three round trips after `accept` (vs. two on buy side) — the maker needs the consignment before it can build the PSBT inputs.
+Uses the **provenance model**: the maker mints no invoice; the taker exports a
+provenance consignment for its own RGB outpoints and names them. The maker still
+needs that consignment before it can build the PSBT inputs, so there's an extra
+round trip after `accept` vs. the buy side.
 
 ```mermaid
 sequenceDiagram
@@ -58,11 +61,11 @@ sequenceDiagram
     participant M as Maker
 
     T->>M: ACCEPT { btc_payout_addr, [rgb_change_invoice] }
-    M->>M: reserve BTC inventory + RGB invoice seal,<br/>generate maker RGB invoice
-    M->>T: INVOICE { maker_rgb_invoice }
-    T->>T: build consignment from taker allocations<br/>to maker_rgb_invoice seal
-    T->>M: DELIVER_CONSIGNMENT { consignment }
-    M->>M: validate consignment against own Stock,<br/>extract taker RGB outpoints,<br/>fetch prevouts via BitcoinClient::get_outpoint,<br/>build PSBT (taker RGB inputs + maker BTC inputs +<br/>outputs: maker RGB seal, taker BTC payout,<br/>maker BTC change, taker RGB change?),<br/>sign maker BTC inputs
+    M->>M: reserve BTC inventory<br/>(quote carries NO maker_rgb_invoice)
+    M->>T: SettlementIntent (AwaitingConsignment)
+    T->>T: export PROVENANCE consignment for the taker's<br/>own RGB outpoints (no maker invoice needed)
+    T->>M: DELIVER_CONSIGNMENT { consignment, named outpoints }
+    M->>M: validate provenance consignment against own Stock,<br/>confirm the named outpoints carry the RGB,<br/>fetch prevouts via BitcoinClient::get_outpoint,<br/>build PSBT (taker RGB inputs + maker BTC inputs +<br/>outputs: maker RGB seal, taker BTC payout,<br/>maker BTC change, taker RGB change?),<br/>sign maker BTC inputs
     M->>T: PSBT (maker-signed half)
     T->>T: verify PSBT (matches consignment,<br/>payout addr, amounts),<br/>sign RGB-bearing inputs
     T->>M: SIGN_PSBT { signed_psbt }
@@ -72,8 +75,8 @@ sequenceDiagram
 
 ### Key properties
 
-- **Maker publishes the invoice (step 2-3).** Per the invariant: maker is the RGB receiver on sell side, so it generates the invoice. The invoice binds the contract id, expected amount, and a maker-controlled seal UTXO. A fresh invoice is generated per quote — reusing seals creates a correlation surface.
-- **Consignment names the inputs.** The taker's consignment in step 5 includes the RGB-bearing outpoints the taker is sending. The maker can't build the PSBT until it has those, which is why there's an extra round trip vs. buy side.
+- **No maker invoice — provenance instead.** The maker mints nothing on the sell side (`maker_rgb_invoice` is `None`) and needs no spare anchor. The taker exports a **provenance consignment** for the RGB outpoints it already holds and names them on the wire; the RGB lands on a fresh maker-controlled output the maker adds when it builds the PSBT. See [provenance-consignment-proposal.md](provenance-consignment-proposal.md).
+- **Consignment names the inputs.** The taker's provenance consignment includes the RGB-bearing outpoints it is sending. The maker can't build the PSBT until it has those, which is why there's an extra round trip vs. buy side.
 - **Prevout fetch is required.** The consignment names outpoints but doesn't carry `scriptPubKey` or BTC value, which are needed to construct the PSBT inputs. The maker calls `BitcoinClient::get_outpoint` for each.
 - **Maker validates consignment in step 6.** Against the maker's Stock. This is the symmetric operation to what the taker does in buy-side step 5. Real validation lands with [#13](https://github.com/pxr64/rfq/issues/13); mock validation accepts any non-empty consignment except the literal `"rgb-invalid"`.
 - **Taker pays the fee, by netting from payout.** The taker's BTC payout output value = `quote.price − actual_fee_sats`. Maker's BTC change = `sum(maker_btc_inputs) − quote.price`. Maker reserves `quote.price` gross from BTC inventory.
@@ -97,8 +100,8 @@ The broker exposes four RFQ endpoints (plus existing `/quotes` for quote request
 
 | Endpoint | Buy side | Sell side |
 |---|---|---|
-| `POST /quotes/:id/accept` | Returns PSBT + consignment | Returns `maker_rgb_invoice` |
-| `POST /quotes/:id/consignment` | Not used | Taker submits consignment; returns PSBT |
+| `POST /quotes/:id/accept` | Returns PSBT + consignment | Returns `SettlementIntent` (no maker invoice — provenance model) |
+| `POST /quotes/:id/consignment` | Not used | Taker submits provenance consignment + named outpoints; returns PSBT |
 | `POST /quotes/:id/sign` | Taker submits signed PSBT; returns FINAL_STATE | Taker submits signed PSBT; returns FINAL_STATE |
 | `GET  /quotes/:id` | Read current `SettlementIntent` | Same |
 
@@ -194,5 +197,3 @@ Segwit-only by design. Non-segwit inputs are rejected at `BitcoinClient::get_out
 - [#15](https://github.com/pxr64/rfq/issues/15) — Buy-side parent issue.
 - [#16](https://github.com/pxr64/rfq/issues/16) — Sell-side parent issue.
 - [#9](https://github.com/pxr64/rfq/issues/9) — Settlement state machine.
-- [docs/broker-maker-node-roadmap.md](broker-maker-node-roadmap.md) — Roadmap.
-- [docs/rebalancing-strategy.md](rebalancing-strategy.md) — RGB inventory rebalancing.

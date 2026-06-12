@@ -44,17 +44,58 @@ Run via `cargo run -p maker-node -- <args>` (or `cargo install --path
 crates/maker-node` then `colorex <args>`). The taker is the separate `colorex-taker`
 binary (`crates/taker-cli`).
 
+### Quickstart — run a maker from scratch (signet)
+
+End to end, a new maker is seven steps. Each links to the deep guide; the worked
+examples use `signet` but every command takes `--network`.
+
+1. **Build the binary.** `cargo install --path crates/maker-node` (then `colorex …`),
+   or run inline with `cargo run -p maker-node -- …`.
+2. **Stand up chain access** — a signet `bitcoind` + a romanz `electrs`:
+   `docker compose -f infra/signet/maker-chain.docker-compose.yml up -d --build`
+   (electrs on `127.0.0.1:60601`). See [running-a-maker.md §0](docs/running-a-maker.md).
+3. **Bootstrap the maker** — `colorex maker init` writes `~/.config/colorex/maker.toml`
+   + node key, **creates the RGB wallet + signing account**, and prints a keychain-10
+   address to fund.
+4. **Fund + sync** — send signet coins to that address, then
+   `colorex wallet sync --name maker --network signet --electrum 127.0.0.1:60601`.
+5. **Get inventory** — either **self-issue** (you are the issuer):
+   `colorex issuer issue --name maker --network signet --ticker FOO --asset-name "Foo" --precision 2 --supply 1000000`
+   then register it `colorex maker contract import rgb:<id>`; **or receive** from a
+   separate issuer (`maker wallet invoice` → their `issuer transfer` →
+   `colorex maker contract import rgb:<id> --consignment <file|base64>`). See
+   [issuing-tokens.md](docs/issuing-tokens.md).
+6. **Price it** — `colorex maker order create --side buy --price <sats-per-unit> --size <units>`
+   (`--side` is the *taker's* side: `buy` = you sell RGB).
+7. **Run it** — `colorex maker up` (dials the broker from the config and auto-registers).
+
+The two guides below expand each step. The command tables that follow are the full reference.
+
 ### `colorex maker` — the maker daemon
 
 | Command | Purpose |
 |---|---|
 | `maker init` | Interactive setup: writes the config + node key, **creates the RGB wallet + signing account**, and prints a keychain-10 address to fund. One-shot. |
-| `maker up` | Start the daemon: HTTP quote server + cleanup / rebalance / chain-observer loops. Loads standing orders for pricing. |
+| `maker up` | Start the daemon: HTTP quote server + cleanup / rebalance / chain-observer + strategy loops. Loads standing orders for pricing. |
 | `maker health` | Probe the broker. |
-| `maker inventory` | Print the RGB inventory snapshot. |
-| `maker invoice --amount` | Mint an RGB invoice to receive inventory from an issuer. |
-| `maker order create --side --price --size [--asset]` | Create/replace the standing order (price the maker quotes) for an (asset, side). |
-| `maker order list` / `maker order cancel <id>` | List / cancel standing orders (persisted to `orders.json` next to the config). |
+| `maker inventory [--btc]` | Print the per-contract RGB inventory snapshot (`--btc` for the BTC-pool + drift diagnostic). |
+| `maker order create --side --price --size [--asset] [--mirror --mirror-spread-bps]` | Create/replace the standing order (price the maker quotes) for an (asset, side). `--price` is sats per smallest unit. |
+| `maker order list` / `cancel <id>` / `clear` | List / cancel one / clear all standing orders (persisted to `maker.db`). |
+| `maker contract import <id> [--consignment <file\|base64>]` / `list` / `remove <id>` | Manage the tradeable-asset **registry** (lives in `maker.db`; replaced the old `[rgb] contract_id`). |
+| `maker wallet …` | Wallet + funding ops — see the next table. |
+| `maker reconsign --outpoint <txid:vout>` / `maker consignment --quote-id <id>` | Recovery: re-derive / re-serve a consignment a recipient lost. |
+
+### `colorex maker wallet` — the maker's wallet + funding ops
+
+| Command | Purpose |
+|---|---|
+| `maker wallet addresses` | Print the BTC (keychain 0) + RGB-anchor (keychain 10) addresses. Offline. |
+| `maker wallet balances [--electrum]` | Funded sats per keychain (syncs against electrum). |
+| `maker wallet invoice --amount [--contract]` | Mint an RGB invoice to receive inventory from an issuer. |
+| `maker wallet accept --consignment <file\|base64> [--contract]` | Accept an incoming consignment into the maker's stash. |
+| `maker wallet transfer --invoice [--fee] [--out]` | **Send** RGB from the maker's inventory to a recipient invoice (build + sign + broadcast). Run with the daemon stopped. |
+| `maker wallet rescan [--electrum]` | Full from-scratch wallet rescan (recovers stranded tapret outputs). Daemon stopped. |
+| `maker wallet recover [--contract] [--dry-run] [--fee]` | Sweep stranded RGB allocations into a fresh anchor. Daemon stopped. |
 
 ### `colorex wallet` — taproot RGB wallets (any role)
 
@@ -63,6 +104,8 @@ binary (`crates/taker-cli`).
 | `wallet create --network --data-dir --name --account-file` | Create a fresh taproot (tapret) RGB wallet + empty stock. |
 | `wallet address --network --data-dir --name [--btc]` | Print a receive address to fund manually (default keychain-10 RGB; `--btc` = keychain-0). |
 | `wallet sync --network --data-dir --name --electrum` | Sync against electrum after funding confirms. |
+| `wallet balance --network --data-dir --name --electrum` | Sync + print the per-keychain BTC balance. |
+| `wallet invoice --contract --amount` | Mint a witness-vout RGB receive invoice for a contract. |
 
 ### `colorex issuer` — mint + distribute tokens
 
@@ -75,9 +118,9 @@ binary (`crates/taker-cli`).
 ### Guides
 
 - [docs/issuing-tokens.md](docs/issuing-tokens.md) — create a wallet, fund + sync,
-  mint a token, and distribute it to a recipient (any network).
+  mint a token, and distribute it to a recipient (the wallet + issuance half of the quickstart).
 - [docs/running-a-maker.md](docs/running-a-maker.md) — run a maker from `init`
-  through inventory to standing orders.
+  through inventory and standing orders to a live daemon (the maker half).
 
 ## Regtest RGB Infra
 

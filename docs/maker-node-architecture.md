@@ -6,8 +6,8 @@ that serves RGB↔BTC swap quotes and settles them on Bitcoin. The binary is
 RGB/Bitcoin I/O lives behind trait boundaries in `rfq-rgb` and `rfq-btc`.
 
 It is the counterpart to the **broker** (`rfq-api`) and the **taker** (the swap
-counterparty). See [swap-flows.md](swap-flows.md) for the protocol and
-[broker-maker-node-roadmap.md](broker-maker-node-roadmap.md) for status.
+counterparty). See [swap-flows.md](swap-flows.md) for the protocol and the
+[README](../README.md) for the operator CLI + setup quickstart.
 
 ---
 
@@ -56,7 +56,7 @@ flowchart TD
 
     rt --> app["maker_app(maker)<br/>axum HTTP server on listen_addr<br/><i>serves quotes / settlement</i>"]
     rt --> cleanup["spawn_cleanup_loop — every cleanup (def 1s)<br/><i>release expired reservations</i>"]
-    rt --> rebal["spawn_rebalance_loop — every rebalance (def 60s)<br/><i>log rebalance plan when fragmented<br/>(planning only; see rebalancing-strategy.md)</i>"]
+    rt --> rebal["spawn_rebalance_loop — every rebalance (def 60s)<br/><i>log rebalance plan when fragmented<br/>(planning/monitoring only)</i>"]
     rt --> obs["spawn_chain_observer_loop — every chain_observer (def 5s)<br/><b>only if [rgb] set</b><br/><i>sync wallet · ingest change · sweep confirms</i>"]
 ```
 
@@ -235,7 +235,7 @@ network      = "regtest"
 data_dir     = "~/.local/share/colorex/rgb"   # RGB stash + bp-wallet cache (rgb-cmd layout)
 wallet_name  = "maker"
 electrum_url = "localhost:50001"
-contract_id  = "rgb:..."
+# no contract_id — tradeable assets live in the maker.db registry (`maker contract import`)
 
 [rgb.signer]
 account_file = "~/.local/share/colorex/maker.account"  # xpriv-bearing, password-encrypted
@@ -283,6 +283,5 @@ The presence of `[rgb]` is the single switch between mock and real mode.
 
 _See also: [swap-flows.md](swap-flows.md) (buy/sell protocol),
 [swap-psbt-design.md](swap-psbt-design.md) (PSBT composition),
-[rebalancing-strategy.md](rebalancing-strategy.md) (rebalance planner),
 [regtest-rgb20-nia-dev-infra.md](regtest-rgb20-nia-dev-infra.md) (running it on
 regtest)._

@@ -201,9 +201,9 @@ pub enum SwapLeg {
         rgb_invoice: String,
         btc_funding_addr: String,
     },
-    /// Taker is selling RGB and receiving BTC. Maker publishes its own RGB
-    /// invoice on the `Quote` (`maker_rgb_invoice`); taker delivers a
-    /// consignment to that invoice via `/consignment`.
+    /// Taker is selling RGB and receiving BTC. Provenance model: the maker mints
+    /// no invoice (`maker_rgb_invoice` is `None`); the taker exports a provenance
+    /// consignment for its own RGB outpoints and delivers it via `/consignment`.
     Sell {
         btc_payout_addr: String,
         /// Where leftover RGB change goes back to the taker, if the consigned

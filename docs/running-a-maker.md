@@ -6,9 +6,8 @@ daemon. The maker itself is Rust-native via `colorex` (no `rgb-cmd`); the only
 Docker is an optional bitcoind + electrs chain backend. Network-agnostic
 (`regtest` / `signet` / `testnet` / `mainnet`); the examples below are signet.
 
-> **Status.** Commands + flags are verified against the current CLI. The full
-> public-network round-trip is **not yet live-validated** (Phase 4). Treat the
-> public-network steps as "should work", not a verified runbook.
+> **Status.** Commands + flags are verified against the current CLI, and the full
+> signet round-trip (issue → fund → swap) has been exercised live.
 
 ## 0. Chain backend — bitcoind + electrs
 
@@ -61,8 +60,9 @@ Answer the prompts with:
   `ssl://mempool.space:60602`, which is fine for BTC but breaks the RGB resolver
   — so a maker uses its own romanz electrs over tcp).
 
-It prints a **keychain-10** address to fund. Leave `RGB contract id` empty for
-now if you haven't issued the asset yet — set it after step 3.
+It prints a **keychain-10** address to fund. There is no contract-id prompt — the
+assets a maker trades live in a registry (`maker.db`), populated in step 3 with
+`colorex maker contract import`.
 
 ## 2. Fund + sync
 
@@ -170,6 +170,19 @@ colorex maker order cancel <id>
   request above it is **declined**, not quoted at the fallback.
 - `--asset`: optional; defaults to the sole registered contract (pass it
   explicitly if the maker trades more than one).
+- `--mirror` / `--mirror-spread-bps`: **auto-mirror**. On each fill of this order
+  the strategy loop places the *opposite-side* order at the fill price ∓ the spread,
+  so inventory ping-pongs back toward neutral and the spread is your margin:
+
+  ```bash
+  # Sell FOO and auto-rebuy on each fill at 5% (500 bps) under the fill price:
+  colorex maker order create --side buy --price 250 --size 1000 --mirror --mirror-spread-bps 500
+  ```
+
+  A `buy` fill (you sold) arms a cheaper `sell`; a `sell` fill (you bought) arms a
+  dearer `buy`. Set a non-zero spread (the default `0` mirrors at the same price, no
+  margin), and keep the daemon running — mirroring is done by the strategy loop in
+  `maker up`.
 
 Orders persist to `maker.db` (the maker's SQLite store, next to the config), and
 `maker up` loads them. Creating a second order for the same (asset, side)
@@ -200,6 +213,30 @@ colorex maker inventory     # RGB inventory snapshot
 ```
 
 A taker can now trade against it via `colorex-taker` (see `crates/taker-cli`).
+
+## 6. Maintenance & recovery
+
+These operate on the maker's wallet directly — **stop the daemon first** so they
+don't contend over the wallet; the chain observer reconciles `maker.db` on the next
+`maker up`.
+
+```bash
+# Send RGB from the maker's own inventory to a recipient's invoice (build+sign+broadcast):
+colorex maker wallet transfer --invoice <recipient-invoice> --fee 1000 --out consignment.b64
+
+# Sweep RGB stranded on tapret outputs bp-wallet's incremental scan missed:
+colorex maker wallet recover --dry-run        # preview what would be swept
+colorex maker wallet recover                  # actually sweep into a fresh anchor
+
+# Full from-scratch wallet rescan (heavier than the daemon's incremental sync):
+colorex maker wallet rescan
+```
+
+- **transfer** is the maker analogue of `issuer transfer` — the contract + amount
+  come from the invoice; recipient accepts the printed consignment after the tx confirms.
+- **recover** / **rescan** are for the tapret-output stranding case: if `maker inventory`
+  shows less than you expect, `inventory --btc` diagnoses it (sellable vs stranded vs
+  spent), then `recover` sweeps the stranded allocations back into spendable inventory.
 
 ## How pricing resolves
 
