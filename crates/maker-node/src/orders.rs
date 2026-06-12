@@ -56,6 +56,23 @@ pub fn new_order(
     }
 }
 
+/// A flat both-sides [`PricePolicy`] for one asset at `price` sats/unit up to
+/// `size`. Convenience for setup/tests that just need the maker to quote an asset
+/// (the maker declines any (asset, side) with no order, so a policy is required).
+pub fn flat_policy(asset_id: &str, price: u64, size: u64) -> PricePolicy {
+    PricePolicy::from_entries(
+        [rfq_types::Side::Buy, rfq_types::Side::Sell]
+            .into_iter()
+            .map(|side| PriceEntry {
+                asset_id: asset_id.to_owned(),
+                side,
+                price_sats_per_unit: price,
+                max_size: size,
+            })
+            .collect(),
+    )
+}
+
 /// Build the maker's [`PricePolicy`] from the orders with a recognized side.
 pub fn price_policy(orders: &[OrderRecord]) -> PricePolicy {
     let entries = orders

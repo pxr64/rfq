@@ -26,10 +26,10 @@ use uuid::Uuid;
 mod coin_select;
 pub use coin_select::{CoinSelectionError, CoinSelector, GreedyExactFitSelector, Selection};
 
-/// Standing per-(asset, side) price the maker quotes at, replacing the flat
-/// [`DEFAULT_UNIT_PRICE_SATS`] markup. Built from the operator's saved orders
-/// (`colorex maker order ...`); empty by default, so a maker with no orders
-/// keeps the legacy flat price. Linear-scanned — an operator runs a handful of
+/// Standing per-(asset, side) price the maker quotes at. Built from the operator's
+/// saved orders (`colorex maker order ...`); empty by default, so a maker with no
+/// orders quotes nothing — it declines until an operator prices the (asset, side).
+/// Linear-scanned — an operator runs a handful of
 /// orders, not thousands.
 #[derive(Debug, Clone, Default)]
 pub struct PricePolicy {
@@ -51,10 +51,11 @@ pub enum PriceLookup {
     /// Quote at this unit price (sats per smallest RGB unit).
     Price(u64),
     /// A matching order exists but the requested amount exceeds its size —
-    /// decline the quote rather than silently fall back to the flat price.
+    /// decline the quote.
     Decline,
-    /// No order for this (asset, side) — use the flat default price.
-    Fallback,
+    /// No standing order for this (asset, side) — decline. The maker quotes only
+    /// what an operator has explicitly priced; there is no flat fallback.
+    NoOrder,
 }
 
 impl PricePolicy {
@@ -73,7 +74,7 @@ impl PricePolicy {
             .iter()
             .find(|e| e.asset_id == asset.id && &e.side == side)
         {
-            None => PriceLookup::Fallback,
+            None => PriceLookup::NoOrder,
             Some(e) if amount <= e.max_size => PriceLookup::Price(e.price_sats_per_unit),
             Some(_) => PriceLookup::Decline,
         }
@@ -169,10 +170,6 @@ const RESERVE_RETRY_ATTEMPTS: u32 = 16;
 /// RGB consignment is a wallet operation, so the window is generous.
 const CONSIGNMENT_TTL_MS: u64 = 600_000;
 
-/// Flat fallback price (sats per smallest RGB unit) used when the maker has no
-/// standing order for an (asset, side) — a ~1% markup over a notional 100-sat
-/// par. Operators override per asset via `colorex maker order create`.
-const DEFAULT_UNIT_PRICE_SATS: u64 = 101;
 
 /// Maker-side state for a buy-side swap held between `accept_quote` and
 /// `submit_signed_psbt`. The settlement state machine (#9) will formalize
@@ -303,8 +300,7 @@ impl Maker {
     }
 
     /// Seed the standing-order price policy (from the operator's saved orders).
-    /// Without it the maker quotes the flat [`DEFAULT_UNIT_PRICE_SATS`] for
-    /// every asset.
+    /// Without an order for an (asset, side) the maker declines quotes for it.
     pub fn with_price_policy(mut self, policy: PricePolicy) -> Self {
         self.price_policy = Arc::new(ArcSwap::from_pointee(policy));
         self
@@ -742,10 +738,16 @@ impl Maker {
                 .unit_price(&request.base_asset, &request.side, amount)
             {
                 PriceLookup::Price(p) => p.saturating_mul(amount),
-                PriceLookup::Fallback => amount.saturating_mul(DEFAULT_UNIT_PRICE_SATS),
-                // Surface the silent decline (else a sell returns no quote and
-                // "looks broken"): the standing order exists but the requested
-                // amount is over its size.
+                // Surface the decline (else a sell returns no quote and "looks
+                // broken"): either no standing order, or the amount is over its size.
+                PriceLookup::NoOrder => {
+                    eprintln!(
+                        "declining sell quote: no standing sell order for asset {} — create one \
+                         with `colorex maker order create --side sell`",
+                        request.base_asset.id,
+                    );
+                    return Ok(None);
+                }
                 PriceLookup::Decline => {
                     eprintln!(
                         "declining sell quote: amount {amount} over the sell order's max size \
@@ -1232,7 +1234,14 @@ impl MakerConnector for Maker {
                 .unit_price(&request.base_asset, &request.side, request.amount)
             {
                 PriceLookup::Price(p) => p,
-                PriceLookup::Fallback => DEFAULT_UNIT_PRICE_SATS,
+                PriceLookup::NoOrder => {
+                    eprintln!(
+                        "declining buy quote: no standing buy order for asset {} — create one \
+                         with `colorex maker order create --side buy`",
+                        request.base_asset.id,
+                    );
+                    return Ok(None);
+                }
                 PriceLookup::Decline => {
                     eprintln!(
                         "declining buy quote: amount {} over the buy order's max size for asset {} \
@@ -1698,8 +1707,26 @@ mod tests {
         }
     }
 
+    /// Prices the test `asset()` at 101 sats/unit on both sides with a generous
+    /// size — matches the flat price the removed fallback used to give, so the
+    /// quote-flow tests still resolve (no order now means *decline*, so the
+    /// test maker must carry an explicit policy).
+    fn default_test_policy() -> PricePolicy {
+        PricePolicy::from_entries(
+            [Side::Buy, Side::Sell]
+                .into_iter()
+                .map(|side| PriceEntry {
+                    asset_id: asset().id,
+                    side,
+                    price_sats_per_unit: 101,
+                    max_size: 1_000_000_000,
+                })
+                .collect(),
+        )
+    }
+
     #[test]
-    fn price_policy_resolves_match_decline_and_fallback() {
+    fn price_policy_resolves_match_decline_and_no_order() {
         let policy = PricePolicy::from_entries(vec![PriceEntry {
             asset_id: asset().id,
             side: Side::Buy,
@@ -1712,20 +1739,20 @@ mod tests {
             policy.unit_price(&asset(), &Side::Buy, 1_000),
             PriceLookup::Price(250)
         ));
-        // Over the order's size → decline (don't silently fall back).
+        // Over the order's size → decline.
         assert!(matches!(
             policy.unit_price(&asset(), &Side::Buy, 1_001),
             PriceLookup::Decline
         ));
-        // Order exists for Buy but not Sell → fall back to the flat price.
+        // Order exists for Buy but not Sell → no order for Sell → decline.
         assert!(matches!(
             policy.unit_price(&asset(), &Side::Sell, 10),
-            PriceLookup::Fallback
+            PriceLookup::NoOrder
         ));
-        // No order for this asset at all → fall back.
+        // No order for this asset at all → decline.
         assert!(matches!(
             policy.unit_price(&quote_asset(), &Side::Buy, 10),
-            PriceLookup::Fallback
+            PriceLookup::NoOrder
         ));
     }
 
@@ -1775,6 +1802,7 @@ mod tests {
         bitcoin_client.seed_address_unspent(BUY_FUNDING_ADDR, taker_funding());
         let rgb_backend = Arc::new(MockRgbBackend::new(utxos.clone()));
         Maker::new(maker_id(), utxos, rgb_backend, bitcoin_client)
+            .with_price_policy(default_test_policy())
     }
 
     /// Seed the store directly so tests can pre-set Reserved / Spent statuses.
@@ -1789,6 +1817,7 @@ mod tests {
             rgb_backend,
             bitcoin_client,
         )
+        .with_price_policy(default_test_policy())
     }
 
     /// The BTC address buy-side tests declare as the taker's funding source.
@@ -1914,6 +1943,7 @@ mod tests {
         let rgb_backend = Arc::new(MockRgbBackend::new(vec![]));
         Maker::new(maker_id(), vec![], rgb_backend, client)
             .with_btc_inventory((0..3).map(|i| btc_inv(i, 1_000_000)).collect())
+            .with_price_policy(default_test_policy())
     }
 
     fn sell_maker() -> Maker {

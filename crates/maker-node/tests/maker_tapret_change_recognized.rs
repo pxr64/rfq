@@ -95,6 +95,12 @@ async fn maker_recognizes_pinned_tapret_change_after_swap() {
         .await
         .expect("seed contract registry");
     let (maker, observer_handle, maker_base_url) = spawn_maker_node(&mut config).await;
+    // No standing order ⇒ the maker declines; seed a flat both-sides policy.
+    maker.reload_price_policy(maker_node::orders::flat_policy(
+        stack.contract_id_str(),
+        101,
+        1_000_000_000,
+    ));
     let broker_base_url = spawn_broker(&maker_base_url, MAKER_NODE_ID).await;
     let client = RfqClient::new(Url::parse(&broker_base_url).expect("broker url parses"));
 

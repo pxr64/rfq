@@ -1024,7 +1024,10 @@ mod tests {
     }
 
     async fn test_app() -> Router {
-        maker_app(build_maker(&test_config()).await.unwrap())
+        let maker = build_maker(&test_config()).await.unwrap();
+        // No standing order ⇒ the maker declines; seed a flat policy for the mock asset.
+        maker.reload_price_policy(orders::flat_policy("rgb-test-asset", 101, 1_000_000_000));
+        maker_app(maker)
     }
 
     #[tokio::test]

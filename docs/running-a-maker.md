@@ -149,8 +149,9 @@ effect on the next `colorex maker up`.
 
 Orders are the maker's liquidity terms — the price it quotes per (asset, side),
 where **`side` is the taker's side** (the order answers "when a taker requests
-side X, quote at price Y"). Without any order, the maker falls back to a flat
-default (`DEFAULT_UNIT_PRICE_SATS`, ~1% over a 100-sat par).
+side X, quote at price Y"). **Without an order for an (asset, side) the maker
+declines** — it quotes only what you've explicitly priced (no flat fallback), so
+set an order for every side you want to trade.
 
 ```bash
 # Back taker BUYS of FOO (you sell RGB) at 250 sats/unit, up to 1,000 units/quote:
@@ -167,7 +168,7 @@ colorex maker order cancel <id>
   (maker buys, paying BTC from its BTC pool).
 - `--price`: sats per **smallest RGB unit**.
 - `--size`: the largest single quote (smallest RGB units) the order backs — a
-  request above it is **declined**, not quoted at the fallback.
+  request above it is **declined**.
 - `--asset`: optional; defaults to the sole registered contract (pass it
   explicitly if the maker trades more than one).
 - `--mirror` / `--mirror-spread-bps`: **auto-mirror**. On each fill of this order
@@ -246,4 +247,4 @@ For each quote the maker consults its orders for (asset, side):
 |---|---|
 | Matching order, amount ≤ size | quote at the order's price |
 | Matching order, amount > size | **decline** the quote |
-| No order for this (asset, side) | flat `DEFAULT_UNIT_PRICE_SATS` fallback |
+| No order for this (asset, side) | **decline** (no quote) |

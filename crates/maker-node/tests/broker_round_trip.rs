@@ -75,6 +75,13 @@ async fn broker_routes_buy_and_sell_to_remote_maker() {
         .expect("seed contract registry");
     // Maker daemon (HTTP + chain observer) on a random port.
     let (maker, observer_handle, maker_base_url) = spawn_maker_node(&mut config).await;
+    // The maker declines any (asset, side) with no standing order — seed a flat
+    // both-sides policy so the buy + sell legs quote.
+    maker.reload_price_policy(maker_node::orders::flat_policy(
+        stack.contract_id_str(),
+        101,
+        1_000_000_000,
+    ));
 
     // Broker in-process, routing to the maker over HTTP.
     let broker_base_url = spawn_broker(&maker_base_url, MAKER_NODE_ID).await;

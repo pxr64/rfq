@@ -78,6 +78,8 @@ fn build_maker(store: Arc<dyn InventoryStore>) -> Maker {
         rgb_backend,
         bitcoin_client,
     )
+    // No standing order ⇒ the maker declines; seed a flat policy for the test asset.
+    .with_price_policy(maker_node::orders::flat_policy(&asset().id, 101, 1_000_000_000))
 }
 
 #[tokio::test]

@@ -82,6 +82,22 @@ pub struct ConsignmentBody {
     pub outpoints: Vec<Outpoint>,
 }
 
+/// A flat both-sides price policy for `asset_id` — the mock broker/maker need a
+/// policy now that a maker with no standing order for an (asset, side) declines.
+fn flat_price_policy(asset_id: &str) -> rfq_maker::PricePolicy {
+    rfq_maker::PricePolicy::from_entries(
+        [rfq_types::Side::Buy, rfq_types::Side::Sell]
+            .into_iter()
+            .map(|side| rfq_maker::PriceEntry {
+                asset_id: asset_id.to_owned(),
+                side,
+                price_sats_per_unit: 101,
+                max_size: 1_000_000_000,
+            })
+            .collect(),
+    )
+}
+
 pub fn app() -> Router {
     let maker_id = MakerId("mock-maker-1".to_owned());
     let rgb_asset = AssetId {
@@ -89,6 +105,7 @@ pub fn app() -> Router {
         kind: AssetKind::Rgb20,
         id: "rgb:eejuoPHh-agACtkj-6j2JkSs-cI4PIwm-CzKGJ7v-1s~IrX0".to_owned(),
     };
+    let policy = flat_price_policy(&rgb_asset.id);
     let utxo = RgbInventoryUtxo {
         outpoint: Outpoint::new(format!("{:064x}", 0u64), 0),
         asset_id: rgb_asset,
@@ -103,7 +120,8 @@ pub fn app() -> Router {
     // Seed BTC inventory so the maker can also quote the sell side.
     let maker = Arc::new(
         Maker::new(maker_id, vec![utxo], rgb_backend, bitcoin_client)
-            .with_btc_inventory(mock_btc_inventory()),
+            .with_btc_inventory(mock_btc_inventory())
+            .with_price_policy(policy),
     );
 
     app_with_state(AppState {
@@ -850,7 +868,8 @@ mod tests {
                 rgb_backend,
                 Arc::new(client),
             )
-            .with_btc_inventory(mock_btc_inventory()),
+            .with_btc_inventory(mock_btc_inventory())
+            .with_price_policy(flat_price_policy(&rgb_asset().id)),
         );
         app_with_state(AppState {
             registry: MakerRegistry::with(vec![maker]),

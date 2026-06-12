@@ -59,6 +59,12 @@ async fn http_two_consecutive_buys_via_chain_observer() {
         .expect("seed contract registry");
     // --- Spin up the maker_app on a random port + spawn the chain observer
     let (maker, observer_handle, base_url) = spawn_maker_node(&mut config).await;
+    // No standing order ⇒ the maker declines; seed a flat both-sides policy.
+    maker.reload_price_policy(maker_node::orders::flat_policy(
+        stack.contract_id_str(),
+        101,
+        1_000_000_000,
+    ));
 
     // --- Pre-fund the taker's btc_funding_addr (keychain-0). The bootstrap
     //     only funds keychain-10 via `fund_role`; the maker's HTTP path

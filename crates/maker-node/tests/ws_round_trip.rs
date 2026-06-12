@@ -53,6 +53,12 @@ async fn maker_autoregisters_then_quotes_and_accepts_over_ws() {
         rgb: None,
     };
     let maker = build_runtime(&config).await.expect("build_runtime").maker;
+    // No standing order ⇒ the maker declines; seed a flat policy for the mock asset.
+    maker.reload_price_policy(maker_node::orders::flat_policy(
+        "rgb-test-asset",
+        101,
+        1_000_000_000,
+    ));
 
     // Broker on a random port with an empty registry — the maker dials in.
     let registry = MakerRegistry::new();
