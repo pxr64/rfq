@@ -9,9 +9,9 @@ use maker_node::{
 };
 use rfq_wallet::{resolve_named, resolve_wallet, WalletConfig, WalletInput};
 use rfq_rgb::RgbBackend;
-use rfq_store::OrderStore as _;
+use rfq_store::{BtcInventoryStore as _, InventoryStore as _, OrderStore as _};
 use rfq_client::{RfqClient, Url};
-use rfq_types::{InventorySnapshot, MakerId};
+use rfq_types::{InventorySnapshot, MakerId, Side};
 use tokio::{net::TcpListener, sync::oneshot};
 
 #[derive(Debug, Parser)]
@@ -208,9 +208,14 @@ enum MakerCmd {
     /// Print the two wallet addresses to fund: the keychain-0 BTC address (pays
     /// sell-side takers + tx fees) and the keychain-10 RGB-anchor address (for
     /// minting/receiving RGB seal anchors).
-    Addresses {
-        /// Electrum URL to fetch per-keychain balances (syncs the wallet). Omit
-        /// for addresses only. Tip: your config's `[rgb] electrum_url`.
+    /// Print the maker's funding addresses (BTC keychain 0 + RGB anchor keychain
+    /// 10). Offline — derived from the wallet, no chain access. Use `balances` to
+    /// also fetch the funded amounts.
+    Addresses,
+    /// Show funded balances per keychain (BTC payment + RGB anchor), syncing the
+    /// wallet against electrum. `--electrum` overrides the config's electrum_url.
+    Balances {
+        /// Electrum URL to sync against. Defaults to the config's `[rgb] electrum_url`.
         #[arg(long)]
         electrum: Option<String>,
     },
@@ -322,6 +327,8 @@ enum OrderCmd {
         /// Order id (from `order list`).
         id: String,
     },
+    /// Cancel ALL standing orders.
+    Clear,
 }
 
 #[tokio::main]
@@ -344,8 +351,9 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             MakerCmd::Inventory { btc, electrum } => {
                 inventory(load_config(&config_path)?, btc, electrum).await
             }
-            MakerCmd::Addresses { electrum } => {
-                maker_addresses(load_config(&config_path)?, electrum).await
+            MakerCmd::Addresses => maker_addresses(load_config(&config_path)?),
+            MakerCmd::Balances { electrum } => {
+                maker_balances(load_config(&config_path)?, electrum).await
             }
             MakerCmd::Rescan { electrum } => maker_rescan(load_config(&config_path)?, electrum).await,
             MakerCmd::Recover {
@@ -371,6 +379,7 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 OrderCmd::List => order_list(&config_path).await,
                 OrderCmd::Cancel { id } => order_cancel(&config_path, &id).await,
+                OrderCmd::Clear => order_clear(&config_path).await,
             },
             MakerCmd::Reconsign {
                 contract,
@@ -556,46 +565,40 @@ async fn maker_keychain_balances(
     Ok((k0, k10))
 }
 
-async fn maker_addresses(
+fn maker_addresses(config: MakerNodeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let (btc, anchor) = maker_funding_addresses(&config)?;
+    let network = config.rgb.as_ref().map(|r| r.network.as_str()).unwrap_or("");
+
+    println!("colorex maker addresses ({network})");
+    output::kv("BTC payment · keychain 0", &btc);
+    output::kv("RGB anchor · keychain 10", &anchor);
+    output::note("");
+    output::note("Fund BTC to pay sell-side takers + tx fees; fund RGB-anchor to mint/receive RGB.");
+    output::note("Show funded balances: colorex maker balances");
+    Ok(())
+}
+
+/// Per-keychain BTC balances (keychain 0 = payment, 10 = RGB anchor), synced
+/// against electrum. The funding addresses are shown alongside, so this answers
+/// both "where do I fund" and "how much is there". `--electrum` overrides the
+/// config's electrum_url. The shown address is the next-unused one (where to
+/// SEND); the sats are the keychain TOTAL across all its UTXOs.
+async fn maker_balances(
     config: MakerNodeConfig,
     electrum: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (btc, anchor) = maker_funding_addresses(&config)?;
     let network = config.rgb.as_ref().map(|r| r.network.as_str()).unwrap_or("");
-    let wallet = config.rgb.as_ref().map(|r| r.wallet_name.as_str()).unwrap_or("maker");
-
-    // Balance readout: use --electrum if given, else fall back to the config's
-    // `[rgb] electrum_url`. Syncs the wallet; on failure, degrade to addresses-only.
     let electrum_url = electrum
         .filter(|s| !s.is_empty())
-        .or_else(|| config.rgb.as_ref().map(|r| r.electrum_url.clone()).filter(|s| !s.is_empty()));
-    let balances = match &electrum_url {
-        Some(url) => match maker_keychain_balances(&config, url).await {
-            Ok(b) => Some(b),
-            Err(e) => {
-                output::step_warn(&format!("balance sync failed: {e}"));
-                None
-            }
-        },
-        None => None,
-    };
-    // The shown address is the next-unused one (where to SEND); the sats are the
-    // keychain TOTAL across all its UTXOs — so put the balance on the label, not
-    // beside the address (which would imply that single address holds it).
-    let label = |name: &str, keychain: u32, sats: Option<u64>| match sats {
-        Some(s) => format!("{name} · keychain {keychain} · {s} sats"),
-        None => format!("{name} · keychain {keychain}"),
-    };
+        .or_else(|| config.rgb.as_ref().map(|r| r.electrum_url.clone()).filter(|s| !s.is_empty()))
+        .ok_or("no electrum URL: pass --electrum <url> or set [rgb] electrum_url")?;
 
-    println!("colorex maker addresses ({network})");
-    output::kv(&label("BTC payment", 0, balances.map(|(b0, _)| b0)), &btc);
-    output::kv(&label("RGB anchor", 10, balances.map(|(_, b10)| b10)), &anchor);
-    output::note("");
-    output::note("Fund BTC to pay sell-side takers + tx fees; fund RGB-anchor to mint/receive RGB.");
-    if electrum_url.is_none() {
-        output::note("Pass --electrum <url> (or set [rgb] electrum_url) to show balances.");
-    }
-    output::note(&format!("Re-sync after funding: colorex wallet sync --name {wallet} --network {network}"));
+    let (k0, k10) = maker_keychain_balances(&config, &electrum_url).await?;
+
+    println!("colorex maker balances ({network})");
+    output::kv(&format!("BTC payment · keychain 0 · {k0} sats"), &btc);
+    output::kv(&format!("RGB anchor · keychain 10 · {k10} sats"), &anchor);
     Ok(())
 }
 
@@ -867,14 +870,15 @@ async fn order_create(
     mirror: bool,
     mirror_spread_bps: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if orders::parse_side(&side).is_none() {
-        return Err(format!("invalid --side '{side}': expected 'buy' or 'sell'").into());
-    }
+    let parsed_side = orders::parse_side(&side)
+        .ok_or_else(|| format!("invalid --side '{side}': expected 'buy' or 'sell'"))?;
+    let config = load_config(config_path)?;
     let asset_id = match asset {
         Some(a) => a,
-        None => load_config(config_path)?
+        None => config
             .rgb
-            .map(|r| r.contract_id)
+            .as_ref()
+            .map(|r| r.contract_id.clone())
             .filter(|id| !id.is_empty())
             .ok_or("no --asset given and no [rgb] contract_id in config")?,
     };
@@ -884,7 +888,7 @@ async fn order_create(
         );
     }
     let store = open_order_store(config_path).await?;
-    let order = orders::new_order(&side, asset_id, price, size, mirror, mirror_spread_bps);
+    let order = orders::new_order(&side, asset_id.clone(), price, size, mirror, mirror_spread_bps);
     let id = order.id.clone();
     let replaced = store.get(&order.asset_id, &order.side).await?;
     store.upsert(order).await?;
@@ -892,7 +896,71 @@ async fn order_create(
         Some(old) => println!("created order {id} (replaced {})", old.id),
         None => println!("created order {id}"),
     }
+    // Non-blocking heads-up if on-hand inventory can't back the order.
+    warn_low_balance(&config, &parsed_side, &asset_id, price, size).await;
     Ok(())
+}
+
+/// Warn (non-blocking) if the maker's cached inventory can't back a full-size
+/// quote for this order. Orders are just terms — the maker declines quotes it
+/// can't fund — so this never blocks creation. Reads maker.db directly (WAL-safe;
+/// no bp-wallet file access, so it's fine while the daemon runs).
+async fn warn_low_balance(
+    config: &MakerNodeConfig,
+    side: &Side,
+    asset_id: &str,
+    price: u64,
+    size: u64,
+) {
+    let Some(rgb) = config.rgb.as_ref() else {
+        return;
+    };
+    let db_path = rgb.data_dir.join(&rgb.network).join("maker.db");
+    if !db_path.exists() {
+        return;
+    }
+    match side {
+        // A buy order SELLS RGB — the maker needs the asset on hand.
+        Side::Buy => {
+            let Ok(network) = rgb.network.parse::<rfq_types::BitcoinNetwork>() else {
+                return;
+            };
+            let Ok(store) = rfq_store::SqliteInventoryStore::open(&db_path).await else {
+                return;
+            };
+            let asset = rfq_types::AssetId {
+                network,
+                kind: rfq_types::AssetKind::Rgb20,
+                id: asset_id.to_owned(),
+            };
+            let avail: u64 = store
+                .list_available(&asset)
+                .await
+                .iter()
+                .map(|u| u.amount)
+                .sum();
+            if avail < size {
+                output::step_warn(&format!(
+                    "maker holds {avail} units of this asset (< order size {size}) — a buy order \
+                     SELLS RGB, so quotes above your balance will decline until funded"
+                ));
+            }
+        }
+        // A sell order PAYS BTC — the maker needs BTC in its pool.
+        Side::Sell => {
+            let Ok(store) = rfq_store::SqliteBtcInventoryStore::open(&db_path).await else {
+                return;
+            };
+            let avail: u64 = store.list_available().await.iter().map(|u| u.value_sats).sum();
+            let need = size.saturating_mul(price);
+            if avail < need {
+                output::step_warn(&format!(
+                    "maker BTC pool is {avail} sats (< ~{need} for a full {size}-unit quote) — a \
+                     sell order PAYS BTC, so large quotes will decline until funded"
+                ));
+            }
+        }
+    }
 }
 
 async fn order_list(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -922,6 +990,13 @@ async fn order_cancel(config_path: &Path, id: &str) -> Result<(), Box<dyn std::e
         return Err(format!("no order with id '{id}'").into());
     }
     println!("cancelled order {id}");
+    Ok(())
+}
+
+async fn order_clear(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_order_store(config_path).await?;
+    let n = store.clear().await?;
+    println!("cleared {n} order(s)");
     Ok(())
 }
 

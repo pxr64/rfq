@@ -14,7 +14,7 @@ use rfq_store::{
     InMemoryFillStore, InMemoryInventoryStore, InventoryStore,
 };
 use rfq_types::{
-    AcceptQuoteRequest, AssetId, AssetInfo, BtcInventoryStatus, BtcInventoryUtxo,
+    AcceptQuoteRequest, AssetId, AssetInfo, BitcoinNetwork, BtcInventoryStatus, BtcInventoryUtxo,
     ExtendedInventorySnapshot, InventoryError, InventorySnapshot, InventoryStatus, InventoryUtxo,
     MakerId, OrderPrice, Outpoint, Quote, QuoteId, QuoteRequest, RgbInventoryUtxo, ReservationId,
     SettlementIntent, SettlementStatus, Side, SwapLeg,
@@ -152,6 +152,13 @@ const ESTIMATED_SWAP_VBYTES: u64 = 200;
 /// signet) return no electrum estimate, which would yield a 0-fee tx that
 /// bitcoind rejects under `minrelaytxfee`. 1 sat/vByte clears the default floor.
 const MIN_SWAP_FEERATE_SAT_VB: u64 = 1;
+/// Mainnet ceiling on the swap feerate (sat/vByte) — a sanity guard so a wildly
+/// wrong electrum estimate can't inflate the fee to absurd levels.
+const MAX_SWAP_FEERATE_SAT_VB: u64 = 1000;
+/// Ceiling for TEST networks (signet / testnet / regtest). `estimatesmartfee` is
+/// unreliable on low-activity chains — signet returned ~1684 sat/vByte, which
+/// blew a swap fee up to ~0.003 BTC. Real fees there are ~1 sat/vByte, so cap low.
+const TESTNET_SWAP_FEERATE_CAP_SAT_VB: u64 = 5;
 /// Upper bound on reservation retries under contention. With outpoint
 /// exclusion on each retry, the effective bound is `min(this, available_utxo_count)`
 /// — the loop exits via the selector's Insufficient branch once exclusions
@@ -784,6 +791,7 @@ impl Maker {
         // docs/provenance-consignment-proposal.md.
         let _ = reservation_id;
 
+        let estimated_fee_sats = self.estimate_swap_fee(&request.base_asset.network).await;
         Ok(Some(Quote {
             quote_id,
             rfq_id: request.rfq_id,
@@ -794,7 +802,7 @@ impl Maker {
             amount,
             price: gross_btc_sats,
             expires_at_ms,
-            estimated_fee_sats: self.estimate_swap_fee().await,
+            estimated_fee_sats,
             fee_slippage_bps: 2000,
             maker_rgb_invoice: None,
         }))
@@ -804,13 +812,17 @@ impl Maker {
     /// failed estimate falls back to 0, which disables the slippage check at
     /// settlement (no baseline to compare against) rather than rejecting the
     /// quote outright.
-    async fn estimate_swap_fee(&self) -> u64 {
+    async fn estimate_swap_fee(&self, network: &BitcoinNetwork) -> u64 {
+        let cap = match network {
+            BitcoinNetwork::Mainnet => MAX_SWAP_FEERATE_SAT_VB,
+            _ => TESTNET_SWAP_FEERATE_CAP_SAT_VB,
+        };
         let feerate = self
             .bitcoin_client
             .estimate_feerate(3)
             .await
             .unwrap_or(0)
-            .max(MIN_SWAP_FEERATE_SAT_VB);
+            .clamp(MIN_SWAP_FEERATE_SAT_VB, cap);
         feerate.saturating_mul(ESTIMATED_SWAP_VBYTES)
     }
 
@@ -983,7 +995,7 @@ impl Maker {
             .collect();
 
         // Re-estimate the fee and abort if it blew the quote's slippage cap.
-        let actual_fee = self.estimate_swap_fee().await;
+        let actual_fee = self.estimate_swap_fee(&quote.base_asset.network).await;
         if quote.estimated_fee_sats > 0 {
             let cap = quote
                 .estimated_fee_sats
@@ -1273,7 +1285,7 @@ impl MakerConnector for Maker {
             }
         };
 
-        let estimated_fee_sats = self.estimate_swap_fee().await;
+        let estimated_fee_sats = self.estimate_swap_fee(&request.base_asset.network).await;
 
         Ok(Some(Quote {
             quote_id,
@@ -1352,7 +1364,7 @@ impl MakerConnector for Maker {
         // Declared-funding: discover the taker's BTC UTXOs from the address it
         // put on the ACCEPT, then select enough to cover the price + fee. The
         // taker only signs these inputs at `/sign`; it never adds its own.
-        let actual_fee = self.estimate_swap_fee().await;
+        let actual_fee = self.estimate_swap_fee(&quote.base_asset.network).await;
         if quote.estimated_fee_sats > 0 {
             let cap = quote
                 .estimated_fee_sats

@@ -704,6 +704,14 @@ impl OrderStore for SqliteOrderStore {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn clear(&self) -> Result<usize, OrderError> {
+        let res = sqlx::query("DELETE FROM orders")
+            .execute(&self.pool)
+            .await
+            .map_err(ordr)?;
+        Ok(res.rows_affected() as usize)
+    }
+
     async fn get(&self, asset_id: &str, side: &str) -> Result<Option<OrderRecord>, OrderError> {
         let row: Option<OrderRow> =
             sqlx::query_as(&format!("{ORDER_COLS} WHERE asset_id = ?1 AND side = ?2"))

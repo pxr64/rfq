@@ -380,6 +380,8 @@ pub trait OrderStore: Send + Sync {
     async fn upsert(&self, order: OrderRecord) -> Result<(), OrderError>;
     /// Remove the order with `id`. Returns true if one was removed.
     async fn cancel(&self, id: &str) -> Result<bool, OrderError>;
+    /// Remove ALL orders. Returns the number removed.
+    async fn clear(&self) -> Result<usize, OrderError>;
     async fn get(&self, asset_id: &str, side: &str) -> Result<Option<OrderRecord>, OrderError>;
 }
 
@@ -422,6 +424,13 @@ impl OrderStore for InMemoryOrderStore {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    async fn clear(&self) -> Result<usize, OrderError> {
+        let mut map = self.by_key.write().await;
+        let n = map.len();
+        map.clear();
+        Ok(n)
     }
 
     async fn get(&self, asset_id: &str, side: &str) -> Result<Option<OrderRecord>, OrderError> {

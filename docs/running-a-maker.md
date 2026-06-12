@@ -76,6 +76,17 @@ colorex wallet sync \
 
 (`<rgb-data-dir>` / `<wallet-name>` are the values you gave `init`.)
 
+Two helpers:
+
+```bash
+colorex maker addresses   # the BTC (keychain 0) + RGB-anchor (keychain 10) addresses — offline, no chain
+colorex maker balances    # the same, with funded sats per keychain (syncs against electrum)
+```
+
+`addresses` never touches the chain, so it's instant even before electrs has
+synced — use it to grab the address to fund; use `balances` to confirm the coins
+landed.
+
 ## 3. Acquire inventory
 
 A maker needs RGB tokens to sell. Two paths:
