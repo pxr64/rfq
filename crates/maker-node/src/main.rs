@@ -295,10 +295,11 @@ enum ContractCmd {
     Import {
         /// RGB contract id (`rgb:...`).
         id: String,
-        /// Optional base64 consignment to accept into the stock before
-        /// registering — the "I was handed a new asset" path (folds in `accept`).
+        /// Optional consignment to accept into the stock before registering —
+        /// the "I was handed a new asset" path (folds in `accept`). Either a file
+        /// path OR the inline base64 string.
         #[arg(long)]
-        consignment: Option<PathBuf>,
+        consignment: Option<String>,
     },
     /// List the registered contracts.
     List,
@@ -364,9 +365,10 @@ enum MakerWalletCmd {
     /// `issuer transfer` against it, they return a consignment; this imports it
     /// so `maker up` sees the RGB as inventory (once the anchoring tx confirms).
     Accept {
-        /// Path to the base64 consignment file the issuer returned.
-        #[arg(long)]
-        path: PathBuf,
+        /// The consignment the issuer returned: a file path OR the inline base64
+        /// string. (`--path` is kept as an alias.)
+        #[arg(long, visible_alias = "path")]
+        consignment: String,
         /// RGB contract id. Defaults to the sole registered contract.
         #[arg(long)]
         contract: Option<String>,
@@ -429,9 +431,10 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 MakerWalletCmd::Invoice { contract, amount } => {
                     maker_invoice(load_config(&config_path)?, contract, amount).await
                 }
-                MakerWalletCmd::Accept { path, contract } => {
-                    maker_accept(load_config(&config_path)?, path, contract).await
-                }
+                MakerWalletCmd::Accept {
+                    consignment,
+                    contract,
+                } => maker_accept(load_config(&config_path)?, consignment, contract).await,
                 MakerWalletCmd::Transfer {
                     invoice,
                     electrum,
@@ -871,16 +874,13 @@ async fn maker_recover(
 
 async fn maker_accept(
     config: MakerNodeConfig,
-    path: PathBuf,
+    consignment: String,
     contract: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let consignment = std::fs::read_to_string(&path)?;
+    let base64 = read_consignment(&consignment)?;
     let contract_id = resolve_contract_id(&config, contract).await?;
-    accept_inventory_consignment(&config, contract_id, consignment.trim()).await?;
-    println!(
-        "accepted consignment from {} into the maker stash",
-        path.display()
-    );
+    accept_inventory_consignment(&config, contract_id, &base64).await?;
+    println!("accepted consignment into the maker stash");
     Ok(())
 }
 
@@ -1009,6 +1009,18 @@ async fn open_contract_store(
     Ok(rfq_store::SqliteContractStore::open(&db_path).await?)
 }
 
+/// Resolve a consignment argument that is EITHER a file path OR the inline base64
+/// string. If `value` names an existing file, read it; otherwise treat `value`
+/// itself as the base64 — so `--consignment` takes a path or a pasted blob.
+fn read_consignment(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let trimmed = value.trim();
+    if std::path::Path::new(trimmed).is_file() {
+        Ok(std::fs::read_to_string(trimmed)?.trim().to_owned())
+    } else {
+        Ok(trimmed.to_owned())
+    }
+}
+
 /// Resolve which contract a single-asset command operates on. An explicit
 /// `--contract`/`--asset` wins; otherwise the registry must hold exactly one
 /// contract (the unambiguous default). Zero or many → an actionable error rather
@@ -1096,17 +1108,18 @@ fn contract_spec_for(
 async fn contract_import(
     config: MakerNodeConfig,
     id: String,
-    consignment: Option<PathBuf>,
+    consignment: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Validate the id parses before any side effects.
     id.parse::<rfq_rgb::ContractId>()
         .map_err(|e| format!("invalid contract id {id}: {e}"))?;
 
     // `--consignment` folds in `accept`: absorb the contract into the stock first,
-    // so a freshly-handed-over asset registers in one step.
-    if let Some(path) = consignment {
-        let base64 = std::fs::read_to_string(&path)?;
-        accept_inventory_consignment(&config, id.clone(), base64.trim()).await?;
+    // so a freshly-handed-over asset registers in one step. The arg is a file path
+    // OR the inline base64.
+    if let Some(consignment) = consignment {
+        let base64 = read_consignment(&consignment)?;
+        accept_inventory_consignment(&config, id.clone(), &base64).await?;
         output::step_ok_with(&format!(
             "accepted consignment for {}",
             init::truncate_contract(&id)
