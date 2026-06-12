@@ -371,6 +371,25 @@ enum MakerWalletCmd {
         #[arg(long)]
         contract: Option<String>,
     },
+    /// Send RGB from the maker's inventory to a recipient's invoice (the maker
+    /// analogue of `issuer transfer`): builds + signs + broadcasts the anchoring
+    /// tx and prints the base64 consignment to hand back. The contract + amount
+    /// come from the invoice. Run with the daemon STOPPED (it spends the maker's
+    /// wallet); the chain observer reconciles inventory on the next `maker up`.
+    Transfer {
+        /// Recipient RGB invoice string (carries the contract id + amount).
+        #[arg(long)]
+        invoice: String,
+        /// Electrum URL to broadcast against. Defaults to the config's `[rgb] electrum_url`.
+        #[arg(long)]
+        electrum: Option<String>,
+        /// Fee for the transfer tx, in sats.
+        #[arg(long, default_value_t = 1000)]
+        fee: u64,
+        /// Write the base64 consignment here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -413,6 +432,12 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 MakerWalletCmd::Accept { path, contract } => {
                     maker_accept(load_config(&config_path)?, path, contract).await
                 }
+                MakerWalletCmd::Transfer {
+                    invoice,
+                    electrum,
+                    fee,
+                    out,
+                } => maker_transfer(load_config(&config_path)?, invoice, electrum, fee, out).await,
             },
             MakerCmd::Order { cmd } => match cmd {
                 OrderCmd::Create {
@@ -856,6 +881,55 @@ async fn maker_accept(
         "accepted consignment from {} into the maker stash",
         path.display()
     );
+    Ok(())
+}
+
+/// Send RGB from the maker's wallet to a recipient invoice — the maker analogue
+/// of `issuer transfer`. Builds + signs + broadcasts the anchoring tx via
+/// `distribute` (the contract + amount are carried by the invoice) and returns
+/// the consignment. Run with the daemon STOPPED: it spends the maker's bp-wallet
+/// directly, and the chain observer reconciles the spent input + change on the
+/// next `maker up`.
+async fn maker_transfer(
+    config: MakerNodeConfig,
+    invoice: String,
+    electrum: Option<String>,
+    fee: u64,
+    out: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rgb = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: a wallet is required to transfer")?;
+    let electrum_url = electrum
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| rgb.electrum_url.clone());
+    if electrum_url.is_empty() {
+        return Err("no --electrum given and no [rgb] electrum_url in config".into());
+    }
+    let backend = rfq_rgb::LibRgbBackend::new(
+        rgb.data_dir.clone(),
+        rgb.wallet_name.clone(),
+        rgb.network.clone(),
+        electrum_url,
+        rgb.signer.account_file.clone(),
+        rgb.signer.password.clone(),
+    );
+    let (txid, consignment) = backend.distribute(&invoice, fee).await?;
+    println!("transfer broadcast: {txid}");
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &consignment)?;
+            eprintln!(
+                "wrote consignment to {} — hand it to the recipient (they accept after the tx confirms)",
+                path.display()
+            );
+        }
+        None => {
+            println!("hand this consignment to the recipient (they accept after the tx confirms):");
+            println!("{consignment}");
+        }
+    }
     Ok(())
 }
 
@@ -1904,6 +1978,22 @@ mod tests {
                     cmd: MakerWalletCmd::Invoice {
                         contract: None,
                         amount: 100,
+                    }
+                }
+            },
+        );
+        assert_eq!(
+            Cli::parse_from([
+                "colorex", "maker", "wallet", "transfer", "--invoice", "rgb:inv", "--fee", "500",
+            ])
+            .command,
+            TopCommand::Maker {
+                cmd: MakerCmd::Wallet {
+                    cmd: MakerWalletCmd::Transfer {
+                        invoice: "rgb:inv".into(),
+                        electrum: None,
+                        fee: 500,
+                        out: None,
                     }
                 }
             },
