@@ -255,16 +255,17 @@ enum MakerCmd {
 enum OrderCmd {
     /// Create (or replace) the standing order for an (asset, side).
     Create {
-        /// `buy` (taker buys RGB) or `sell` (taker sells RGB).
-        #[arg(long)]
+        /// Quote side, from the TAKER's view: `buy` = taker buys RGB (you sell
+        /// RGB); `sell` = taker sells RGB (you buy, paying BTC).
+        #[arg(long, value_parser = ["buy", "sell"])]
         side: String,
-        /// RGB contract id. Defaults to the config's `[rgb] contract_id`.
+        /// RGB contract id. Defaults to the sole registered contract.
         #[arg(long)]
         asset: Option<String>,
-        /// Price in sats per smallest RGB unit.
+        /// Price in SATS per smallest RGB unit.
         #[arg(long)]
         price: u64,
-        /// Max single-quote size (smallest RGB units) this order backs.
+        /// Max single-quote size, in smallest RGB units, this order backs.
         #[arg(long)]
         size: u64,
         /// Auto-mirror: on each fill of this order, place the opposite-side order
