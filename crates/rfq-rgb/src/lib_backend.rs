@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use rfq_btc::{BitcoinClient, ElectrumClient};
 use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, SwapTransfer};
 
+use amplify::Wrapper as _;
+use base64::Engine as _;
 use bpstd::psbt::Psbt;
 use bpstd::signers::TestnetRefSigner;
 use bpstd::{HardenedIndex, Keychain, Network, Sats, XprivAccount, XpubDerivable};
@@ -12,8 +14,6 @@ use bpwallet::fs::FsTextStore;
 use bpwallet::hot::{SecureIo, Seed, SeedType};
 use bpwallet::{Bip43, Wallet};
 use psrgbt::PsbtConstructor;
-use amplify::Wrapper as _;
-use base64::Engine as _;
 use rgb::containers::{ConsignmentExt, FileContent, Kit, Transfer};
 use rgb::contract::FilterIncludeAll;
 use rgb::invoice::{
@@ -277,7 +277,12 @@ impl LibRgbBackend {
         let lines: Vec<String> = stock
             .contracts()
             .map_err(|e| RgbError::StashLoad(format!("list contracts: {e}")))?
-            .map(|info| format!("{}  issuer={} net={:?}", info.id, info.issuer, info.chain_net))
+            .map(|info| {
+                format!(
+                    "{}  issuer={} net={:?}",
+                    info.id, info.issuer, info.chain_net
+                )
+            })
             .collect();
         Ok(lines)
     }
@@ -331,8 +336,8 @@ impl LibRgbBackend {
     }
 
     fn load_stock(&self) -> Result<Stock, RgbError> {
-        let provider = FsBinStore::new(self.stock_path())
-            .map_err(|e| RgbError::StashLoad(e.to_string()))?;
+        let provider =
+            FsBinStore::new(self.stock_path()).map_err(|e| RgbError::StashLoad(e.to_string()))?;
         Stock::load(provider, true).map_err(|e| RgbError::StashLoad(e.to_string()))
     }
 
@@ -463,11 +468,11 @@ impl LibRgbBackend {
         let network = self.parse_network()?;
         let resolver = AnyResolver::electrum_blocking(&self.electrum_url, None)
             .map_err(|e| RgbError::StashLoad(format!("resolver: {e}")))?;
-       
+
         resolver
             .check_chain_net(chain_net_for(network))
             .map_err(|e| RgbError::StashLoad(format!("resolver chain check: {e}")))?;
-      
+
         Ok(resolver)
     }
 
@@ -565,11 +570,13 @@ impl LibRgbBackend {
 
         let stranded_inputs: Vec<swap::RecoveryInput> = stranded
             .into_iter()
-            .map(|(outpoint, value_sats, script_pubkey)| swap::RecoveryInput {
-                outpoint,
-                value_sats,
-                script_pubkey,
-            })
+            .map(
+                |(outpoint, value_sats, script_pubkey)| swap::RecoveryInput {
+                    outpoint,
+                    value_sats,
+                    script_pubkey,
+                },
+            )
             .collect();
         let fee = swap::RecoveryInput {
             outpoint: fee_input.0,
@@ -609,13 +616,12 @@ impl LibRgbBackend {
         let mut wallet = self.load_wallet()?;
         let contract_id = ContractId::from_str(&asset.id)
             .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
-        let to_input = |(outpoint, value_sats, script_pubkey): (Outpoint, u64, Vec<u8>)| {
-            swap::RecoveryInput {
+        let to_input =
+            |(outpoint, value_sats, script_pubkey): (Outpoint, u64, Vec<u8>)| swap::RecoveryInput {
                 outpoint,
                 value_sats,
                 script_pubkey,
-            }
-        };
+            };
         let (raw_tx, witness_id) = swap::build_asset_split(
             &mut wallet,
             &account,
@@ -659,9 +665,9 @@ impl LibRgbBackend {
         }
 
         let (raw_tx, witness_id) = if asset_inputs.is_empty() {
-            let (op, rungs) = btc
-                .as_ref()
-                .ok_or_else(|| RgbError::TransferBuild("split_pools: nothing to split".to_owned()))?;
+            let (op, rungs) = btc.as_ref().ok_or_else(|| {
+                RgbError::TransferBuild("split_pools: nothing to split".to_owned())
+            })?;
             swap::build_btc_split(&mut wallet, &account, op, rungs, fee_sats)?
         } else {
             let btc_source = btc.as_ref().map(|(op, _)| op);
@@ -724,7 +730,8 @@ impl LibRgbBackend {
         recipient_invoice: &str,
         fee_sats: u64,
     ) -> Result<String, RgbError> {
-        let invoice = RgbInvoice::from_str(recipient_invoice).map_err(|_| RgbError::InvalidInvoice)?;
+        let invoice =
+            RgbInvoice::from_str(recipient_invoice).map_err(|_| RgbError::InvalidInvoice)?;
         // `min_amount` is the witness-vout beneficiary dust floor; maker swap
         // invoices use blinded seals (no witness vout), so 546 is a safe nominal.
         let params = TransferParams::with(Sats(fee_sats), Sats(546));
@@ -782,8 +789,7 @@ impl LibRgbBackend {
             let account = self.load_signer()?;
             psbt.sign(&TestnetRefSigner::new(&account))
                 .map_err(|e| RgbError::TransferBuild(format!("sign: {e}")))?;
-            let (raw_tx, witness_id) =
-                swap::finalize_signed_psbt(&descriptor, &psbt.to_base64())?;
+            let (raw_tx, witness_id) = swap::finalize_signed_psbt(&descriptor, &psbt.to_base64())?;
             drop(wallet);
             (raw_tx, witness_id, transfer)
         };
@@ -845,7 +851,11 @@ impl LibRgbBackend {
     /// witness-vout outpoints. Generalizes [`Self::reconsign`] to multiple outpoints.
     /// See `docs/provenance-consignment-proposal.md`. Witness-vout (explicit
     /// `txid:vout`) seals only. Returns the base64 consignment.
-    pub fn export_provenance(&self, contract: &str, outpoints: &[String]) -> Result<String, RgbError> {
+    pub fn export_provenance(
+        &self,
+        contract: &str,
+        outpoints: &[String],
+    ) -> Result<String, RgbError> {
         let _guard = self.guard();
         let contract_id = ContractId::from_str(contract)
             .map_err(|e| RgbError::TransferBuild(format!("bad contract id {contract}: {e}")))?;
@@ -1059,7 +1069,6 @@ fn chain_net_for(network: Network) -> ChainNet {
     }
 }
 
-
 #[async_trait]
 impl RgbBackend for LibRgbBackend {
     async fn asset_spec(&self, asset: &AssetId) -> Result<(String, u8), RgbError> {
@@ -1150,13 +1159,21 @@ impl RgbBackend for LibRgbBackend {
         //    reserved RGB inputs. `change_rungs` (if any) reserves fresh k0
         //    outputs that piggyback a denomination-ladder split of the maker's
         //    RGB change onto this settlement tx.
-        let inputs =
-            swap::prepare_buy_inputs(&mut wallet, rgb_invoice, maker_rgb_utxos, change_rungs.len())?;
+        let inputs = swap::prepare_buy_inputs(
+            &mut wallet,
+            rgb_invoice,
+            maker_rgb_utxos,
+            change_rungs.len(),
+        )?;
 
         // 2. Assemble the unsigned swap tx (maker RGB + taker BTC inputs) with the
         //    commitment host; from here the witness txid is final.
-        let mut psbt =
-            swap::assemble_unsigned_psbt(&inputs, taker_btc_inputs, gross_btc_sats, actual_fee_sats)?;
+        let mut psbt = swap::assemble_unsigned_psbt(
+            &inputs,
+            taker_btc_inputs,
+            gross_btc_sats,
+            actual_fee_sats,
+        )?;
 
         // 3. Build the RGB transition: pay the taker's seal (blinded or
         //    witness-vout), change back to the maker (split into `change_rungs`
@@ -1166,13 +1183,8 @@ impl RgbBackend for LibRgbBackend {
             swap::build_buy_transition(&wallet, &inputs, &psbt, amount, change_rungs)?;
 
         // 4. Embed + commit the transition and emit the witness-extended consignment.
-        let (transfer, witness_id) = swap::commit_and_consign(
-            &mut wallet,
-            &mut psbt,
-            batch,
-            inputs.contract_id,
-            delivery,
-        )?;
+        let (transfer, witness_id) =
+            swap::commit_and_consign(&mut wallet, &mut psbt, batch, inputs.contract_id, delivery)?;
 
         // 5. Sign the maker's inputs (after commit — U4); taker BTC inputs stay open.
         swap::sign_maker_inputs(&mut psbt, &account)?;
@@ -1303,10 +1315,7 @@ impl RgbBackend for LibRgbBackend {
         Ok(builder.finish().to_string())
     }
 
-    async fn parse_maker_invoice(
-        &self,
-        invoice: &str,
-    ) -> Result<MakerInvoiceParts, RgbError> {
+    async fn parse_maker_invoice(&self, invoice: &str) -> Result<MakerInvoiceParts, RgbError> {
         // The maker minted this invoice via `create_invoice`; we only need its
         // contract id + amount. The beneficiary seal is irrelevant — the maker
         // routes its own receive to a fresh witness-vout output in
@@ -1321,7 +1330,10 @@ impl RgbBackend for LibRgbBackend {
             Some(InvoiceState::Amount(a)) => Some(*a.as_inner()),
             _ => None,
         };
-        Ok(MakerInvoiceParts { contract_id, amount })
+        Ok(MakerInvoiceParts {
+            contract_id,
+            amount,
+        })
     }
 
     async fn validate_incoming_consignment(
@@ -1481,13 +1493,8 @@ impl RgbBackend for LibRgbBackend {
         // 4. Embed + commit the transition and emit the witness-extended
         //    consignment to the taker's change seal so it can accept its RGB
         //    change post-broadcast (with no surplus the consignment is dropped).
-        let (transfer, witness_id) = swap::commit_and_consign(
-            &mut wallet,
-            &mut psbt,
-            batch,
-            inputs.contract_id,
-            delivery,
-        )?;
+        let (transfer, witness_id) =
+            swap::commit_and_consign(&mut wallet, &mut psbt, batch, inputs.contract_id, delivery)?;
 
         // 5. Sign the maker's BTC inputs (after commit — U4); taker RGB inputs
         //    stay open for /sign.

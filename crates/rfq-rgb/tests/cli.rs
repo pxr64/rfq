@@ -171,7 +171,16 @@ async fn create_swap_psbt_buy_produces_psbt_and_consignment() {
     );
 
     let transfer = backend
-        .create_swap_psbt_buy(&invoice, 100, &maker_outpoints, &[], "bcrt1qtaker", 1_000, 100, &[])
+        .create_swap_psbt_buy(
+            &invoice,
+            100,
+            &maker_outpoints,
+            &[],
+            "bcrt1qtaker",
+            1_000,
+            100,
+            &[],
+        )
         .await
         .expect("create_swap_psbt_buy should compose a swap PSBT");
 
@@ -186,7 +195,11 @@ async fn create_swap_psbt_buy_produces_psbt_and_consignment() {
     let wt = transfer
         .expected_witness_txid
         .expect("declared-funding buy commits a stable witness txid");
-    assert_eq!(wt.len(), 64, "witness txid should be 64 hex chars, got {wt:?}");
+    assert_eq!(
+        wt.len(),
+        64,
+        "witness txid should be 64 hex chars, got {wt:?}"
+    );
 }
 
 #[tokio::test]
@@ -279,7 +292,11 @@ async fn create_swap_psbt_sell_produces_psbt() {
     let wt = transfer
         .expected_witness_txid
         .expect("declared-funding sell commits a stable witness txid");
-    assert_eq!(wt.len(), 64, "witness txid should be 64 hex chars, got {wt:?}");
+    assert_eq!(
+        wt.len(),
+        64,
+        "witness txid should be 64 hex chars, got {wt:?}"
+    );
 }
 
 #[tokio::test]
@@ -303,7 +320,16 @@ async fn finalize_after_taker_sign_returns_extractable_witness_tx() {
         .expect("list_inventory_utxos");
     let maker_outpoints: Vec<Outpoint> = utxos.iter().map(|u| u.outpoint.clone()).collect();
     let transfer = backend
-        .create_swap_psbt_buy(&invoice, 100, &maker_outpoints, &[], "bcrt1qtaker", 1_000, 100, &[])
+        .create_swap_psbt_buy(
+            &invoice,
+            100,
+            &maker_outpoints,
+            &[],
+            "bcrt1qtaker",
+            1_000,
+            100,
+            &[],
+        )
         .await
         .expect("create_swap_psbt_buy should compose a swap PSBT");
 
@@ -631,9 +657,17 @@ async fn sell_round_trip_two_backends_broadcasts() {
             // resolves the value/spk from the wallet via the maker's
             // descriptor in `resolve_maker_btc_inputs` /
             // `enrich_psbt_input`. The `TxOut` here is a placeholder.
-            TxOut { value_sats: 0, script_pubkey: vec![] },
+            TxOut {
+                value_sats: 0,
+                script_pubkey: vec![],
+            },
         );
-        (maker_invoice, parts, maker_btc_input, stack.taker_payout_addr().to_owned())
+        (
+            maker_invoice,
+            parts,
+            maker_btc_input,
+            stack.taker_payout_addr().to_owned(),
+        )
         // drop MakerGuard → release lock for the taker
     };
 

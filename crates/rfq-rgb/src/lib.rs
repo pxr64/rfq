@@ -159,10 +159,7 @@ pub trait RgbBackend: Send + Sync {
     /// `ContractId` + `SecretSeal` into the swap-PSBT call without depending
     /// on `rgb` directly. Mock backends may fake the components from the
     /// invoice string.
-    async fn parse_maker_invoice(
-        &self,
-        invoice: &str,
-    ) -> Result<MakerInvoiceParts, RgbError>;
+    async fn parse_maker_invoice(&self, invoice: &str) -> Result<MakerInvoiceParts, RgbError>;
 
     /// Maker-side, sell flow: validate a taker-submitted consignment against
     /// the maker's expected contract and return the RGB input outpoints +
@@ -343,17 +340,14 @@ impl RgbBackend for MockRgbBackend {
         Ok(format!("rgb:mock-invoice:{}:{amount}:{nonce}", asset.id))
     }
 
-    async fn parse_maker_invoice(
-        &self,
-        invoice: &str,
-    ) -> Result<MakerInvoiceParts, RgbError> {
+    async fn parse_maker_invoice(&self, invoice: &str) -> Result<MakerInvoiceParts, RgbError> {
         // Parse `rgb:mock-invoice:<asset_id>:<amount>:<nonce>`. The typed
         // ContractId/SecretSeal are derived deterministically from the
         // invoice string (just hashing) — real RGB cryptography isn't needed
         // for the mock's downstream consumers; only round-trip stability is.
-        let rest = invoice.strip_prefix("rgb:mock-invoice:").ok_or_else(|| {
-            RgbError::TransferBuild(format!("not a mock invoice: {invoice}"))
-        })?;
+        let rest = invoice
+            .strip_prefix("rgb:mock-invoice:")
+            .ok_or_else(|| RgbError::TransferBuild(format!("not a mock invoice: {invoice}")))?;
         let mut parts = rest.splitn(3, ':');
         let _asset_id = parts
             .next()
@@ -387,9 +381,7 @@ impl RgbBackend for MockRgbBackend {
         }
         let body = consignment_base64
             .strip_prefix(MOCK_SELL_CONSIGNMENT_PREFIX)
-            .ok_or_else(|| {
-                RgbError::TransferBuild("not a sell-side consignment".to_owned())
-            })?;
+            .ok_or_else(|| RgbError::TransferBuild("not a sell-side consignment".to_owned()))?;
 
         let mut amount = None;
         let mut outpoints: Vec<Outpoint> = Vec::new();
@@ -402,9 +394,10 @@ impl RgbBackend for MockRgbBackend {
                 );
             } else if let Some(v) = field.strip_prefix("outpoints=") {
                 for op in v.split(',').filter(|s| !s.is_empty()) {
-                    outpoints.push(op.parse::<Outpoint>().map_err(|_| {
-                        RgbError::TransferBuild(format!("bad outpoint `{op}`"))
-                    })?);
+                    outpoints
+                        .push(op.parse::<Outpoint>().map_err(|_| {
+                            RgbError::TransferBuild(format!("bad outpoint `{op}`"))
+                        })?);
                 }
             }
         }

@@ -518,10 +518,7 @@ impl<'a> TakerGuard<'a> {
     /// become visible to `spare_btc_input` / `lookup_prevout`. Mirrors
     /// `LibRgbBackend::sync_wallet` on the maker side.
     pub async fn sync_wallet(&self) -> Result<(), String> {
-        self.taker()
-            .sync_wallet()
-            .await
-            .map_err(|e| e.to_string())
+        self.taker().sync_wallet().await.map_err(|e| e.to_string())
     }
 
     /// The production [`Taker`] backing this guard. Every op delegates here;
@@ -916,7 +913,12 @@ fn create_role_wallet(
         &stash_dir,
         role,
         electrum_url,
-        &["create", "--tapret-key-only", &descriptor_with_terminal, role],
+        &[
+            "create",
+            "--tapret-key-only",
+            &descriptor_with_terminal,
+            role,
+        ],
     )?;
 
     Ok(RoleHandles {
