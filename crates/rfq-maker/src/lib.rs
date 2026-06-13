@@ -16,8 +16,8 @@ use rfq_store::{
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetInfo, BitcoinNetwork, BtcInventoryStatus, BtcInventoryUtxo,
     ExtendedInventorySnapshot, InventoryError, InventorySnapshot, InventoryStatus, InventoryUtxo,
-    MakerId, OrderPrice, Outpoint, Quote, QuoteId, QuoteRequest, RgbInventoryUtxo, ReservationId,
-    SettlementIntent, SettlementStatus, Side, SwapLeg,
+    MakerId, OrderPrice, Outpoint, Quote, QuoteId, QuoteRequest, RfqId, RgbInventoryUtxo,
+    ReservationId, SettlementIntent, SettlementStatus, Side, SwapLeg,
 };
 use arc_swap::ArcSwap;
 use tokio::sync::RwLock;
@@ -117,6 +117,238 @@ impl RebalancePlan {
     }
 }
 
+/// Every RGB-bearing output carries exactly this much BTC dust, independent of
+/// the RGB amount it holds — a 1-unit rung and a 1M-unit rung both anchor on 546
+/// sats. Mirrors `swap::SEAL_ANCHOR_SATS`; used by the rebalance budget.
+pub const REBALANCE_ANCHOR_SATS: u64 = 546;
+
+/// Sentinel `RfqId`/`QuoteId` prefix for the internal reservations the rebalance
+/// executor makes. Never collides with broker-issued ids, so the quoting path
+/// and the rebalancer can't fight over the same UTXO.
+const REBALANCE_RFQ_ID: &str = "__rebalance__";
+
+/// Smallest *spendable BTC* piece the BTC ladder will create (and the floor for
+/// split change — sub-floor change is folded into the fee). Distinct from the
+/// 546-sat anchor: that's dust on an RGB-bearing output; this is the minimum for
+/// a plain BTC UTXO the maker pays sell-side takers from.
+pub const DEFAULT_BTC_MIN_PIECE_SATS: u64 = 1000;
+
+/// RGB ladder `min_piece` default — the transferred asset amount doesn't affect
+/// cost (every rung anchors on 546 sats regardless), so any positive amount is a
+/// valid rung.
+pub const DEFAULT_RGB_MIN_PIECE: u64 = 1;
+
+/// A target distribution of UTXO values, largest→smallest, so coin selection and
+/// tx-building stay cheap. Geometric: tier `i` targets `base * ratio^i` and wants
+/// `copies` pieces of it; tiers whose value falls below `min_piece` are dropped.
+/// `ratio` is expected in `(0, 1)` (a halving ladder is `0.5`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LadderSpec {
+    pub base: u64,
+    pub ratio: f64,
+    pub tiers: u32,
+    pub copies: u32,
+    pub min_piece: u64,
+}
+
+impl LadderSpec {
+    /// Expand into the desired multiset of rung values, largest first — `copies`
+    /// of each tier whose value is `>= min_piece` (and non-zero).
+    pub fn target_rungs(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut v = self.base as f64;
+        for _ in 0..self.tiers {
+            let rung = v as u64;
+            if rung >= self.min_piece && rung > 0 {
+                for _ in 0..self.copies {
+                    out.push(rung);
+                }
+            }
+            v *= self.ratio;
+        }
+        out
+    }
+}
+
+/// One contract's rungs to carve from a single fat source UTXO.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssetSplit {
+    pub asset: AssetId,
+    pub source: Outpoint,
+    /// RGB amount held by the source allocation.
+    pub source_amount: u64,
+    /// The source UTXO's own BTC value — funds its share of the anchor outputs.
+    pub source_btc_sats: u64,
+    /// RGB amounts to carve, largest→smallest (remainder = `source_amount - Σ`).
+    pub rungs: Vec<u64>,
+}
+
+/// The BTC pool's rungs to carve from a single fat BTC source UTXO.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BtcSplit {
+    pub source: Outpoint,
+    pub source_sats: u64,
+    /// Sats to carve, largest→smallest.
+    pub rungs: Vec<u64>,
+}
+
+/// The combined plan for one rebalance pass: every asset's rungs + the BTC
+/// rungs, carved by a single transaction with one fee and one tapret commitment.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RebalanceTx {
+    pub assets: Vec<AssetSplit>,
+    pub btc: Option<BtcSplit>,
+    pub fee_sats: u64,
+    /// BTC the tx must source: `fee + anchor·(rgb outputs) + Σ(btc rungs)`.
+    pub btc_needed: u64,
+}
+
+/// Greedily match available pieces to target rungs (a piece covers a target iff
+/// `piece >= target`). Returns the targets left UNcovered — the rungs to mint.
+/// Classic "assign cookies" greedy: sort both ascending, satisfy the smallest
+/// target with the smallest sufficient piece. Optimal for maximizing coverage.
+fn ladder_deficit(available: &[u64], targets: &[u64]) -> Vec<u64> {
+    let mut pieces: Vec<u64> = available.to_vec();
+    pieces.sort_unstable();
+    let mut tgts: Vec<u64> = targets.to_vec();
+    tgts.sort_unstable();
+    let mut deficit = Vec::new();
+    let mut pi = 0usize;
+    for t in tgts {
+        while pi < pieces.len() && pieces[pi] < t {
+            pi += 1;
+        }
+        if pi < pieces.len() {
+            pi += 1; // consume this piece for the target
+        } else {
+            deficit.push(t);
+        }
+    }
+    deficit
+}
+
+/// Decide whether `available` `(outpoint, value)` needs splitting toward `spec`,
+/// and if so return the fattest source to cut plus the rung amounts to carve
+/// (largest first). Pure & idempotent — feeding the post-split distribution back
+/// returns `None`. At most ONE source per call (bounds tx cost; the loop
+/// converges over successive passes). Works for both RGB (asset units) and BTC
+/// (sats) since it's value-agnostic.
+pub fn plan_ladder(
+    available: &[(Outpoint, u64)],
+    spec: &LadderSpec,
+) -> Option<(Outpoint, u64, Vec<u64>)> {
+    let targets = spec.target_rungs();
+    if targets.is_empty() {
+        return None;
+    }
+    let values: Vec<u64> = available.iter().map(|(_, v)| *v).collect();
+    let mut deficit = ladder_deficit(&values, &targets);
+    if deficit.is_empty() {
+        return None;
+    }
+    // Source = the fattest available UTXO (the reserve we cut rungs from).
+    let (source_op, source_val) = available.iter().cloned().max_by_key(|(_, v)| *v)?;
+    // Carve deficit rungs largest-first that fit, always leaving a positive
+    // remainder (>= min_piece) so the host output carries a real allocation.
+    deficit.sort_unstable_by(|a, b| b.cmp(a));
+    let reserve = spec.min_piece.max(1);
+    let mut rungs = Vec::new();
+    let mut remaining = source_val;
+    for d in deficit {
+        if remaining >= d.saturating_add(reserve) {
+            rungs.push(d);
+            remaining -= d;
+        }
+    }
+    if rungs.is_empty() {
+        return None; // source too small to carve anything useful
+    }
+    Some((source_op, source_val, rungs))
+}
+
+/// BTC the rebalance tx must source for a given set of split plans.
+fn required_btc(assets: &[AssetSplit], btc: &Option<BtcSplit>, fee_sats: u64) -> u64 {
+    // Each asset emits one output per rung + one remainder output, each needing
+    // an anchor's worth of dust.
+    let rgb_outputs: u64 = assets.iter().map(|a| a.rungs.len() as u64 + 1).sum();
+    let btc_rungs: u64 = btc.as_ref().map(|b| b.rungs.iter().sum()).unwrap_or(0);
+    fee_sats
+        .saturating_add(REBALANCE_ANCHOR_SATS.saturating_mul(rgb_outputs))
+        .saturating_add(btc_rungs)
+}
+
+/// Drop one rung to shrink the BTC requirement. RGB rungs go first (smallest
+/// value across all assets — each frees one anchor while keeping the big, useful
+/// pieces); once no RGB rungs remain, the smallest BTC rung goes. Empty asset /
+/// BTC plans are removed. Returns `false` when nothing is left to drop.
+fn scale_down(assets: &mut Vec<AssetSplit>, btc: &mut Option<BtcSplit>) -> bool {
+    let mut smallest: Option<(usize, usize, u64)> = None; // (asset, rung, value)
+    for (ai, a) in assets.iter().enumerate() {
+        for (ri, &r) in a.rungs.iter().enumerate() {
+            if smallest.is_none_or(|(_, _, sv)| r < sv) {
+                smallest = Some((ai, ri, r));
+            }
+        }
+    }
+    if let Some((ai, ri, _)) = smallest {
+        assets[ai].rungs.remove(ri);
+        assets.retain(|a| !a.rungs.is_empty());
+        return true;
+    }
+    if let Some(b) = btc {
+        if let Some((ri, _)) = b.rungs.iter().enumerate().min_by_key(|(_, v)| **v) {
+            b.rungs.remove(ri);
+            if b.rungs.is_empty() {
+                *btc = None;
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Combine per-asset + BTC split plans into one rebalance-tx plan under a single
+/// BTC budget. `btc_available_sats` is what the executor will commit to fund the
+/// tx (the BTC source plus any extra fee inputs). When the budget is short, rungs
+/// are dropped (RGB first — see [`scale_down`]) until it fits; if it can't even
+/// fund the fee + remainders, returns `None` (caller warns & skips — the maker
+/// can't mint BTC). Returns `None` when there's nothing to split.
+pub fn assemble_rebalance_tx(
+    mut assets: Vec<AssetSplit>,
+    mut btc: Option<BtcSplit>,
+    btc_available_sats: u64,
+    fee_sats: u64,
+) -> Option<RebalanceTx> {
+    assets.retain(|a| !a.rungs.is_empty());
+    if btc.as_ref().is_some_and(|b| b.rungs.is_empty()) {
+        btc = None;
+    }
+    if assets.is_empty() && btc.is_none() {
+        return None;
+    }
+    loop {
+        if assets.is_empty() && btc.is_none() {
+            return None; // scaled everything away — nothing left to split
+        }
+        // Recompute each pass: dropping a whole asset removes its source UTXO
+        // from the inputs, so its `source_btc_sats` no longer helps fund anchors.
+        let rgb_source_sats: u64 = assets.iter().map(|a| a.source_btc_sats).sum();
+        let avail = btc_available_sats.saturating_add(rgb_source_sats);
+        let need = required_btc(&assets, &btc, fee_sats);
+        if avail >= need {
+            return Some(RebalanceTx {
+                assets,
+                btc,
+                fee_sats,
+                btc_needed: need,
+            });
+        }
+        if !scale_down(&mut assets, &mut btc) {
+            return None;
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RebalanceTrigger {
     HighFragmentation { score: f64, threshold: f64 },
@@ -160,6 +392,30 @@ const MAX_SWAP_FEERATE_SAT_VB: u64 = 1000;
 /// unreliable on low-activity chains — signet returned ~1684 sat/vByte, which
 /// blew a swap fee up to ~0.003 BTC. Real fees there are ~1 sat/vByte, so cap low.
 const TESTNET_SWAP_FEERATE_CAP_SAT_VB: u64 = 5;
+/// Confirmation target for a rebalance tx — next block, so the fresh ladder
+/// pieces become usable promptly (the rebalancer isn't fee-sensitive about a
+/// background self-send, within the absolute cap the operator sets).
+pub const REBALANCE_CONF_TARGET_BLOCKS: u32 = 1;
+
+/// Clamp a raw `estimatesmartfee` result (sat/vByte) into the sane band a
+/// rebalance tx uses: floored at 1 (so a missing estimate can't yield a
+/// `minrelaytxfee`-rejected zero-fee tx) and capped per network (mainnet vs the
+/// low test-net ceiling). Shared by the daemon executor and the `rebalance` CLI.
+pub fn clamp_next_block_feerate(raw_estimate: u64, network: &BitcoinNetwork) -> u64 {
+    let cap = match network {
+        BitcoinNetwork::Mainnet => MAX_SWAP_FEERATE_SAT_VB,
+        _ => TESTNET_SWAP_FEERATE_CAP_SAT_VB,
+    };
+    raw_estimate.clamp(MIN_SWAP_FEERATE_SAT_VB, cap)
+}
+
+/// Rough vsize (vBytes) of an all-P2TR keyspend rebalance tx with the given
+/// input/output counts: ~11 tx overhead + ~58/input + ~43/output. The tapret
+/// commitment rides the host output's taproot key (keyspend), so it needs no
+/// extra witness budget. Multiplied by the next-block feerate to size the fee.
+pub fn estimate_rebalance_vbytes(num_inputs: usize, num_outputs: usize) -> u64 {
+    11 + num_inputs as u64 * 58 + num_outputs as u64 * 43
+}
 /// Upper bound on reservation retries under contention. With outpoint
 /// exclusion on each retry, the effective bound is `min(this, available_utxo_count)`
 /// — the loop exits via the selector's Insufficient branch once exclusions
@@ -716,6 +972,146 @@ impl Maker {
         }
 
         plan
+    }
+
+    // --- rebalance executor support ---------------------------------------
+    //
+    // Reservations made for an internal rebalance split reuse the quote-bound
+    // reserve path under a sentinel rfq id (no store-schema change). The maker's
+    // quoting path never collides with it — real ids come from broker requests.
+
+    /// `(outpoint, rgb_amount, btc_sats)` for every Available allocation of
+    /// `asset` — `plan_ladder` consumes the first two, `AssetSplit` the sats.
+    pub async fn available_rgb_for(&self, asset: &AssetId) -> Vec<(Outpoint, u64, u64)> {
+        self.store.release_expired_reservations(now_ms()).await;
+        self.store
+            .list_available(asset)
+            .await
+            .into_iter()
+            .map(|u| (u.outpoint, u.amount, u.btc_sats))
+            .collect()
+    }
+
+    /// `(outpoint, sats)` for every Available BTC UTXO.
+    pub async fn available_btc(&self) -> Vec<(Outpoint, u64)> {
+        self.btc_store.release_expired_reservations(now_ms()).await;
+        self.btc_store
+            .list_available()
+            .await
+            .into_iter()
+            .map(|u| (u.outpoint, u.value_sats))
+            .collect()
+    }
+
+    /// Atomically claim `source` (an RGB allocation) for an internal split so the
+    /// quoting path won't select it mid-rebalance. Long TTL — the source must stay
+    /// reserved until its split tx confirms (then `mark_*_rebalance_pending` +
+    /// `sweep_confirmations` retire it).
+    pub async fn reserve_rgb_for_rebalance(
+        &self,
+        source: Outpoint,
+    ) -> Result<ReservationId, InventoryError> {
+        let now = now_ms();
+        self.store
+            .reserve_utxos(
+                &RfqId(REBALANCE_RFQ_ID.to_owned()),
+                &QuoteId(format!("{REBALANCE_RFQ_ID}:{}", Uuid::new_v4())),
+                &[source],
+                now + BROADCAST_CONFIRM_TTL_MS,
+                now,
+            )
+            .await
+    }
+
+    /// BTC analogue of [`Self::reserve_rgb_for_rebalance`].
+    pub async fn reserve_btc_for_rebalance(
+        &self,
+        source: Outpoint,
+    ) -> Result<ReservationId, rfq_types::BtcInventoryError> {
+        let now = now_ms();
+        self.btc_store
+            .reserve(
+                &RfqId(REBALANCE_RFQ_ID.to_owned()),
+                &QuoteId(format!("{REBALANCE_RFQ_ID}:{}", Uuid::new_v4())),
+                &[source],
+                now + BROADCAST_CONFIRM_TTL_MS,
+                now,
+            )
+            .await
+    }
+
+    /// Move a reserved RGB source to `PendingBitcoinConfirm` after the split tx
+    /// broadcasts, so `sweep_confirmations` retires it once the tx confirms.
+    pub async fn mark_rgb_rebalance_pending(&self, reservation_id: &ReservationId, txid: String) {
+        let _ = self
+            .store
+            .mark_pending_bitcoin_confirm(reservation_id, txid, now_ms())
+            .await;
+    }
+
+    /// BTC analogue of [`Self::mark_rgb_rebalance_pending`].
+    pub async fn mark_btc_rebalance_pending(&self, reservation_id: &ReservationId, txid: String) {
+        let _ = self
+            .btc_store
+            .mark_pending_bitcoin_confirm(reservation_id, txid, now_ms())
+            .await;
+    }
+
+    /// Release rebalance reservations (RGB then BTC) back to Available — called
+    /// when the split fails to build or broadcast, before anything was marked
+    /// pending.
+    pub async fn release_rebalance(
+        &self,
+        rgb: &[ReservationId],
+        btc: Option<&ReservationId>,
+    ) {
+        let now = now_ms();
+        for r in rgb {
+            let _ = self.store.release_reservation(r, now).await;
+        }
+        if let Some(r) = btc {
+            let _ = self.btc_store.release_reservation(r, now).await;
+        }
+    }
+
+    /// True while a previously-launched rebalance split is still settling — its
+    /// RGB source(s) are no longer Available but not yet `Spent`. Lets the loop
+    /// skip planning so it doesn't pile a second split on top of an unconfirmed
+    /// one. `false` once every source reads `Spent` (or is gone).
+    pub async fn rgb_sources_settled(&self, sources: &[Outpoint]) -> bool {
+        for op in sources {
+            match self.store.get(op).await {
+                Some(u) => {
+                    if !matches!(u.status, InventoryStatus::Spent { .. }) {
+                        return false;
+                    }
+                }
+                None => continue,
+            }
+        }
+        true
+    }
+
+    /// Next-block feerate (sat/vByte) for a rebalance tx, clamped to the same
+    /// sane band as swaps so a missing estimate can't zero-fee the tx (it would
+    /// be rejected under `minrelaytxfee`) and a wild one can't overpay. The
+    /// executor multiplies this by the tx's estimated vsize, then applies the
+    /// operator's absolute fee cap.
+    pub async fn next_block_feerate(&self, network: &BitcoinNetwork) -> u64 {
+        let raw = self
+            .bitcoin_client
+            .estimate_feerate(REBALANCE_CONF_TARGET_BLOCKS)
+            .await
+            .unwrap_or(0);
+        clamp_next_block_feerate(raw, network)
+    }
+
+    /// Broadcast a finished rebalance tx via the maker's bitcoin client.
+    pub async fn broadcast_rebalance(&self, raw_tx: &[u8]) -> Result<String, RouterError> {
+        self.bitcoin_client
+            .broadcast(raw_tx)
+            .await
+            .map_err(|e| RouterError::Maker(format!("rebalance broadcast: {e}")))
     }
 
     /// Sell-side `request_quote`: the maker reserves BTC to pay the taker and
@@ -2986,5 +3382,203 @@ mod tests {
         let ext = maker.extended_inventory_summary().await;
         let derived: InventorySnapshot = (&ext).into();
         assert_eq!(legacy, derived);
+    }
+
+    // --- rebalance ladder planner (pure) ---
+
+    fn ladder(base: u64, ratio: f64, tiers: u32, copies: u32, min_piece: u64) -> LadderSpec {
+        LadderSpec {
+            base,
+            ratio,
+            tiers,
+            copies,
+            min_piece,
+        }
+    }
+
+    /// `(synth_outpoint(i), value)` pairs for the planner's `available` input.
+    fn avail(values: &[u64]) -> Vec<(Outpoint, u64)> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (synth_outpoint(i), v))
+            .collect()
+    }
+
+    #[test]
+    fn ladder_target_rungs_expands_geometric_largest_first() {
+        // 100 → 50 → 25 → 12 (12.5 truncated), two copies each.
+        let rungs = ladder(100, 0.5, 4, 2, 1).target_rungs();
+        assert_eq!(rungs, vec![100, 100, 50, 50, 25, 25, 12, 12]);
+    }
+
+    #[test]
+    fn ladder_target_rungs_drops_subfloor_tiers() {
+        // min_piece 30 prunes the 25 and 12 tiers.
+        let rungs = ladder(100, 0.5, 4, 1, 30).target_rungs();
+        assert_eq!(rungs, vec![100, 50]);
+    }
+
+    #[test]
+    fn ladder_deficit_reports_uncovered_targets() {
+        // Pieces [100, 1000] cover two targets; [50,50,100,100] remain.
+        let deficit = ladder_deficit(&[100, 1000], &[100, 100, 50, 50, 25, 25]);
+        let mut d = deficit;
+        d.sort_unstable();
+        assert_eq!(d, vec![50, 50, 100, 100]);
+    }
+
+    #[test]
+    fn plan_ladder_none_when_already_covered() {
+        let spec = ladder(100, 0.5, 3, 1, 1); // targets [100,50,25]
+        assert!(plan_ladder(&avail(&[100, 50, 25]), &spec).is_none());
+    }
+
+    #[test]
+    fn plan_ladder_splits_one_fat_utxo_into_rungs() {
+        let spec = ladder(100, 0.5, 3, 1, 1); // targets [100,50,25]
+        // The lone 1000 covers the smallest target (25); the 100 and 50 tiers are
+        // the deficit, carved off the fat UTXO largest-first (remainder 850).
+        let (src, val, rungs) = plan_ladder(&avail(&[1000]), &spec).expect("a split");
+        assert_eq!(src, synth_outpoint(0));
+        assert_eq!(val, 1000);
+        assert_eq!(rungs, vec![100, 50]);
+    }
+
+    #[test]
+    fn plan_ladder_picks_the_fattest_source() {
+        let spec = ladder(100, 0.5, 3, 2, 1);
+        // index 1 holds the 1000; it must be chosen over the 100.
+        let (src, _, _) = plan_ladder(&avail(&[100, 1000]), &spec).expect("a split");
+        assert_eq!(src, synth_outpoint(1));
+    }
+
+    #[test]
+    fn plan_ladder_stops_when_source_too_small_for_any_rung() {
+        // targets [100,50]; a lone 60 covers 50 but can't fund a 100 rung while
+        // leaving the min_piece remainder.
+        let spec = ladder(100, 0.5, 2, 1, 50);
+        assert!(plan_ladder(&avail(&[60]), &spec).is_none());
+    }
+
+    #[test]
+    fn plan_ladder_is_idempotent_after_a_split() {
+        let spec = ladder(100, 0.5, 3, 1, 1);
+        // Feed back the post-split distribution: remainder 850 + rungs 100, 50.
+        assert!(plan_ladder(&avail(&[850, 100, 50]), &spec).is_none());
+    }
+
+    fn asset_split(rungs: Vec<u64>, source_btc_sats: u64) -> AssetSplit {
+        AssetSplit {
+            asset: asset(),
+            source: synth_outpoint(0),
+            source_amount: 10_000,
+            source_btc_sats,
+            rungs,
+        }
+    }
+
+    #[test]
+    fn assemble_returns_plan_with_btc_needed_when_budget_fits() {
+        let plan = assemble_rebalance_tx(vec![asset_split(vec![50, 25], 546)], None, 100_000, 300)
+            .expect("a plan");
+        // fee 300 + anchor 546 * (2 rungs + 1 remainder) = 300 + 1638.
+        assert_eq!(plan.btc_needed, 300 + 546 * 3);
+        assert_eq!(plan.assets[0].rungs, vec![50, 25]);
+        assert!(plan.btc.is_none());
+    }
+
+    #[test]
+    fn assemble_scales_down_rgb_rungs_when_budget_short() {
+        // avail = 1000 (pool) + 546 (source) = 1546. Full ladder of 3 rungs needs
+        // 100 + 546*4 = 2284 → drop smallest rung (12) → 1738 → still short → drop
+        // 25 → 100 + 546*2 = 1192 ≤ 1546. One rung survives.
+        let plan = assemble_rebalance_tx(vec![asset_split(vec![50, 25, 12], 546)], None, 1000, 100)
+            .expect("a scaled-down plan");
+        assert_eq!(plan.assets[0].rungs, vec![50]);
+        assert_eq!(plan.btc_needed, 100 + 546 * 2);
+    }
+
+    #[test]
+    fn assemble_none_when_budget_cannot_even_fund_fee() {
+        // Zero pool, one 546-sat source, fee 1000: never fits → everything dropped.
+        assert!(assemble_rebalance_tx(vec![asset_split(vec![50], 546)], None, 0, 1000).is_none());
+    }
+
+    #[test]
+    fn assemble_none_when_nothing_to_split() {
+        assert!(assemble_rebalance_tx(vec![], None, 100_000, 300).is_none());
+        // an empty-rung asset is stripped, leaving nothing.
+        assert!(assemble_rebalance_tx(vec![asset_split(vec![], 546)], None, 100_000, 300).is_none());
+    }
+
+    #[test]
+    fn assemble_keeps_btc_rungs_when_they_fit() {
+        let btc = BtcSplit {
+            source: synth_outpoint(9),
+            source_sats: 100_000,
+            rungs: vec![50_000, 25_000],
+        };
+        let plan = assemble_rebalance_tx(vec![], Some(btc), 100_000, 300).expect("a plan");
+        let b = plan.btc.expect("btc split kept");
+        assert_eq!(b.rungs, vec![50_000, 25_000]);
+        // fee 300 + 0 rgb outputs + (50_000 + 25_000) btc rungs.
+        assert_eq!(plan.btc_needed, 300 + 75_000);
+    }
+
+    #[test]
+    fn rebalance_vbytes_sizes_all_p2tr_tx() {
+        // 2 inputs + 6 outputs: 11 + 2*58 + 6*43.
+        assert_eq!(estimate_rebalance_vbytes(2, 6), 11 + 116 + 258);
+        assert_eq!(estimate_rebalance_vbytes(1, 2), 11 + 58 + 86);
+    }
+
+    #[test]
+    fn feerate_clamp_floors_and_caps_per_network() {
+        use rfq_types::BitcoinNetwork::*;
+        // A missing/zero estimate floors at 1 (so the tx clears minrelaytxfee).
+        assert_eq!(clamp_next_block_feerate(0, &Regtest), 1);
+        // Test nets cap low (5); a wild estimate can't blow the fee up.
+        assert_eq!(clamp_next_block_feerate(99_999, &Signet), 5);
+        assert_eq!(clamp_next_block_feerate(99_999, &Regtest), 5);
+        // Mainnet caps at 1000; an in-band estimate passes through.
+        assert_eq!(clamp_next_block_feerate(99_999, &Mainnet), 1000);
+        assert_eq!(clamp_next_block_feerate(42, &Mainnet), 42);
+    }
+
+    #[test]
+    fn assemble_scales_down_btc_rungs_when_source_too_small() {
+        // No RGB; a 60k BTC source can't carve [50k, 25k] + 300 fee → drop the
+        // smallest BTC rung (25k) so 50k + 300 fits.
+        let btc = BtcSplit {
+            source: synth_outpoint(9),
+            source_sats: 60_000,
+            rungs: vec![50_000, 25_000],
+        };
+        let plan = assemble_rebalance_tx(vec![], Some(btc), 60_000, 300).expect("a scaled plan");
+        let b = plan.btc.expect("btc split survives");
+        assert_eq!(b.rungs, vec![50_000], "smallest BTC rung dropped to fit the source");
+        assert_eq!(plan.btc_needed, 300 + 50_000);
+    }
+
+    #[tokio::test]
+    async fn reserve_for_rebalance_removes_source_from_available() {
+        // The primary anti-thrash guard: a source claimed for a split immediately
+        // leaves Available, so the planner can't re-pick it next tick.
+        let maker = maker_with_utxos(vec![utxo_with_amount(0, 1000), utxo_with_amount(1, 500)]);
+        assert_eq!(maker.available_rgb_for(&asset()).await.len(), 2);
+
+        let source = synth_outpoint(0);
+        maker
+            .reserve_rgb_for_rebalance(source.clone())
+            .await
+            .expect("reserve source for rebalance");
+
+        let after = maker.available_rgb_for(&asset()).await;
+        assert_eq!(after.len(), 1, "reserved source drops out of Available");
+        assert!(
+            !after.iter().any(|(o, _, _)| *o == source),
+            "the reserved source is gone from Available"
+        );
     }
 }

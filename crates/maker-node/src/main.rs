@@ -5,7 +5,7 @@ use maker_node::{
     accept_inventory_consignment, broker_client, build_maker, build_runtime,
     create_inventory_invoice, init, maker_app, now_ms, orders, fetch_consignment, output,
     reconsign_consignment, spawn_chain_observer_loop, spawn_cleanup_loop, spawn_order_reload_loop,
-    spawn_rebalance_loop, spawn_strategy_loop, MakerNodeConfig,
+    spawn_rebalance_executor_loop, spawn_rebalance_loop, spawn_strategy_loop, MakerNodeConfig,
 };
 use rfq_wallet::{resolve_named, resolve_wallet, WalletConfig, WalletInput};
 use rfq_rgb::RgbBackend;
@@ -352,6 +352,26 @@ enum MakerWalletCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Rebalance UTXOs into a denomination ladder: split each asset + the BTC
+    /// pool into large→small pieces so coin selection stays cheap. Builds ONE tx
+    /// for all of it. Run with the daemon stopped (or rely on the daemon's own
+    /// executor); `--dry-run` first to see the plan.
+    Rebalance {
+        /// RGB contract id to rebalance. Omit to rebalance every registered
+        /// contract; ignored with `--btc-only`.
+        #[arg(long)]
+        asset: Option<String>,
+        /// Rebalance only the BTC pool (skip every RGB asset).
+        #[arg(long)]
+        btc_only: bool,
+        /// Override the tx fee (sats). Default: next-block feerate × tx vsize,
+        /// capped at `[rebalance] rebalance_max_fee_sats`.
+        #[arg(long)]
+        fee: Option<u64>,
+        /// Print the plan without building/broadcasting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Mint an RGB invoice to receive inventory from an issuer.
     Invoice {
         /// RGB contract id. Defaults to the sole registered contract.
@@ -429,6 +449,12 @@ async fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                     fee,
                     dry_run,
                 } => maker_recover(load_config(&config_path)?, contract, electrum, fee, dry_run).await,
+                MakerWalletCmd::Rebalance {
+                    asset,
+                    btc_only,
+                    fee,
+                    dry_run,
+                } => maker_rebalance(load_config(&config_path)?, asset, btc_only, fee, dry_run).await,
                 MakerWalletCmd::Invoice { contract, amount } => {
                     maker_invoice(load_config(&config_path)?, contract, amount).await
                 }
@@ -870,6 +896,214 @@ async fn maker_recover(
          re-sync and `colorex maker inventory --btc` to see them as sellable.",
         swept.len()
     ));
+    Ok(())
+}
+
+/// Manual one-shot rebalance: plan each asset's + the BTC pool's denomination
+/// ladder, build ONE `split_pools` tx, and broadcast it. The daemon's executor
+/// does this automatically when `[rebalance] enabled`; this is for operators who
+/// keep it off (run with the daemon stopped) or want a `--dry-run` preview. No
+/// reservations are taken — it assumes exclusive wallet access, like `recover`.
+async fn maker_rebalance(
+    config: MakerNodeConfig,
+    asset_filter: Option<String>,
+    btc_only: bool,
+    fee_override: Option<u64>,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rfq_btc::BitcoinClient as _;
+    use rfq_rgb::RgbBackend as _;
+    let rgb = config
+        .rgb
+        .as_ref()
+        .ok_or("no [rgb] config: a wallet is required to rebalance")?;
+    let electrum_url = rgb.electrum_url.clone();
+    if electrum_url.is_empty() {
+        return Err("no [rgb] electrum_url in config".into());
+    }
+    let network: rfq_types::BitcoinNetwork = rgb.network.parse()?;
+    let backend = rfq_rgb::LibRgbBackend::new(
+        rgb.data_dir.clone(),
+        rgb.wallet_name.clone(),
+        rgb.network.clone(),
+        electrum_url.clone(),
+        rgb.signer.account_file.clone(),
+        rgb.signer.password.clone(),
+    );
+    let probe = rfq_btc::ElectrumClient::connect(&electrum_url)?;
+
+    output::step("syncing wallet");
+    backend.sync_wallet().await?;
+    output::step_ok();
+
+    // Every registered asset (to exclude RGB-bearing outputs from the BTC pool),
+    // vs the subset to actually ladder.
+    let all_assets = registered_assets(&config).await;
+    let ladder_assets: Vec<rfq_types::AssetId> = if btc_only {
+        Vec::new()
+    } else if let Some(id) = asset_filter {
+        let contract_id = resolve_contract_id(&config, Some(id)).await?;
+        vec![rfq_types::AssetId {
+            network,
+            kind: rfq_types::AssetKind::Rgb20,
+            id: contract_id,
+        }]
+    } else {
+        all_assets.clone()
+    };
+
+    let rgb_spec = config.rebalance.rgb_ladder();
+    let btc_spec = config.rebalance.btc_ladder();
+
+    // Plan each asset's ladder.
+    let mut asset_splits = Vec::new();
+    for asset in &ladder_assets {
+        let inv = backend.list_inventory_utxos(asset).await?;
+        let pairs: Vec<(rfq_types::Outpoint, u64)> =
+            inv.iter().map(|u| (u.outpoint.clone(), u.amount)).collect();
+        if let Some((source, source_amount, rungs)) = rfq_maker::plan_ladder(&pairs, &rgb_spec) {
+            let source_btc_sats = inv
+                .iter()
+                .find(|u| u.outpoint == source)
+                .map(|u| u.btc_sats)
+                .unwrap_or(0);
+            asset_splits.push(rfq_maker::AssetSplit {
+                asset: asset.clone(),
+                source,
+                source_amount,
+                source_btc_sats,
+                rungs,
+            });
+        }
+    }
+
+    // Plan the BTC ladder (excluding every registered asset's RGB outputs).
+    let now = now_ms();
+    let btc = backend.list_btc_only_utxos(&all_assets, now).await?;
+    let btc_avail: Vec<(rfq_types::Outpoint, u64)> =
+        btc.iter().map(|u| (u.outpoint.clone(), u.value_sats)).collect();
+    let btc_total: u64 = btc_avail.iter().map(|(_, s)| *s).sum();
+    let fattest_btc = btc_avail.iter().max_by_key(|(_, s)| *s).cloned();
+    let btc_split =
+        rfq_maker::plan_ladder(&btc_avail, &btc_spec).map(|(source, source_sats, rungs)| {
+            rfq_maker::BtcSplit {
+                source,
+                source_sats,
+                rungs,
+            }
+        });
+
+    if asset_splits.is_empty() && btc_split.is_none() {
+        output::note("inventory already matches the ladder — nothing to rebalance.");
+        return Ok(());
+    }
+
+    let btc_fee_source = btc_split
+        .as_ref()
+        .map(|b| (b.source.clone(), b.source_sats))
+        .or_else(|| fattest_btc.clone());
+    if !asset_splits.is_empty() && btc_fee_source.is_none() {
+        return Err("no BTC-only UTXO to fund the split anchors + fee (fund keychain 0)".into());
+    }
+    let btc_source_value = btc_fee_source.as_ref().map(|(_, v)| *v).unwrap_or(0);
+
+    // Fee: next-block feerate × estimated vsize (capped), unless overridden.
+    let feerate = if fee_override.is_some() {
+        0
+    } else {
+        rfq_maker::clamp_next_block_feerate(
+            probe
+                .estimate_feerate(rfq_maker::REBALANCE_CONF_TARGET_BLOCKS)
+                .await
+                .unwrap_or(0),
+            &network,
+        )
+    };
+    let max_fee = config.rebalance.rebalance_max_fee_sats;
+    let has_btc = btc_fee_source.is_some();
+    let fee_of = |assets: usize, rgb_rungs: usize, btc_rungs: usize| -> u64 {
+        if let Some(f) = fee_override {
+            return f;
+        }
+        let inputs = assets + usize::from(has_btc);
+        let outputs = usize::from(assets > 0) + rgb_rungs + btc_rungs + 1;
+        feerate
+            .saturating_mul(rfq_maker::estimate_rebalance_vbytes(inputs, outputs))
+            .min(max_fee)
+    };
+    let budget_fee = fee_of(
+        asset_splits.len(),
+        asset_splits.iter().map(|a| a.rungs.len()).sum(),
+        btc_split.as_ref().map(|b| b.rungs.len()).unwrap_or(0),
+    );
+
+    let plan =
+        rfq_maker::assemble_rebalance_tx(asset_splits, btc_split, btc_source_value, budget_fee)
+            .ok_or("budget can't fund any split (fund keychain 0)")?;
+    let fee = fee_of(
+        plan.assets.len(),
+        plan.assets.iter().map(|a| a.rungs.len()).sum(),
+        plan.btc.as_ref().map(|b| b.rungs.len()).unwrap_or(0),
+    );
+
+    // Show the plan.
+    for a in &plan.assets {
+        output::kv(
+            &format!("asset {}", a.asset.id),
+            &format!(
+                "{} rungs {:?} from {}:{}",
+                a.rungs.len(),
+                a.rungs,
+                a.source.txid,
+                a.source.vout
+            ),
+        );
+    }
+    if let Some(b) = &plan.btc {
+        output::kv(
+            "btc rungs",
+            &format!("{:?} sats from {}:{}", b.rungs, b.source.txid, b.source.vout),
+        );
+    }
+    output::kv("fee", &format!("{fee} sats"));
+    output::kv(
+        "btc needed",
+        &format!("{} sats (pool {btc_total})", plan.btc_needed),
+    );
+
+    if dry_run {
+        output::note("dry-run: nothing built or broadcast. Re-run without --dry-run.");
+        return Ok(());
+    }
+
+    let assets_arg: Vec<(rfq_types::AssetId, rfq_types::Outpoint, Vec<u64>)> = plan
+        .assets
+        .iter()
+        .map(|a| (a.asset.clone(), a.source.clone(), a.rungs.clone()))
+        .collect();
+    let btc_arg = btc_fee_source.as_ref().map(|(op, _)| {
+        (
+            op.clone(),
+            plan.btc.as_ref().map(|b| b.rungs.clone()).unwrap_or_default(),
+        )
+    });
+
+    output::step("building + signing rebalance tx");
+    let (raw_tx, witness_txid) = backend.split_pools(assets_arg, btc_arg, fee).await?;
+    output::step_ok();
+
+    output::step("broadcasting");
+    let broadcast_txid = probe.broadcast(&raw_tx).await?;
+    output::step_ok();
+    output::kv("rebalance tx", &broadcast_txid);
+    if broadcast_txid != witness_txid {
+        output::step_warn(&format!(
+            "broadcast txid {broadcast_txid} != built witness id {witness_txid}"
+        ));
+    }
+    output::note(
+        "once confirmed: re-sync; the new ladder pieces appear as RGB inventory + BTC pool UTXOs.",
+    );
     Ok(())
 }
 
@@ -1390,6 +1624,7 @@ async fn run(
     let order_count = standing.len();
     let maker = runtime.maker.with_price_policy(orders::price_policy(&standing));
     let chain_observer_deps = runtime.chain_observer;
+    let rebalance_executor_deps = runtime.rebalance_executor;
     let app = maker_app(maker.clone());
     let listener = TcpListener::bind(&config.maker.listen_addr).await?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -1421,6 +1656,12 @@ async fn run(
     } else {
         output::step_skip();
     }
+    output::step("rebalance executor");
+    if config.rebalance.enabled && rebalance_executor_deps.is_some() {
+        output::step_ok_with(&format!("every {:?}", config.intervals.rebalance));
+    } else {
+        output::step_skip();
+    }
     output::step("http server");
     output::step_ok_with(&config.maker.listen_addr);
     output::step("broker stream");
@@ -1441,6 +1682,22 @@ async fn run(
         config.intervals.rebalance,
         (&config.rebalance).into(),
     );
+    // Proactive split executor — opt-in, only with a real backend.
+    let rebalance_executor_task = if config.rebalance.enabled {
+        rebalance_executor_deps.map(|deps| {
+            spawn_rebalance_executor_loop(
+                maker.clone(),
+                deps,
+                config.intervals.rebalance,
+                config.rebalance.rgb_ladder(),
+                config.rebalance.btc_ladder(),
+                config.rebalance.min_btc_reserve_sats,
+                config.rebalance.rebalance_max_fee_sats,
+            )
+        })
+    } else {
+        None
+    };
     let chain_observer_task = chain_observer_deps
         .map(|deps| spawn_chain_observer_loop(maker.clone(), deps, config.intervals.chain_observer));
     let server_task = tokio::spawn(async move {
@@ -1474,6 +1731,9 @@ async fn run(
     if let Some(t) = &chain_observer_task {
         t.abort();
     }
+    if let Some(t) = &rebalance_executor_task {
+        t.abort();
+    }
     let _ = server_task.await;
     let _ = broker_task.await;
     let _ = order_reload_task.await;
@@ -1481,6 +1741,9 @@ async fn run(
     let _ = cleanup_task.await;
     let _ = rebalance_task.await;
     if let Some(t) = chain_observer_task {
+        let _ = t.await;
+    }
+    if let Some(t) = rebalance_executor_task {
         let _ = t.await;
     }
 

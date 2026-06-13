@@ -19,7 +19,11 @@ use axum::{
     Json, Router,
 };
 use rfq_btc::{BitcoinClient, ElectrumClient, MockBitcoinClient};
-use rfq_maker::{CoinSelector, GreedyExactFitSelector, Maker, RebalancePolicy};
+use rfq_maker::{
+    assemble_rebalance_tx, estimate_rebalance_vbytes, plan_ladder, AssetSplit, BtcSplit,
+    CoinSelector, GreedyExactFitSelector, LadderSpec, Maker, RebalancePolicy,
+    REBALANCE_ANCHOR_SATS,
+};
 use rfq_rgb::{ContractId, LibRgbBackend, MockRgbBackend, RgbBackend};
 use rfq_router::MakerConnector;
 use rfq_store::{
@@ -136,6 +140,34 @@ pub struct RebalancePolicyConfig {
     pub max_utxo_count: u64,
     #[serde(default = "default_min_utxo_count")]
     pub min_utxo_count: u64,
+    /// Master switch for the proactive split EXECUTOR (the log-only planner runs
+    /// regardless). Opt-in — the executor builds + broadcasts on-chain txs.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Largest RGB ladder rung, in asset units (per asset the maker trades).
+    #[serde(default = "default_rgb_ladder_base")]
+    pub rgb_ladder_base: u64,
+    /// Largest BTC ladder rung, in sats.
+    #[serde(default = "default_btc_ladder_base_sats")]
+    pub btc_ladder_base_sats: u64,
+    /// Geometric shrink factor per tier (halving = 0.5).
+    #[serde(default = "default_ladder_ratio")]
+    pub ladder_ratio: f64,
+    /// Number of distinct rung sizes per ladder.
+    #[serde(default = "default_ladder_tiers")]
+    pub ladder_tiers: u32,
+    /// Desired pieces per tier.
+    #[serde(default = "default_ladder_copies")]
+    pub ladder_copies: u32,
+    /// BTC sats kept spendable for sell-side payouts — the executor won't drain
+    /// the pool below this.
+    #[serde(default = "default_min_btc_reserve_sats")]
+    pub min_btc_reserve_sats: u64,
+    /// Absolute cap (sats) on a rebalance tx's fee. The fee itself is the
+    /// next-block feerate × the tx's estimated vsize (so it confirms promptly);
+    /// this just bounds it against a wild feerate estimate.
+    #[serde(default = "default_rebalance_max_fee_sats")]
+    pub rebalance_max_fee_sats: u64,
 }
 
 fn default_fragmentation_threshold() -> f64 {
@@ -146,6 +178,27 @@ fn default_max_utxo_count() -> u64 {
 }
 fn default_min_utxo_count() -> u64 {
     3
+}
+fn default_rgb_ladder_base() -> u64 {
+    1_000
+}
+fn default_btc_ladder_base_sats() -> u64 {
+    50_000
+}
+fn default_ladder_ratio() -> f64 {
+    0.5
+}
+fn default_ladder_tiers() -> u32 {
+    4
+}
+fn default_ladder_copies() -> u32 {
+    2
+}
+fn default_min_btc_reserve_sats() -> u64 {
+    5_000
+}
+fn default_rebalance_max_fee_sats() -> u64 {
+    10_000
 }
 
 impl From<&RebalancePolicyConfig> for RebalancePolicy {
@@ -158,6 +211,31 @@ impl From<&RebalancePolicyConfig> for RebalancePolicy {
     }
 }
 
+impl RebalancePolicyConfig {
+    /// RGB ladder spec: any positive rung amount is valid (the asset amount
+    /// doesn't affect cost — every rung anchors on 546 sats).
+    pub fn rgb_ladder(&self) -> LadderSpec {
+        LadderSpec {
+            base: self.rgb_ladder_base,
+            ratio: self.ladder_ratio,
+            tiers: self.ladder_tiers,
+            copies: self.ladder_copies,
+            min_piece: rfq_maker::DEFAULT_RGB_MIN_PIECE,
+        }
+    }
+
+    /// BTC ladder spec: rungs floor at the smallest spendable BTC piece (1000).
+    pub fn btc_ladder(&self) -> LadderSpec {
+        LadderSpec {
+            base: self.btc_ladder_base_sats,
+            ratio: self.ladder_ratio,
+            tiers: self.ladder_tiers,
+            copies: self.ladder_copies,
+            min_piece: rfq_maker::DEFAULT_BTC_MIN_PIECE_SATS,
+        }
+    }
+}
+
 impl Default for RebalancePolicyConfig {
     fn default() -> Self {
         let p = RebalancePolicy::default();
@@ -165,6 +243,14 @@ impl Default for RebalancePolicyConfig {
             fragmentation_threshold: p.fragmentation_threshold,
             max_utxo_count: p.max_utxo_count,
             min_utxo_count: p.min_utxo_count,
+            enabled: false,
+            rgb_ladder_base: default_rgb_ladder_base(),
+            btc_ladder_base_sats: default_btc_ladder_base_sats(),
+            ladder_ratio: default_ladder_ratio(),
+            ladder_tiers: default_ladder_tiers(),
+            ladder_copies: default_ladder_copies(),
+            min_btc_reserve_sats: default_min_btc_reserve_sats(),
+            rebalance_max_fee_sats: default_rebalance_max_fee_sats(),
         }
     }
 }
@@ -196,6 +282,8 @@ pub struct SignerConfig {
 pub enum ConfigError {
     Io(std::io::Error),
     Parse(toml::de::Error),
+    /// A field parsed but holds a semantically invalid value.
+    Invalid(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -203,6 +291,7 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::Io(e) => write!(f, "read config: {e}"),
             ConfigError::Parse(e) => write!(f, "parse config: {e}"),
+            ConfigError::Invalid(msg) => write!(f, "invalid config: {msg}"),
         }
     }
 }
@@ -212,6 +301,7 @@ impl std::error::Error for ConfigError {
         match self {
             ConfigError::Io(e) => Some(e),
             ConfigError::Parse(e) => Some(e),
+            ConfigError::Invalid(_) => None,
         }
     }
 }
@@ -262,6 +352,14 @@ impl MakerNodeConfig {
             rgb.data_dir = expand_tilde_path(&rgb.data_dir);
             rgb.signer.account_file = expand_tilde_path(&rgb.signer.account_file);
         }
+        // The ladder shrinks each tier by `ladder_ratio`; it must be in (0, 1).
+        // >= 1 would grow rungs unboundedly, <= 0 collapses them — both nonsense.
+        let ratio = cfg.rebalance.ladder_ratio;
+        if !(ratio > 0.0 && ratio < 1.0) {
+            return Err(ConfigError::Invalid(format!(
+                "rebalance.ladder_ratio must be in (0, 1), got {ratio}"
+            )));
+        }
         Ok(cfg)
     }
 }
@@ -277,6 +375,10 @@ fn expand_tilde_path(p: &std::path::Path) -> PathBuf {
 pub struct MakerNodeRuntime {
     pub maker: Maker,
     pub chain_observer: Option<ChainObserverDeps>,
+    /// Same backend + assets as the chain observer, for the proactive rebalance
+    /// executor. `None` for the mock fallback. Spawned only when the config's
+    /// `rebalance.enabled` is set.
+    pub rebalance_executor: Option<RebalanceExecutorDeps>,
     /// The standing-order store (maker.db `orders` table, or in-memory for the
     /// mock fallback) — driven by the order-reload + strategy loops in `run()`.
     pub order_store: Arc<dyn OrderStore>,
@@ -288,6 +390,14 @@ pub struct MakerNodeRuntime {
 /// inventory and excludes all of them from the BTC pool). `None` for the mock
 /// fallback (nothing on-chain to observe).
 pub struct ChainObserverDeps {
+    pub rgb_backend: Arc<LibRgbBackend>,
+    pub assets: Vec<AssetId>,
+}
+
+/// Dependencies for the rebalance executor loop. Holds the concrete backend
+/// (needed for `split_pools`, an inherent method) + the asset list, same as
+/// [`ChainObserverDeps`]. `None` for the mock fallback (nothing on-chain).
+pub struct RebalanceExecutorDeps {
     pub rgb_backend: Arc<LibRgbBackend>,
     pub assets: Vec<AssetId>,
 }
@@ -492,6 +602,10 @@ pub async fn build_runtime(
             Ok(MakerNodeRuntime {
                 maker,
                 chain_observer: Some(ChainObserverDeps {
+                    rgb_backend: backend.clone(),
+                    assets: assets.clone(),
+                }),
+                rebalance_executor: Some(RebalanceExecutorDeps {
                     rgb_backend: backend,
                     assets,
                 }),
@@ -523,6 +637,7 @@ pub async fn build_runtime(
             Ok(MakerNodeRuntime {
                 maker,
                 chain_observer: None,
+                rebalance_executor: None,
                 order_store: Arc::new(InMemoryOrderStore::new()),
             })
         }
@@ -933,6 +1048,260 @@ pub fn spawn_rebalance_loop(
     })
 }
 
+/// Outcome of one executor tick.
+enum RebalanceTick {
+    /// Pools already match their ladders — nothing to do.
+    Idle,
+    /// A guard prevented action this tick (in-flight split, budget, contention).
+    Skipped(String),
+    /// A split tx was built + broadcast; `rgb_sources` are its consumed RGB
+    /// sources, tracked until they confirm so the loop doesn't pile on.
+    Split {
+        txid: String,
+        rgb_sources: Vec<Outpoint>,
+    },
+}
+
+/// Proactive rebalance EXECUTOR loop (the acting successor to the log-only
+/// [`spawn_rebalance_loop`]). Each tick: skip while a prior split is still
+/// settling; else plan per-asset RGB ladders + the BTC ladder, build ONE
+/// `split_pools` tx, broadcast it, and mark the consumed sources pending so the
+/// chain observer's `sweep_confirmations` retires them and ingests the new
+/// pieces. Anti-thrash: reserving a source removes it from Available (so it's
+/// never re-picked), and the in-flight guard skips planning until the previous
+/// split's sources read `Spent`. See `docs/rebalancing-strategy.md`.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_rebalance_executor_loop(
+    maker: Maker,
+    deps: RebalanceExecutorDeps,
+    interval: Duration,
+    rgb_spec: LadderSpec,
+    btc_spec: LadderSpec,
+    min_btc_reserve_sats: u64,
+    max_fee_sats: u64,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = time::interval(interval);
+        tick.tick().await; // skip the immediate first tick
+        let mut inflight: Option<Vec<Outpoint>> = None;
+        loop {
+            tick.tick().await;
+            // Wait out a previous split: skip planning until its RGB sources
+            // confirm (read `Spent`), so we don't stack a second split on top.
+            if let Some(sources) = &inflight {
+                if maker.rgb_sources_settled(sources).await {
+                    inflight = None;
+                } else {
+                    continue;
+                }
+            }
+            match rebalance_once(
+                &maker,
+                &deps,
+                &rgb_spec,
+                &btc_spec,
+                min_btc_reserve_sats,
+                max_fee_sats,
+            )
+            .await
+            {
+                RebalanceTick::Idle => {}
+                RebalanceTick::Skipped(reason) => eprintln!("rebalance skipped: {reason}"),
+                RebalanceTick::Split { txid, rgb_sources } => {
+                    println!("rebalance split broadcast: {txid}");
+                    inflight = Some(rgb_sources);
+                }
+            }
+        }
+    })
+}
+
+/// One executor pass: plan → reserve → build `split_pools` → broadcast → mark
+/// pending. Releases reservations on any build/broadcast failure so a transient
+/// error doesn't strand liquidity.
+async fn rebalance_once(
+    maker: &Maker,
+    deps: &RebalanceExecutorDeps,
+    rgb_spec: &LadderSpec,
+    btc_spec: &LadderSpec,
+    min_btc_reserve_sats: u64,
+    max_fee_sats: u64,
+) -> RebalanceTick {
+    // 1. Per-asset RGB ladders.
+    let mut asset_splits = Vec::new();
+    for asset in &deps.assets {
+        let avail = maker.available_rgb_for(asset).await;
+        let pairs: Vec<(Outpoint, u64)> = avail.iter().map(|(o, a, _)| (o.clone(), *a)).collect();
+        if let Some((source, source_amount, rungs)) = plan_ladder(&pairs, rgb_spec) {
+            let source_btc_sats = avail
+                .iter()
+                .find(|(o, _, _)| *o == source)
+                .map(|(_, _, s)| *s)
+                .unwrap_or(0);
+            asset_splits.push(AssetSplit {
+                asset: asset.clone(),
+                source,
+                source_amount,
+                source_btc_sats,
+                rungs,
+            });
+        }
+    }
+
+    // 2. BTC ladder + the fattest BTC UTXO (which funds anchors + fee even when
+    //    BTC itself needs no laddering).
+    let btc_avail = maker.available_btc().await;
+    let btc_total: u64 = btc_avail.iter().map(|(_, s)| *s).sum();
+    let fattest_btc = btc_avail.iter().max_by_key(|(_, s)| *s).cloned();
+    let btc_split = plan_ladder(&btc_avail, btc_spec).map(|(source, source_sats, rungs)| BtcSplit {
+        source,
+        source_sats,
+        rungs,
+    });
+
+    if asset_splits.is_empty() && btc_split.is_none() {
+        return RebalanceTick::Idle;
+    }
+
+    // The BTC input that funds the tx: the ladder's source if BTC is laddering,
+    // else just the fattest UTXO as a fee/anchor funder.
+    let btc_fee_source = btc_split
+        .as_ref()
+        .map(|b| (b.source.clone(), b.source_sats))
+        .or_else(|| fattest_btc.clone());
+    if !asset_splits.is_empty() && btc_fee_source.is_none() {
+        return RebalanceTick::Skipped(
+            "no BTC available to fund RGB split anchors + fee (fund keychain-0)".to_owned(),
+        );
+    }
+    let btc_source_value = btc_fee_source.as_ref().map(|(_, v)| *v).unwrap_or(0);
+
+    // Fee = next-block feerate × the tx's estimated vsize, capped. Computed from
+    // input/output counts (all P2TR keyspend). `fee_of` is reused for the budget
+    // (full plan) and the final tx (post-scaledown plan). Targets the next block
+    // so fresh pieces are usable promptly.
+    let network = deps
+        .assets
+        .first()
+        .map(|a| a.network)
+        .unwrap_or(BitcoinNetwork::Regtest);
+    let feerate = maker.next_block_feerate(&network).await;
+    let has_btc_source = btc_fee_source.is_some();
+    let fee_of = |assets: usize, rgb_rungs: usize, btc_rungs: usize| -> u64 {
+        let inputs = assets + usize::from(has_btc_source);
+        // host (only when RGB present) + rgb rungs + btc rungs + change
+        let outputs = usize::from(assets > 0) + rgb_rungs + btc_rungs + 1;
+        feerate
+            .saturating_mul(estimate_rebalance_vbytes(inputs, outputs))
+            .min(max_fee_sats)
+    };
+    // Provisional fee from the full plan funds the budget (>= the final fee, so
+    // the tx — with possibly fewer outputs after scaledown — always fits).
+    let budget_fee = fee_of(
+        asset_splits.len(),
+        asset_splits.iter().map(|a| a.rungs.len()).sum(),
+        btc_split.as_ref().map(|b| b.rungs.len()).unwrap_or(0),
+    );
+
+    // 3. Budget: scales RGB rungs down to what the BTC source can fund.
+    let plan = match assemble_rebalance_tx(asset_splits, btc_split, btc_source_value, budget_fee) {
+        Some(p) => p,
+        None => {
+            return RebalanceTick::Skipped(
+                "budget can't fund any split (fund keychain-0)".to_owned(),
+            )
+        }
+    };
+
+    // Final fee for the actual (post-scaledown) tx.
+    let rgb_rung_count: u64 = plan.assets.iter().map(|a| a.rungs.len() as u64).sum();
+    let fee_sats = fee_of(
+        plan.assets.len(),
+        rgb_rung_count as usize,
+        plan.btc.as_ref().map(|b| b.rungs.len()).unwrap_or(0),
+    );
+
+    // 4. Reserve floor: keep sell-side liquidity. Only RGB rungs net-drain BTC
+    //    (anchors); BTC rungs/change return to the pool. Conservative estimate.
+    if !plan.assets.is_empty() {
+        let net_drain = fee_sats + REBALANCE_ANCHOR_SATS * (1 + rgb_rung_count);
+        if btc_total.saturating_sub(net_drain) < min_btc_reserve_sats {
+            return RebalanceTick::Skipped(format!(
+                "would breach BTC reserve {min_btc_reserve_sats} (pool {btc_total}, drain ~{net_drain})"
+            ));
+        }
+    }
+
+    // 5. Reserve every source so quoting won't grab one mid-split.
+    let mut rgb_reservations = Vec::new();
+    let mut rgb_sources = Vec::new();
+    for a in &plan.assets {
+        match maker.reserve_rgb_for_rebalance(a.source.clone()).await {
+            Ok(r) => {
+                rgb_reservations.push(r);
+                rgb_sources.push(a.source.clone());
+            }
+            Err(e) => {
+                maker.release_rebalance(&rgb_reservations, None).await;
+                return RebalanceTick::Skipped(format!("rgb reserve failed: {e}"));
+            }
+        }
+    }
+    let (btc_source_op, btc_reservation) = match &btc_fee_source {
+        Some((op, _)) => match maker.reserve_btc_for_rebalance(op.clone()).await {
+            Ok(r) => (Some(op.clone()), Some(r)),
+            Err(e) => {
+                maker.release_rebalance(&rgb_reservations, None).await;
+                return RebalanceTick::Skipped(format!("btc reserve failed: {e}"));
+            }
+        },
+        None => (None, None),
+    };
+
+    // 6. Build the one combined split tx.
+    let assets_arg: Vec<(AssetId, Outpoint, Vec<u64>)> = plan
+        .assets
+        .iter()
+        .map(|a| (a.asset.clone(), a.source.clone(), a.rungs.clone()))
+        .collect();
+    let btc_arg = btc_source_op.clone().map(|op| {
+        (
+            op,
+            plan.btc.as_ref().map(|b| b.rungs.clone()).unwrap_or_default(),
+        )
+    });
+    let (raw_tx, txid) = match deps
+        .rgb_backend
+        .split_pools(assets_arg, btc_arg, fee_sats)
+        .await
+    {
+        Ok(x) => x,
+        Err(e) => {
+            maker
+                .release_rebalance(&rgb_reservations, btc_reservation.as_ref())
+                .await;
+            return RebalanceTick::Skipped(format!("split build failed: {e}"));
+        }
+    };
+
+    // 7. Broadcast, then mark sources pending so `sweep_confirmations` retires
+    //    them on confirmation (and the chain observer ingests the new pieces).
+    if let Err(e) = maker.broadcast_rebalance(&raw_tx).await {
+        maker
+            .release_rebalance(&rgb_reservations, btc_reservation.as_ref())
+            .await;
+        return RebalanceTick::Skipped(format!("broadcast failed: {e}"));
+    }
+    for r in &rgb_reservations {
+        maker.mark_rgb_rebalance_pending(r, txid.clone()).await;
+    }
+    if let Some(r) = &btc_reservation {
+        maker.mark_btc_rebalance_pending(r, txid.clone()).await;
+    }
+
+    RebalanceTick::Split { txid, rgb_sources }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1004,6 +1373,22 @@ mod tests {
         assert_eq!(cfg.intervals.rebalance, Duration::from_secs(60));
         assert_eq!(cfg.intervals.chain_observer, Duration::from_secs(5));
         assert!(cfg.rgb.is_none());
+    }
+
+    #[test]
+    fn rejects_out_of_range_ladder_ratio() {
+        for bad in ["1.0", "1.5", "0.0", "-0.5"] {
+            let raw = format!("[rebalance]\nladder_ratio = {bad}\n");
+            let err = MakerNodeConfig::load_str(&raw)
+                .expect_err(&format!("ratio {bad} must be rejected"));
+            assert!(
+                matches!(err, ConfigError::Invalid(_)),
+                "expected Invalid for ratio {bad}, got {err:?}"
+            );
+        }
+        // A valid ratio in (0, 1) is accepted.
+        MakerNodeConfig::load_str("[rebalance]\nladder_ratio = 0.5\n")
+            .expect("0.5 is a valid ratio");
     }
 
     #[test]

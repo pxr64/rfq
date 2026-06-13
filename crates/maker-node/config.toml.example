@@ -15,6 +15,18 @@ chain_observer = "5s"
 fragmentation_threshold = 0.7
 max_utxo_count          = 50
 min_utxo_count          = 3
+# Proactive split executor (opt-in). When true, the maker builds + broadcasts a
+# single tx per pass that splits each RGB asset and the BTC pool into a
+# denomination ladder (large→small) so coin selection stays cheap. Runs on the
+# [intervals] `rebalance` cadence. Needs the [rgb] backend below.
+enabled                 = false
+rgb_ladder_base         = 1000      # largest RGB rung (asset units), per asset
+btc_ladder_base_sats    = 50000     # largest BTC rung (sats)
+ladder_ratio            = 0.5       # tier shrink factor (0.5 = halving)
+ladder_tiers            = 4         # number of distinct rung sizes
+ladder_copies           = 2         # desired pieces per tier
+min_btc_reserve_sats    = 5000      # keep this much BTC spendable for sell payouts
+rebalance_max_fee_sats  = 10000     # cap; actual fee = next-block feerate × tx vsize
 
 # Optional. Omit the whole [rgb] section to run with the mock backend
 # (no on-chain settlement; useful for local development against the broker).

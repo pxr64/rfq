@@ -132,6 +132,57 @@ impl RegtestStack {
         &self.electrum_url
     }
 
+    /// Issue a SECOND NIA contract owned by the maker — for multi-contract tests
+    /// (e.g. the rebalance MPC-bundle path). Funds a fresh maker keychain-10 UTXO
+    /// to use as the genesis seal (so it carries no other RGB), mints the full
+    /// `supply` straight into the maker's own stash (no issuer→maker transfer
+    /// needed — the maker IS the issuer here), and syncs. Returns the new asset.
+    /// The shared single-contract bootstrap is untouched; tests keyed off
+    /// `asset()` ignore this contract.
+    pub async fn issue_second_maker_contract(&self, ticker: &str, supply: u64) -> AssetId {
+        let asset1 = self.asset();
+        // Snapshot the maker's RGB-free outpoints, so we can spot the fresh one.
+        let before: std::collections::HashSet<(String, u32)> = {
+            let maker = self.maker_backend().await;
+            maker
+                .list_btc_only_utxos(std::slice::from_ref(&asset1), 0)
+                .await
+                .expect("btc-only (pre-fund)")
+                .into_iter()
+                .map(|u| (u.outpoint.txid, u.outpoint.vout))
+                .collect()
+        };
+        // Fund a fresh keychain-10 UTXO → a clean genesis seal.
+        fund_role(
+            &self.tools_dir,
+            &self.compose_dir,
+            &self.maker.stash_dir,
+            "maker",
+            &self.electrum_url,
+        )
+        .expect("fund maker for second-contract genesis");
+
+        let maker = self.maker_backend().await;
+        maker.sync_wallet().await.expect("maker sync after fund");
+        let fresh = maker
+            .list_btc_only_utxos(std::slice::from_ref(&asset1), 0)
+            .await
+            .expect("btc-only (post-fund)")
+            .into_iter()
+            .find(|u| !before.contains(&(u.outpoint.txid.clone(), u.outpoint.vout)))
+            .expect("a freshly funded genesis outpoint");
+        let genesis = format!("{}:{}", fresh.outpoint.txid, fresh.outpoint.vout);
+        let id = maker
+            .issue_contract(ticker, ticker, None, 0, supply, &genesis, "ssi:maker")
+            .expect("issue second maker contract");
+        maker.sync_wallet().await.expect("maker sync after issue");
+        AssetId {
+            network: BitcoinNetwork::Regtest,
+            kind: AssetKind::Rgb20,
+            id,
+        }
+    }
+
     /// Mint an ADDRESS-BASED (witness-vout / "future seal") invoice on the
     /// taker's stash via `rgb invoice -a`. The production `Taker::create_invoice`
     /// only emits witness-vout when no free keychain-10 anchor is available, which

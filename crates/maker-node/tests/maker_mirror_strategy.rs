@@ -73,6 +73,7 @@ async fn fill_records_and_auto_mirrors_the_opposite_order() {
         maker,
         chain_observer,
         order_store,
+        ..
     } = runtime;
     let chain_observer = chain_observer.expect("RGB config present → chain observer must spawn");
 

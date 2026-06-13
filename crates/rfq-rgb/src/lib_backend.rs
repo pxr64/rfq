@@ -588,6 +588,97 @@ impl LibRgbBackend {
         Ok((raw_tx, witness_id.to_string(), swept))
     }
 
+    /// Single-contract RGB denomination-ladder split: spend one fat RGB UTXO
+    /// (`rgb_source`) + one BTC `fee_input`, re-allocating the asset across
+    /// `rungs` fresh keychain-0 outputs (largest→smallest), remainder back on the
+    /// pinned tapret host. Builds, signs and finalizes under the wallet guard but
+    /// does NOT broadcast (the std guard cannot cross an `.await`) — like
+    /// `recover_stranded_rgb`, it returns the raw witness tx + txid for the caller
+    /// to broadcast via its `BitcoinClient`. This is the Phase-1 spike kernel that
+    /// the multi-contract `split_pools` generalises.
+    pub async fn split_asset(
+        &self,
+        asset: &AssetId,
+        rgb_source: (Outpoint, u64, Vec<u8>),
+        fee_input: (Outpoint, u64, Vec<u8>),
+        rungs: Vec<u64>,
+        fee_sats: u64,
+    ) -> Result<(Vec<u8>, String), RgbError> {
+        let _guard = self.guard();
+        let account = self.load_signer()?;
+        let mut wallet = self.load_wallet()?;
+        let contract_id = ContractId::from_str(&asset.id)
+            .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
+        let to_input = |(outpoint, value_sats, script_pubkey): (Outpoint, u64, Vec<u8>)| {
+            swap::RecoveryInput {
+                outpoint,
+                value_sats,
+                script_pubkey,
+            }
+        };
+        let (raw_tx, witness_id) = swap::build_asset_split(
+            &mut wallet,
+            &account,
+            contract_id,
+            &to_input(rgb_source),
+            &to_input(fee_input),
+            &rungs,
+            fee_sats,
+        )?;
+        Ok((raw_tx, witness_id.to_string()))
+    }
+
+    /// Multi-asset + BTC denomination rebalance: build ONE transaction that
+    /// splits every listed RGB asset into its ladder rungs and (optionally) the
+    /// BTC pool into its rungs, under a single tapret commitment + one fee. Each
+    /// `assets` entry is `(asset, source_outpoint, rgb_rungs)`; `btc` is
+    /// `(source_outpoint, sat_rungs)`. Sources are wallet-tracked Available UTXOs
+    /// resolved from the coin cache. Builds/signs/finalizes under the wallet guard
+    /// and returns `(raw_tx, txid)` for the caller to broadcast (no broadcast
+    /// under the std guard). When `assets` is empty it falls back to a plain BTC
+    /// split. Generalises [`Self::split_asset`].
+    pub async fn split_pools(
+        &self,
+        assets: Vec<(AssetId, Outpoint, Vec<u64>)>,
+        btc: Option<(Outpoint, Vec<u64>)>,
+        fee_sats: u64,
+    ) -> Result<(Vec<u8>, String), RgbError> {
+        let _guard = self.guard();
+        let account = self.load_signer()?;
+        let mut wallet = self.load_wallet()?;
+
+        let mut asset_inputs = Vec::with_capacity(assets.len());
+        for (asset, source, rungs) in assets {
+            let contract_id = ContractId::from_str(&asset.id)
+                .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
+            asset_inputs.push(swap::AssetSplitInput {
+                contract_id,
+                source,
+                rungs,
+            });
+        }
+
+        let (raw_tx, witness_id) = if asset_inputs.is_empty() {
+            let (op, rungs) = btc
+                .as_ref()
+                .ok_or_else(|| RgbError::TransferBuild("split_pools: nothing to split".to_owned()))?;
+            swap::build_btc_split(&mut wallet, &account, op, rungs, fee_sats)?
+        } else {
+            let btc_source = btc.as_ref().map(|(op, _)| op);
+            let empty: Vec<u64> = Vec::new();
+            let btc_rungs = btc.as_ref().map(|(_, r)| r.as_slice()).unwrap_or(&empty);
+            swap::build_rebalance_tx(
+                &mut wallet,
+                &account,
+                &asset_inputs,
+                btc_source,
+                btc_rungs,
+                fee_sats,
+            )?
+        };
+        Ok((raw_tx, witness_id.to_string()))
+    }
+
     /// Sync the wallet against electrum, then return its tracked UTXOs (BTC).
     /// Role-agnostic — needs no RGB contract; sum `sats` for the spendable
     /// balance, and the keychain distinguishes the BTC (0) vs RGB-anchor (10)
@@ -637,6 +728,11 @@ impl LibRgbBackend {
         // `min_amount` is the witness-vout beneficiary dust floor; maker swap
         // invoices use blinded seals (no witness vout), so 546 is a safe nominal.
         let params = TransferParams::with(Sats(fee_sats), Sats(546));
+        // Serialize against every other wallet mutation (chain observer sync,
+        // swap settlement, rebalance self-send) — `pay` writes a tentative
+        // transfer into the stash and autosaves on drop. No `.await` follows, so
+        // the std guard can live to the end of the (otherwise synchronous) body.
+        let _guard = self.guard();
         let mut wallet = self.load_wallet()?;
         let (_psbt, _meta, transfer) = wallet
             .pay(&invoice, params)
@@ -664,18 +760,33 @@ impl LibRgbBackend {
             RgbInvoice::from_str(recipient_invoice).map_err(|_| RgbError::InvalidInvoice)?;
         let params = TransferParams::with(Sats(fee_sats), Sats(546));
 
-        let mut wallet = self.load_wallet()?;
-        let descriptor = wallet.wallet().descriptor().clone();
-        let (mut psbt, _meta, transfer) = wallet
-            .pay(&invoice, params)
-            .map_err(|e| RgbError::TransferBuild(format!("pay: {e}")))?;
+        // Hold the wallet lock only for the synchronous build/sign/finalize: the
+        // std `MutexGuard` is not `Send` and cannot cross the `.await` broadcast
+        // below. We drop the wallet inside the guarded scope so its updated
+        // stock/UTXO state autosaves *before* the lock is released — at which
+        // point a concurrent chain-observer sync or swap can safely load it. The
+        // autosave therefore lands just before broadcast rather than just after
+        // (the prior, unguarded order); the window is tiny and a failed broadcast
+        // leaves a diagnosable tentative transfer in the stash.
+        let (raw_tx, witness_id, transfer) = {
+            let _guard = self.guard();
+            let mut wallet = self.load_wallet()?;
+            let descriptor = wallet.wallet().descriptor().clone();
+            let (mut psbt, _meta, transfer) = wallet
+                .pay(&invoice, params)
+                .map_err(|e| RgbError::TransferBuild(format!("pay: {e}")))?;
 
-        // The issuer owns every input of a distribution tx, so it signs the whole
-        // PSBT; then reuse the swap finalize/extract to get the broadcast-ready tx.
-        let account = self.load_signer()?;
-        psbt.sign(&TestnetRefSigner::new(&account))
-            .map_err(|e| RgbError::TransferBuild(format!("sign: {e}")))?;
-        let (raw_tx, witness_id) = swap::finalize_signed_psbt(&descriptor, &psbt.to_base64())?;
+            // The issuer owns every input of a distribution tx, so it signs the
+            // whole PSBT; then reuse the swap finalize/extract to get the
+            // broadcast-ready tx.
+            let account = self.load_signer()?;
+            psbt.sign(&TestnetRefSigner::new(&account))
+                .map_err(|e| RgbError::TransferBuild(format!("sign: {e}")))?;
+            let (raw_tx, witness_id) =
+                swap::finalize_signed_psbt(&descriptor, &psbt.to_base64())?;
+            drop(wallet);
+            (raw_tx, witness_id, transfer)
+        };
 
         ElectrumClient::connect(&self.electrum_url)
             .map_err(|e| RgbError::TransferBuild(format!("electrum connect: {e}")))?
@@ -683,9 +794,6 @@ impl LibRgbBackend {
             .await
             .map_err(|e| RgbError::TransferBuild(format!("broadcast: {e}")))?;
 
-        // Drop the wallet so its updated stock/UTXO state autosaves, then hand the
-        // recipient the consignment.
-        drop(wallet);
         let mut bytes = Vec::new();
         transfer
             .save(&mut bytes)
