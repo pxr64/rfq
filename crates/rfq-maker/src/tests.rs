@@ -1594,3 +1594,114 @@ async fn reserve_for_rebalance_removes_source_from_available() {
         "the reserved source is gone from Available"
     );
 }
+
+// --- rebalance ⇄ swap concurrency (reservation mutual-exclusion) ---
+
+#[tokio::test]
+async fn rebalance_reservation_blocks_quoting_the_same_utxo() {
+    // The maker's only RGB UTXO is claimed for a rebalance split → the quoting
+    // path can't reserve it, and a second rebalance reserve is also refused.
+    let maker = maker_with_utxos(vec![utxo()]); // one UTXO of 100 @ outpoint 0
+    let source = synth_outpoint(0);
+    maker
+        .reserve_rgb_for_rebalance(source.clone())
+        .await
+        .expect("reserve source for rebalance");
+
+    // A buy quote (amount 100) finds no spendable RGB — the only UTXO is locked.
+    assert!(
+        maker
+            .request_quote(quote_request("rfq-during-rebalance"))
+            .await
+            .unwrap()
+            .is_none(),
+        "quoting must not touch a UTXO reserved for rebalance"
+    );
+    // The same source can't be double-reserved for another split.
+    assert!(
+        maker.reserve_rgb_for_rebalance(source).await.is_err(),
+        "a rebalance-reserved UTXO can't be reserved again"
+    );
+}
+
+#[tokio::test]
+async fn quote_reservation_blocks_rebalancing_the_same_utxo() {
+    // The reverse direction: a live quote holds the UTXO → the rebalancer can't
+    // grab it out from under an in-flight swap.
+    let maker = maker_with_utxos(vec![utxo()]);
+    let quote = maker
+        .request_quote(quote_request("rfq-live-swap"))
+        .await
+        .unwrap();
+    assert!(quote.is_some(), "the quote reserves the only UTXO");
+
+    assert!(
+        maker
+            .reserve_rgb_for_rebalance(synth_outpoint(0))
+            .await
+            .is_err(),
+        "rebalance must not seize a UTXO a quote already reserved"
+    );
+}
+
+#[tokio::test]
+async fn rebalance_and_quote_use_disjoint_utxos_concurrently() {
+    // With two UTXOs, a rebalance reserving one leaves the other quotable —
+    // fine-grained reservations, not a whole-inventory lock.
+    let maker = maker_with_utxos(vec![utxo_with_amount(0, 100), utxo_with_amount(1, 100)]);
+    let rebalance_source = synth_outpoint(0);
+    maker
+        .reserve_rgb_for_rebalance(rebalance_source.clone())
+        .await
+        .expect("reserve rebalance source");
+
+    // The swap proceeds on the OTHER UTXO.
+    let quote = maker
+        .request_quote(quote_request("rfq-parallel"))
+        .await
+        .unwrap()
+        .expect("quote served from the disjoint UTXO");
+
+    // Both UTXOs now reserved (one for rebalance, one for the quote) on distinct
+    // outpoints — a third quote finds nothing.
+    let snapshot = maker.utxo_snapshot().await;
+    let reserved: Vec<_> = snapshot
+        .iter()
+        .filter(|u| matches!(u.status, InventoryStatus::Reserved { .. }))
+        .map(|u| u.outpoint.clone())
+        .collect();
+    assert_eq!(reserved.len(), 2, "both UTXOs reserved on disjoint outpoints");
+    assert!(reserved.contains(&rebalance_source));
+    assert!(
+        maker
+            .request_quote(quote_request("rfq-none-left"))
+            .await
+            .unwrap()
+            .is_none(),
+        "no UTXOs left after rebalance + one quote"
+    );
+    let _ = quote; // keep the quote alive for clarity
+}
+
+#[tokio::test]
+async fn rebalance_reservation_excludes_a_btc_utxo() {
+    // Same exclusion on the BTC pool: a UTXO reserved for a BTC-ladder split
+    // leaves Available (so sell-side payouts can't grab it) and can't be
+    // double-reserved.
+    let maker = sell_maker(); // 3 BTC UTXOs of 1_000_000 each
+    assert_eq!(maker.available_btc().await.len(), 3);
+
+    let btc_source = Outpoint::new(format!("{:064x}", 0xb7c0u64), 0);
+    maker
+        .reserve_btc_for_rebalance(btc_source.clone())
+        .await
+        .expect("reserve BTC source for rebalance");
+
+    let after = maker.available_btc().await;
+    assert_eq!(after.len(), 2, "reserved BTC source drops out of Available");
+    assert!(!after.iter().any(|(o, _)| *o == btc_source));
+    assert!(
+        maker.reserve_btc_for_rebalance(btc_source).await.is_err(),
+        "a rebalance-reserved BTC UTXO can't be reserved again"
+    );
+}

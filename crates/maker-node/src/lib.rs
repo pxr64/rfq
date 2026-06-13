@@ -1062,8 +1062,10 @@ pub fn spawn_rebalance_loop(
     })
 }
 
-/// Outcome of one executor tick.
-enum RebalanceTick {
+/// Outcome of one executor tick. `pub` so the e2e suite can drive a single
+/// `rebalance_once` pass and assert on the result.
+#[derive(Debug)]
+pub enum RebalanceTick {
     /// Pools already match their ladders — nothing to do.
     Idle,
     /// A guard prevented action this tick (in-flight split, budget, contention).
@@ -1132,8 +1134,9 @@ pub fn spawn_rebalance_executor_loop(
 
 /// One executor pass: plan → reserve → build `split_pools` → broadcast → mark
 /// pending. Releases reservations on any build/broadcast failure so a transient
-/// error doesn't strand liquidity.
-async fn rebalance_once(
+/// error doesn't strand liquidity. `pub` so the e2e suite can drive a single
+/// deterministic pass (the loop wrapper just adds cadence + the in-flight guard).
+pub async fn rebalance_once(
     maker: &Maker,
     deps: &RebalanceExecutorDeps,
     rgb_spec: &LadderSpec,

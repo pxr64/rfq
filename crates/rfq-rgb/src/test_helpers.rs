@@ -410,6 +410,16 @@ impl RegtestStack {
         )?;
         Ok(())
     }
+
+    /// Confirm an ALREADY-broadcast tx: mine one block and wait for electrs to
+    /// index it, so a follow-up in-process `sync_wallet` sees the new state.
+    /// Unlike [`Self::broadcast`], this does NOT send a tx (the caller already
+    /// broadcast via its own client, e.g. the rebalance executor).
+    pub fn confirm(&self) -> Result<(), String> {
+        self.mine_block()?;
+        wait_for_electrs_tip(&self.compose_dir, &self.electrum_url)?;
+        Ok(())
+    }
 }
 
 /// Maker backend handle holding the shared backend lock. Derefs to
