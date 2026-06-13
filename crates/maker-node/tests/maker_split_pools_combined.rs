@@ -29,7 +29,10 @@ async fn split_pools_splits_rgb_and_btc_in_one_tx() {
     let (pre_total, rgb_source, rgb_amount) = {
         let maker = stack.maker_backend().await;
         maker.sync_wallet().await.expect("maker sync (pre)");
-        let inv = maker.list_inventory_utxos(&asset).await.expect("inventory (pre)");
+        let inv = maker
+            .list_inventory_utxos(&asset)
+            .await
+            .expect("inventory (pre)");
         let total: u64 = inv.iter().map(|u| u.amount).sum();
         let fat = inv
             .into_iter()
@@ -37,7 +40,10 @@ async fn split_pools_splits_rgb_and_btc_in_one_tx() {
             .expect("an RGB allocation to split");
         (total, fat.outpoint, fat.amount)
     };
-    assert!(rgb_amount >= 4, "RGB source {rgb_amount} too small to split");
+    assert!(
+        rgb_amount >= 4,
+        "RGB source {rgb_amount} too small to split"
+    );
     let rung = rgb_amount / 4;
     let rgb_rungs = vec![rung, rung];
 
@@ -74,21 +80,30 @@ async fn split_pools_splits_rgb_and_btc_in_one_tx() {
     };
 
     let broadcast_txid = stack.broadcast(&raw_tx).expect("broadcast combined split");
-    assert_eq!(broadcast_txid, split_txid, "broadcast txid matches built witness id");
+    assert_eq!(
+        broadcast_txid, split_txid,
+        "broadcast txid matches built witness id"
+    );
 
     // Re-sync and assert both pools landed.
     let maker = stack.maker_backend().await;
     maker.sync_wallet().await.expect("maker sync (post)");
 
     // --- RGB side ---
-    let inv = maker.list_inventory_utxos(&asset).await.expect("inventory (post)");
+    let inv = maker
+        .list_inventory_utxos(&asset)
+        .await
+        .expect("inventory (post)");
     let post_total: u64 = inv.iter().map(|u| u.amount).sum();
     assert_eq!(post_total, pre_total, "RGB total preserved (self-transfer)");
     assert!(
         !inv.iter().any(|u| u.outpoint == rgb_source),
         "RGB source consumed"
     );
-    let from_split: Vec<_> = inv.iter().filter(|u| u.outpoint.txid == split_txid).collect();
+    let from_split: Vec<_> = inv
+        .iter()
+        .filter(|u| u.outpoint.txid == split_txid)
+        .collect();
     let remainder = rgb_amount - 2 * rung;
     let mut rungs_on_k0 = 0;
     let mut remainder_on_host = 0;
@@ -102,7 +117,11 @@ async fn split_pools_splits_rgb_and_btc_in_one_tx() {
             assert_eq!(terminal.0, 0, "RGB rung on keychain 0, got {terminal:?}");
             rungs_on_k0 += 1;
         } else if piece.amount == remainder {
-            assert_eq!(terminal, (10, 0), "remainder on pinned host, got {terminal:?}");
+            assert_eq!(
+                terminal,
+                (10, 0),
+                "remainder on pinned host, got {terminal:?}"
+            );
             remainder_on_host += 1;
         }
     }

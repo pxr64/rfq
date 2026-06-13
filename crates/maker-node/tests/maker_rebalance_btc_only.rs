@@ -35,7 +35,10 @@ async fn split_pools_btc_only_splits_into_pieces() {
     };
     // Two rungs that comfortably fit, leaving change well above the 1000 floor.
     let rungs = vec![source_sats / 4, source_sats / 8];
-    assert!(rungs[1] > 1000, "source {source_sats} too small for this test");
+    assert!(
+        rungs[1] > 1000,
+        "source {source_sats} too small for this test"
+    );
 
     // No RGB assets → build_btc_split.
     let (raw_tx, split_txid) = {
@@ -46,7 +49,10 @@ async fn split_pools_btc_only_splits_into_pieces() {
             .expect("build + sign btc-only split")
     };
     let broadcast = stack.broadcast(&raw_tx).expect("broadcast btc split");
-    assert_eq!(broadcast, split_txid, "broadcast txid matches built witness id");
+    assert_eq!(
+        broadcast, split_txid,
+        "broadcast txid matches built witness id"
+    );
 
     let maker = stack.maker_backend().await;
     maker.sync_wallet().await.expect("maker sync (post)");

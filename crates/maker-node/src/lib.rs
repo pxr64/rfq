@@ -594,11 +594,16 @@ pub async fn build_runtime(
             let fills_store: Arc<dyn rfq_store::FillStore> = Arc::new(fills_store);
             let order_store: Arc<dyn OrderStore> = Arc::new(order_store);
             let selector: Arc<dyn CoinSelector> = Arc::new(GreedyExactFitSelector);
-            let mut maker =
-                Maker::with_components(maker_id, inv_store, selector, rgb_backend_trait, bitcoin_client)
-                    .with_btc_store(btc_store)
-                    .with_consignment_store(consignment_store)
-                    .with_fills_store(fills_store);
+            let mut maker = Maker::with_components(
+                maker_id,
+                inv_store,
+                selector,
+                rgb_backend_trait,
+                bitcoin_client,
+            )
+            .with_btc_store(btc_store)
+            .with_consignment_store(consignment_store)
+            .with_fills_store(fills_store);
             // Settlement-piggyback shares the rebalance opt-in: when enabled, buy
             // swaps split the maker's RGB change into the same RGB ladder.
             if config.rebalance.enabled {
@@ -977,7 +982,9 @@ pub fn spawn_strategy_loop(
                 let opp = orders::opposite(f.side.clone());
                 match order_store.get(&f.asset_id, side_str(&opp)).await {
                     Ok(Some(existing)) if !existing.mirror => {
-                        eprintln!("strategy: mirror skipped (opposite-side order is operator-pinned)");
+                        eprintln!(
+                            "strategy: mirror skipped (opposite-side order is operator-pinned)"
+                        );
                         maker.mark_fill_mirrored(&f.quote_id).await;
                         continue;
                     }
@@ -1160,11 +1167,12 @@ async fn rebalance_once(
     let btc_avail = maker.available_btc().await;
     let btc_total: u64 = btc_avail.iter().map(|(_, s)| *s).sum();
     let fattest_btc = btc_avail.iter().max_by_key(|(_, s)| *s).cloned();
-    let btc_split = plan_ladder(&btc_avail, btc_spec).map(|(source, source_sats, rungs)| BtcSplit {
-        source,
-        source_sats,
-        rungs,
-    });
+    let btc_split =
+        plan_ladder(&btc_avail, btc_spec).map(|(source, source_sats, rungs)| BtcSplit {
+            source,
+            source_sats,
+            rungs,
+        });
 
     if asset_splits.is_empty() && btc_split.is_none() {
         return RebalanceTick::Idle;
@@ -1274,7 +1282,10 @@ async fn rebalance_once(
     let btc_arg = btc_source_op.clone().map(|op| {
         (
             op,
-            plan.btc.as_ref().map(|b| b.rungs.clone()).unwrap_or_default(),
+            plan.btc
+                .as_ref()
+                .map(|b| b.rungs.clone())
+                .unwrap_or_default(),
         )
     });
     let (raw_tx, txid) = match deps
@@ -1338,8 +1349,7 @@ mod tests {
     #[tokio::test]
     async fn reconcile_seeds_each_asset_independently() {
         use rfq_types::{AssetKind, BitcoinNetwork};
-        let path =
-            std::env::temp_dir().join(format!("maker-reconcile-{}.db", std::process::id()));
+        let path = std::env::temp_dir().join(format!("maker-reconcile-{}.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let store = SqliteInventoryStore::open(&path).await.unwrap();
 
@@ -1534,7 +1544,11 @@ mod tests {
 
     async fn request_quote(app: Router, rfq_id: &str) -> Quote {
         let response = app
-            .oneshot(json_request(Method::POST, "/quotes", &quote_request(rfq_id)))
+            .oneshot(json_request(
+                Method::POST,
+                "/quotes",
+                &quote_request(rfq_id),
+            ))
             .await
             .unwrap();
 
@@ -1616,7 +1630,11 @@ pub fn spawn_chain_observer_loop(
             }
             let now = now_ms();
             // BTC pool excludes EVERY traded contract's allocations in one call.
-            match deps.rgb_backend.list_btc_only_utxos(&deps.assets, now).await {
+            match deps
+                .rgb_backend
+                .list_btc_only_utxos(&deps.assets, now)
+                .await
+            {
                 Ok(utxos) => {
                     let added = maker.ingest_btc_change_utxos(utxos).await;
                     if added > 0 {

@@ -7,11 +7,14 @@
 use std::time::Duration;
 
 use maker_node::broker_client::{broker_ws_url, run_broker_stream};
-use maker_node::{build_runtime, IntervalsConfig, MakerNodeConfig, MakerSection, RebalancePolicyConfig};
+use maker_node::{
+    build_runtime, IntervalsConfig, MakerNodeConfig, MakerSection, RebalancePolicyConfig,
+};
 use rfq_api::registry::MakerRegistry;
 use rfq_client::{RfqClient, Url};
 use rfq_types::{
-    AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, CreateRfqRequest, MakerId, Side, SwapLeg,
+    AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, CreateRfqRequest, MakerId, Side,
+    SwapLeg,
 };
 use tokio::net::TcpListener;
 

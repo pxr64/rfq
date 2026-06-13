@@ -29,7 +29,10 @@ async fn recovers_rgb_into_pinned_host() {
     // Pick an RGB allocation to sweep + snapshot the total.
     let (pre_total, sweep_op) = {
         let maker = stack.maker_backend().await;
-        maker.sync_wallet().await.expect("maker sync (pre-recovery)");
+        maker
+            .sync_wallet()
+            .await
+            .expect("maker sync (pre-recovery)");
         let inv = maker
             .list_inventory_utxos(&asset)
             .await
@@ -80,7 +83,11 @@ async fn recovers_rgb_into_pinned_host() {
             .await
             .expect("build + sign recovery sweep")
     };
-    assert_eq!(swept, vec![sweep_op.clone()], "the swept outpoint is reported");
+    assert_eq!(
+        swept,
+        vec![sweep_op.clone()],
+        "the swept outpoint is reported"
+    );
 
     // Broadcast + confirm (the harness mines).
     let broadcast_txid = stack.broadcast(&raw_tx).expect("broadcast recovery tx");
@@ -91,7 +98,10 @@ async fn recovers_rgb_into_pinned_host() {
 
     // Re-open the wallet, sync, and assert the recovery landed correctly.
     let maker = stack.maker_backend().await;
-    maker.sync_wallet().await.expect("maker sync (post-recovery)");
+    maker
+        .sync_wallet()
+        .await
+        .expect("maker sync (post-recovery)");
     let inv = maker
         .list_inventory_utxos(&asset)
         .await

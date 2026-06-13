@@ -25,8 +25,8 @@ use maker_node::{
     MakerNodeRuntime, MakerSection, RebalancePolicyConfig, RgbConfig, SignerConfig,
 };
 use rfq_client::{RfqClient, Url};
-use rfq_router::{HttpMakerConnector, MakerConnector};
 use rfq_rgb::test_helpers;
+use rfq_router::{HttpMakerConnector, MakerConnector};
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, CreateRfqRequest, MakerId, Outpoint,
     Side, SwapLeg,
@@ -227,7 +227,10 @@ async fn drive_buy_via_broker(
             .accept_consignment(asset, &delivery)
             .await
             .expect("taker imports the bought RGB");
-        taker.sync_wallet().await.expect("taker re-sync after the buy");
+        taker
+            .sync_wallet()
+            .await
+            .expect("taker re-sync after the buy");
         let post_total: u64 = taker
             .inventory(asset)
             .await
@@ -283,8 +286,14 @@ async fn drive_sell_via_broker(
             have += u.amount;
             chosen.push(u.outpoint.clone());
         }
-        assert!(have >= amount, "taker holds {have} RGB, needs {amount} to sell");
-        let strs: Vec<String> = chosen.iter().map(|o| format!("{}:{}", o.txid, o.vout)).collect();
+        assert!(
+            have >= amount,
+            "taker holds {have} RGB, needs {amount} to sell"
+        );
+        let strs: Vec<String> = chosen
+            .iter()
+            .map(|o| format!("{}:{}", o.txid, o.vout))
+            .collect();
         let c = taker
             .export_provenance(stack.contract_id_str(), &strs)
             .expect("export_provenance");
@@ -367,7 +376,10 @@ async fn drive_sell_via_broker(
             .accept_consignment(asset, &change)
             .await
             .expect("taker imports its RGB change");
-        taker.sync_wallet().await.expect("taker re-sync after the swap");
+        taker
+            .sync_wallet()
+            .await
+            .expect("taker re-sync after the swap");
         let post_total: u64 = taker
             .inventory(asset)
             .await
@@ -410,8 +422,11 @@ async fn spawn_maker_node(
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let observer_handle =
-        spawn_chain_observer_loop(maker.clone(), chain_observer, config.intervals.chain_observer);
+    let observer_handle = spawn_chain_observer_loop(
+        maker.clone(),
+        chain_observer,
+        config.intervals.chain_observer,
+    );
 
     (maker, observer_handle, base_url)
 }

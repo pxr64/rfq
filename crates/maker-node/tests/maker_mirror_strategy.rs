@@ -18,8 +18,8 @@ use maker_node::{
     RebalancePolicyConfig, RgbConfig, SignerConfig,
 };
 use rfq_client::{RfqClient, Url};
-use rfq_router::{HttpMakerConnector, MakerConnector};
 use rfq_rgb::test_helpers;
+use rfq_router::{HttpMakerConnector, MakerConnector};
 use rfq_store::OrderRecord;
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, CreateRfqRequest, MakerId, Side,
@@ -103,9 +103,18 @@ async fn fill_records_and_auto_mirrors_the_opposite_order() {
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let observer = spawn_chain_observer_loop(maker.clone(), chain_observer, Duration::from_millis(500));
-    let reload = spawn_order_reload_loop(maker.clone(), order_store.clone(), Duration::from_millis(300));
-    let strategy = spawn_strategy_loop(maker.clone(), order_store.clone(), config.intervals.strategy);
+    let observer =
+        spawn_chain_observer_loop(maker.clone(), chain_observer, Duration::from_millis(500));
+    let reload = spawn_order_reload_loop(
+        maker.clone(),
+        order_store.clone(),
+        Duration::from_millis(300),
+    );
+    let strategy = spawn_strategy_loop(
+        maker.clone(),
+        order_store.clone(),
+        config.intervals.strategy,
+    );
 
     let broker_base_url = spawn_broker(&maker_base_url, MAKER_NODE_ID).await;
     let client = RfqClient::new(Url::parse(&broker_base_url).expect("broker url"));
@@ -124,7 +133,9 @@ async fn fill_records_and_auto_mirrors_the_opposite_order() {
     tokio::time::sleep(Duration::from_millis(1500)).await;
 
     // ★ FILLED counter: the maker recorded BUY_AMOUNT sold on the buy side.
-    let filled = maker.filled_for(stack.contract_id_str(), &Side::Buy, 0).await;
+    let filled = maker
+        .filled_for(stack.contract_id_str(), &Side::Buy, 0)
+        .await;
     assert_eq!(
         filled, BUY_AMOUNT,
         "maker should record {BUY_AMOUNT} filled on the buy side (got {filled})"
@@ -137,9 +148,15 @@ async fn fill_records_and_auto_mirrors_the_opposite_order() {
         .expect("order store get")
         .expect("strategy must auto-place the opposite SELL mirror order");
     let expected_unit = UNIT_PRICE * (10_000 - SPREAD_BPS as u64) / 10_000; // 20 * 9500/10000 = 19
-    assert_eq!(mirror.price, expected_unit, "mirror priced at fill_unit - spread");
+    assert_eq!(
+        mirror.price, expected_unit,
+        "mirror priced at fill_unit - spread"
+    );
     assert_eq!(mirror.size, BUY_AMOUNT, "mirror sized to the filled amount");
-    assert!(mirror.mirror, "mirror order is itself mirror-enabled (continues the loop)");
+    assert!(
+        mirror.mirror,
+        "mirror order is itself mirror-enabled (continues the loop)"
+    );
     assert_eq!(mirror.mirror_spread_bps, SPREAD_BPS);
 
     observer.abort();

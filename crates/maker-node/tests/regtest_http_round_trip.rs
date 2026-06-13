@@ -126,11 +126,7 @@ async fn http_two_consecutive_buys_via_chain_observer() {
 /// base URL). The caller aborts the observer when the test ends.
 async fn spawn_maker_node(
     config: &mut MakerNodeConfig,
-) -> (
-    rfq_maker::Maker,
-    tokio::task::JoinHandle<()>,
-    String,
-) {
+) -> (rfq_maker::Maker, tokio::task::JoinHandle<()>, String) {
     let runtime: MakerNodeRuntime = build_runtime(config).await.expect("build_runtime");
     let MakerNodeRuntime {
         maker,
@@ -289,4 +285,3 @@ async fn decode_or_panic<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&body)
         .unwrap_or_else(|e| panic!("{label}: parse JSON failed ({e}); body was: {body}"))
 }
-

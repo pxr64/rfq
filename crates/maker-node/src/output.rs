@@ -64,7 +64,11 @@ pub fn step_ok() {
 
 /// Like [`step_ok`] but appends a dimmed parenthetical detail: `[ok] (detail)`.
 pub fn step_ok_with(detail: &str) {
-    println!("{} {}", paint("[ok]", GREEN), paint(&format!("({detail})"), DIM));
+    println!(
+        "{} {}",
+        paint("[ok]", GREEN),
+        paint(&format!("({detail})"), DIM)
+    );
 }
 
 /// A standalone `› label` line (chevron, newline, no `[ok]`) — for static info

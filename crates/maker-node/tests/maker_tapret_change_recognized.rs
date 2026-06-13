@@ -38,9 +38,9 @@ use maker_node::{
     MakerNodeRuntime, MakerSection, RebalancePolicyConfig, RgbConfig, SignerConfig,
 };
 use rfq_client::{RfqClient, Url};
-use rfq_router::{HttpMakerConnector, MakerConnector};
 use rfq_rgb::test_helpers;
 use rfq_rgb::RgbBackend;
+use rfq_router::{HttpMakerConnector, MakerConnector};
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, CreateRfqRequest, MakerId, Side,
     SwapLeg,
@@ -127,7 +127,10 @@ async fn maker_recognizes_pinned_tapret_change_after_swap() {
     //     path where the change used to strand), and assert recognition ---
     let (post_total, change_outpoint, change_terminal) = {
         let maker = stack.maker_backend().await;
-        maker.sync_wallet().await.expect("maker sync after the swap");
+        maker
+            .sync_wallet()
+            .await
+            .expect("maker sync after the swap");
         let inv = maker
             .list_inventory_utxos(&asset)
             .await
@@ -280,8 +283,11 @@ async fn spawn_maker_node(
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let observer_handle =
-        spawn_chain_observer_loop(maker.clone(), chain_observer, config.intervals.chain_observer);
+    let observer_handle = spawn_chain_observer_loop(
+        maker.clone(),
+        chain_observer,
+        config.intervals.chain_observer,
+    );
 
     (maker, observer_handle, base_url)
 }

@@ -17,9 +17,7 @@
 //! Run with the regtest stack up + tools installed (see rfq-rgb/tests/cli.rs):
 //!   cargo test -p maker-node --test maker_rebalance_ladder -- --ignored
 
-use rfq_maker::{
-    assemble_rebalance_tx, plan_ladder, AssetSplit, LadderSpec,
-};
+use rfq_maker::{assemble_rebalance_tx, plan_ladder, AssetSplit, LadderSpec};
 use rfq_rgb::{test_helpers, RgbBackend};
 
 #[tokio::test]
@@ -33,13 +31,19 @@ async fn ladder_splits_converge_and_are_idempotent() {
     let (pre_total, pre_values) = {
         let maker = stack.maker_backend().await;
         maker.sync_wallet().await.expect("maker sync (pre)");
-        let inv = maker.list_inventory_utxos(&asset).await.expect("inventory (pre)");
+        let inv = maker
+            .list_inventory_utxos(&asset)
+            .await
+            .expect("inventory (pre)");
         let total: u64 = inv.iter().map(|u| u.amount).sum();
         let values: Vec<(rfq_types::Outpoint, u64)> =
             inv.iter().map(|u| (u.outpoint.clone(), u.amount)).collect();
         (total, values)
     };
-    assert!(pre_total >= 8, "RGB total {pre_total} too small for a ladder");
+    assert!(
+        pre_total >= 8,
+        "RGB total {pre_total} too small for a ladder"
+    );
 
     // base = total/8, halving, 2 copies × 3 tiers → up to 6 target rungs.
     let spec = LadderSpec {
@@ -108,16 +112,25 @@ async fn ladder_splits_converge_and_are_idempotent() {
             .expect("build + sign ladder split")
     };
     let broadcast_txid = stack.broadcast(&raw_tx).expect("broadcast ladder split");
-    assert_eq!(broadcast_txid, split_txid, "broadcast txid matches built witness id");
+    assert_eq!(
+        broadcast_txid, split_txid,
+        "broadcast txid matches built witness id"
+    );
 
     // Re-sync and assert convergence.
     let maker = stack.maker_backend().await;
     maker.sync_wallet().await.expect("maker sync (post)");
-    let inv = maker.list_inventory_utxos(&asset).await.expect("inventory (post)");
+    let inv = maker
+        .list_inventory_utxos(&asset)
+        .await
+        .expect("inventory (post)");
     let post_total: u64 = inv.iter().map(|u| u.amount).sum();
 
     // ★ Self-transfer: total preserved.
-    assert_eq!(post_total, pre_total, "ladder split is a self-transfer; RGB total preserved");
+    assert_eq!(
+        post_total, pre_total,
+        "ladder split is a self-transfer; RGB total preserved"
+    );
     // ★ Source consumed.
     assert!(
         !inv.iter().any(|u| u.outpoint == source),

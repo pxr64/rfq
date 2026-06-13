@@ -157,5 +157,8 @@ async fn splits_rgb_into_keychain0_rungs() {
         }
     }
     assert_eq!(rung_pieces, 2, "both rungs recognized on keychain 0");
-    assert_eq!(remainder_pieces, 1, "remainder recognized on the pinned host");
+    assert_eq!(
+        remainder_pieces, 1,
+        "remainder recognized on the pinned host"
+    );
 }

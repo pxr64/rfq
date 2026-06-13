@@ -20,7 +20,10 @@ pub fn broker_ws_url(broker_url: &str) -> String {
     let base = base
         .strip_prefix("https://")
         .map(|rest| format!("wss://{rest}"))
-        .or_else(|| base.strip_prefix("http://").map(|rest| format!("ws://{rest}")))
+        .or_else(|| {
+            base.strip_prefix("http://")
+                .map(|rest| format!("ws://{rest}"))
+        })
         .unwrap_or_else(|| base.to_owned());
     format!("{base}/maker-stream")
 }
@@ -68,7 +71,9 @@ async fn connect_and_serve(
         let text = match msg? {
             Message::Text(t) => t,
             Message::Close(_) => break,
-            Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => continue,
+            Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {
+                continue
+            }
         };
         let request: WsRequest = serde_json::from_str(&text)?;
         let result = dispatch(maker, request.op).await;
@@ -98,7 +103,11 @@ async fn dispatch(maker: &Maker, op: WsOp) -> WsResult {
             quote_id,
             consignment,
             outpoints,
-        } => settle(maker.deliver_consignment(quote_id, consignment, outpoints).await),
+        } => settle(
+            maker
+                .deliver_consignment(quote_id, consignment, outpoints)
+                .await,
+        ),
         WsOp::SubmitSignedPsbt { quote_id, psbt } => {
             settle(maker.submit_signed_psbt(quote_id, psbt).await)
         }

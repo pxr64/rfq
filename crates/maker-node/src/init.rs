@@ -14,12 +14,12 @@
 use std::path::{Path, PathBuf};
 
 use clap::Args;
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password};
+use rfq_client::{RfqClient, Url};
 use rfq_wallet::{
     default_account_file, default_data_dir, default_electrum_url, expand_tilde, prompt_network,
     ResolvedWallet, WalletConfig,
 };
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password};
-use rfq_client::{RfqClient, Url};
 
 use crate::{node_key::NodeKey, output};
 
@@ -120,7 +120,9 @@ pub async fn run(args: InitArgs, config_path: &Path) -> Result<(), Box<dyn std::
         match resolved_from(r).create_wallet() {
             Ok(Some(addr)) => {
                 output::step_ok();
-                println!("  fund this tapret (keychain-10) address, then run `colorex wallet sync`:");
+                println!(
+                    "  fund this tapret (keychain-10) address, then run `colorex wallet sync`:"
+                );
                 println!("    {addr}");
             }
             Ok(None) => output::step_skip(), // wallet already exists — kept as-is
@@ -148,9 +150,7 @@ pub async fn run(args: InitArgs, config_path: &Path) -> Result<(), Box<dyn std::
     if rgb.is_some() {
         output::step("contracts");
         output::step_skip();
-        output::note(
-            "register assets to trade after funding: colorex maker contract import <id>",
-        );
+        output::note("register assets to trade after funding: colorex maker contract import <id>");
     }
 
     output::step("subscribing to broker");
@@ -266,7 +266,6 @@ fn resolved_from(r: &RgbAnswers) -> ResolvedWallet {
         password: r.password.clone(),
     }
 }
-
 
 async fn probe_broker(broker_url: &str) -> Result<String, Box<dyn std::error::Error>> {
     let url = Url::parse(broker_url)?;

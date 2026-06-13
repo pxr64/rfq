@@ -26,10 +26,9 @@ impl std::fmt::Display for NodeKeyError {
         match self {
             NodeKeyError::Io(e) => write!(f, "node key io: {e}"),
             NodeKeyError::Secp(e) => write!(f, "node key crypto: {e}"),
-            NodeKeyError::InvalidLength { expected, actual } => write!(
-                f,
-                "node key file has {actual} bytes, expected {expected}"
-            ),
+            NodeKeyError::InvalidLength { expected, actual } => {
+                write!(f, "node key file has {actual} bytes, expected {expected}")
+            }
         }
     }
 }
@@ -139,7 +138,8 @@ mod tests {
 
     #[test]
     fn persist_then_load_round_trips() {
-        let dir = std::env::temp_dir().join(format!("colorex-node-key-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("colorex-node-key-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let secret_path = dir.join("node.key");
         let pubkey_path = dir.join("node.pub");
@@ -148,10 +148,7 @@ mod tests {
         original.persist(&secret_path, &pubkey_path).unwrap();
 
         let loaded = NodeKey::load(&secret_path).unwrap();
-        assert_eq!(
-            original.secret.secret_bytes(),
-            loaded.secret.secret_bytes()
-        );
+        assert_eq!(original.secret.secret_bytes(), loaded.secret.secret_bytes());
         assert_eq!(original.pubkey.serialize(), loaded.pubkey.serialize());
         assert_eq!(original.node_id(), loaded.node_id());
 
@@ -163,10 +160,7 @@ mod tests {
 
     #[test]
     fn load_rejects_wrong_length_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "colorex-node-key-bad-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("colorex-node-key-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("node.key");
         std::fs::write(&path, [0u8; 16]).unwrap();

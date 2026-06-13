@@ -30,9 +30,7 @@ async fn split_pools_splits_two_contracts_in_one_tx() {
     let stack = test_helpers::stack().await;
     let asset1 = stack.asset();
     // Maker mints a second contract to itself (fresh funded genesis).
-    let asset2 = stack
-        .issue_second_maker_contract("COLY", 1_000_000)
-        .await;
+    let asset2 = stack.issue_second_maker_contract("COLY", 1_000_000).await;
     let assets = [asset1.clone(), asset2.clone()];
 
     // Plan a ladder for each asset against its live inventory.
@@ -42,9 +40,16 @@ async fn split_pools_splits_two_contracts_in_one_tx() {
         let maker = stack.maker_backend().await;
         maker.sync_wallet().await.expect("maker sync (pre)");
         for asset in &assets {
-            let inv = maker.list_inventory_utxos(asset).await.expect("inventory (pre)");
+            let inv = maker
+                .list_inventory_utxos(asset)
+                .await
+                .expect("inventory (pre)");
             let total: u64 = inv.iter().map(|u| u.amount).sum();
-            assert!(total >= 4, "asset {} total {total} too small to split", asset.id);
+            assert!(
+                total >= 4,
+                "asset {} total {total} too small to split",
+                asset.id
+            );
             let pairs: Vec<(rfq_types::Outpoint, u64)> =
                 inv.iter().map(|u| (u.outpoint.clone(), u.amount)).collect();
             let (source, source_amount, rungs) =
@@ -94,18 +99,30 @@ async fn split_pools_splits_two_contracts_in_one_tx() {
             .await
             .expect("build + sign two-contract split")
     };
-    let broadcast = stack.broadcast(&raw_tx).expect("broadcast two-contract split");
-    assert_eq!(broadcast, split_txid, "broadcast txid matches built witness id");
+    let broadcast = stack
+        .broadcast(&raw_tx)
+        .expect("broadcast two-contract split");
+    assert_eq!(
+        broadcast, split_txid,
+        "broadcast txid matches built witness id"
+    );
 
     // Re-sync and assert BOTH contracts split correctly on the SAME tx.
     let maker = stack.maker_backend().await;
     maker.sync_wallet().await.expect("maker sync (post)");
     for (i, asset) in assets.iter().enumerate() {
-        let inv = maker.list_inventory_utxos(asset).await.expect("inventory (post)");
+        let inv = maker
+            .list_inventory_utxos(asset)
+            .await
+            .expect("inventory (post)");
         let post_total: u64 = inv.iter().map(|u| u.amount).sum();
 
         // ★ Self-transfer per contract: total preserved.
-        assert_eq!(post_total, pre_totals[i], "asset {} total preserved", asset.id);
+        assert_eq!(
+            post_total, pre_totals[i],
+            "asset {} total preserved",
+            asset.id
+        );
         // ★ Source consumed.
         assert!(
             !inv.iter().any(|u| u.outpoint == splits[i].source),
@@ -131,7 +148,11 @@ async fn split_pools_splits_two_contracts_in_one_tx() {
                 .await
                 .expect("terminal lookup")
                 .expect("rung derives from the descriptor");
-            assert_eq!(terminal.0, 0, "asset {} rung on keychain 0, got {terminal:?}", asset.id);
+            assert_eq!(
+                terminal.0, 0,
+                "asset {} rung on keychain 0, got {terminal:?}",
+                asset.id
+            );
         }
         // ★ Converged: nothing left to split for this asset.
         let post_pairs: Vec<(rfq_types::Outpoint, u64)> =
