@@ -94,7 +94,12 @@ impl CoinSelector for GreedyExactFitSelector {
 
         // Step 1: exact single.
         if let Some(u) = candidates.iter().find(|u| u.amount == amount) {
-            return Ok(make_selection(asset, vec![u.outpoint.clone()], u.amount, amount));
+            return Ok(make_selection(
+                asset,
+                vec![u.outpoint.clone()],
+                u.amount,
+                amount,
+            ));
         }
 
         // Step 2: bounded subset-sum exact (2-of-N then 3-of-N).
@@ -305,7 +310,9 @@ mod tests {
         // {100, 50, 50}, target 100. Step 1 returns {100} even though
         // {50, 50} is also exact at zero change.
         let utxos = vec![available(0, 100), available(1, 50), available(2, 50)];
-        let sel = GreedyExactFitSelector.select(&asset(), 100, &utxos).unwrap();
+        let sel = GreedyExactFitSelector
+            .select(&asset(), 100, &utxos)
+            .unwrap();
         assert_eq!(sel.chosen.len(), 1);
         assert_eq!(sel.total_input, 100);
         assert_eq!(sel.expected_change, 0);
@@ -330,7 +337,9 @@ mod tests {
             available(2, 30),
             available(3, 50),
         ];
-        let sel = GreedyExactFitSelector.select(&asset(), 100, &utxos).unwrap();
+        let sel = GreedyExactFitSelector
+            .select(&asset(), 100, &utxos)
+            .unwrap();
         assert_eq!(sel.chosen.len(), 3);
         assert_eq!(sel.total_input, 100);
         assert_eq!(sel.expected_change, 0);
@@ -341,7 +350,9 @@ mod tests {
         // {100, 60, 200}, target 150. No exact. Single > 150 = 200, change 50.
         // Greedy desc starts at 200, stops, change 50. Same result.
         let utxos = vec![available(0, 100), available(1, 60), available(2, 200)];
-        let sel = GreedyExactFitSelector.select(&asset(), 150, &utxos).unwrap();
+        let sel = GreedyExactFitSelector
+            .select(&asset(), 150, &utxos)
+            .unwrap();
         assert_eq!(sel.chosen, vec![outpoint_for(2)]);
         assert_eq!(sel.total_input, 200);
         assert_eq!(sel.expected_change, 50);
@@ -353,7 +364,9 @@ mod tests {
         // change 100. Greedy desc would start at 500, change 400.
         // pick_better favors single.
         let utxos = vec![available(0, 200), available(1, 300), available(2, 500)];
-        let sel = GreedyExactFitSelector.select(&asset(), 100, &utxos).unwrap();
+        let sel = GreedyExactFitSelector
+            .select(&asset(), 100, &utxos)
+            .unwrap();
         assert_eq!(sel.chosen, vec![outpoint_for(0)]);
         assert_eq!(sel.total_input, 200);
         assert_eq!(sel.expected_change, 100);
@@ -374,10 +387,16 @@ mod tests {
     #[test]
     fn selection_chosen_is_sorted_by_outpoint() {
         let utxos = vec![available(2, 50), available(0, 50), available(1, 50)];
-        let sel = GreedyExactFitSelector.select(&asset(), 150, &utxos).unwrap();
+        let sel = GreedyExactFitSelector
+            .select(&asset(), 150, &utxos)
+            .unwrap();
         assert_eq!(sel.chosen.len(), 3);
         for window in sel.chosen.windows(2) {
-            assert!(window[0] <= window[1], "chosen not sorted: {:?}", sel.chosen);
+            assert!(
+                window[0] <= window[1],
+                "chosen not sorted: {:?}",
+                sel.chosen
+            );
         }
     }
 

@@ -594,11 +594,18 @@ pub async fn build_runtime(
             let fills_store: Arc<dyn rfq_store::FillStore> = Arc::new(fills_store);
             let order_store: Arc<dyn OrderStore> = Arc::new(order_store);
             let selector: Arc<dyn CoinSelector> = Arc::new(GreedyExactFitSelector);
-            let maker =
+            let mut maker =
                 Maker::with_components(maker_id, inv_store, selector, rgb_backend_trait, bitcoin_client)
                     .with_btc_store(btc_store)
                     .with_consignment_store(consignment_store)
                     .with_fills_store(fills_store);
+            // Settlement-piggyback shares the rebalance opt-in: when enabled, buy
+            // swaps split the maker's RGB change into the same RGB ladder.
+            if config.rebalance.enabled {
+                maker = maker
+                    .with_piggyback_ladder(config.rebalance.rgb_ladder())
+                    .with_piggyback_btc_ladder(config.rebalance.btc_ladder());
+            }
             Ok(MakerNodeRuntime {
                 maker,
                 chain_observer: Some(ChainObserverDeps {

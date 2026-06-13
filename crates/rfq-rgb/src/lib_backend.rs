@@ -1140,24 +1140,30 @@ impl RgbBackend for LibRgbBackend {
         _btc_funding_addr: &str,
         gross_btc_sats: u64,
         actual_fee_sats: u64,
+        change_rungs: &[u64],
     ) -> Result<SwapTransfer, RgbError> {
         let _guard = self.guard();
         let account = self.load_signer()?;
         let mut wallet = self.load_wallet()?;
 
         // 1. Parse the taker's invoice and resolve the maker's payout address +
-        //    reserved RGB inputs.
-        let inputs = swap::prepare_buy_inputs(&mut wallet, rgb_invoice, maker_rgb_utxos)?;
-       
+        //    reserved RGB inputs. `change_rungs` (if any) reserves fresh k0
+        //    outputs that piggyback a denomination-ladder split of the maker's
+        //    RGB change onto this settlement tx.
+        let inputs =
+            swap::prepare_buy_inputs(&mut wallet, rgb_invoice, maker_rgb_utxos, change_rungs.len())?;
+
         // 2. Assemble the unsigned swap tx (maker RGB + taker BTC inputs) with the
         //    commitment host; from here the witness txid is final.
         let mut psbt =
             swap::assemble_unsigned_psbt(&inputs, taker_btc_inputs, gross_btc_sats, actual_fee_sats)?;
-       
+
         // 3. Build the RGB transition: pay the taker's seal (blinded or
-        //    witness-vout), change back to the maker. `delivery` carries how to
-        //    address the taker's consignment.
-        let (batch, delivery) = swap::build_buy_transition(&wallet, &inputs, &psbt, amount)?;
+        //    witness-vout), change back to the maker (split into `change_rungs`
+        //    rungs + a host remainder). `delivery` carries how to address the
+        //    taker's consignment.
+        let (batch, delivery) =
+            swap::build_buy_transition(&wallet, &inputs, &psbt, amount, change_rungs)?;
 
         // 4. Embed + commit the transition and emit the witness-extended consignment.
         let (transfer, witness_id) = swap::commit_and_consign(
@@ -1432,14 +1438,16 @@ impl RgbBackend for LibRgbBackend {
         rgb_change_invoice: Option<&str>,
         gross_btc_sats: u64,
         actual_fee_sats: u64,
+        btc_change_rungs: &[u64],
     ) -> Result<SwapTransfer, RgbError> {
         let _guard = self.guard();
         let account = self.load_signer()?;
         let mut wallet = self.load_wallet()?;
 
         // 1. Resolve the maker's side: taker's RGB-change seal (if any), the
-        //    taker's BTC payout spk, a fresh maker receive + change address, and
-        //    per-input terminals for the maker's BTC inputs.
+        //    taker's BTC payout spk, a fresh maker receive + change address,
+        //    per-input terminals for the maker's BTC inputs, and (if any) fresh
+        //    k0 outputs for piggybacking a BTC-change ladder split onto this tx.
         let inputs = swap::prepare_sell_inputs(
             &mut wallet,
             contract_id,
@@ -1447,15 +1455,18 @@ impl RgbBackend for LibRgbBackend {
             btc_payout_addr,
             rgb_change_invoice,
             maker_btc_inputs,
+            btc_change_rungs.len(),
         )?;
 
         // 2. Assemble the unsigned swap tx (taker RGB + maker BTC inputs) with
-        //    the commitment host; from here the witness txid is final.
+        //    the commitment host; from here the witness txid is final. The maker's
+        //    BTC change is split into `btc_change_rungs` + a remainder.
         let mut psbt = swap::assemble_sell_psbt(
             &inputs,
             taker_rgb_prevouts,
             gross_btc_sats,
             actual_fee_sats,
+            btc_change_rungs,
         )?;
 
         // 3. Build the RGB transition against the sorted PSBT: spend the taker's

@@ -171,7 +171,7 @@ async fn create_swap_psbt_buy_produces_psbt_and_consignment() {
     );
 
     let transfer = backend
-        .create_swap_psbt_buy(&invoice, 100, &maker_outpoints, &[], "bcrt1qtaker", 1_000, 100)
+        .create_swap_psbt_buy(&invoice, 100, &maker_outpoints, &[], "bcrt1qtaker", 1_000, 100, &[])
         .await
         .expect("create_swap_psbt_buy should compose a swap PSBT");
 
@@ -263,6 +263,7 @@ async fn create_swap_psbt_sell_produces_psbt() {
             None,
             10_000,
             500,
+            &[],
         )
         .await
         .expect("create_swap_psbt_sell should compose a swap PSBT");
@@ -302,7 +303,7 @@ async fn finalize_after_taker_sign_returns_extractable_witness_tx() {
         .expect("list_inventory_utxos");
     let maker_outpoints: Vec<Outpoint> = utxos.iter().map(|u| u.outpoint.clone()).collect();
     let transfer = backend
-        .create_swap_psbt_buy(&invoice, 100, &maker_outpoints, &[], "bcrt1qtaker", 1_000, 100)
+        .create_swap_psbt_buy(&invoice, 100, &maker_outpoints, &[], "bcrt1qtaker", 1_000, 100, &[])
         .await
         .expect("create_swap_psbt_buy should compose a swap PSBT");
 
@@ -404,6 +405,7 @@ async fn buy_round_trip_two_backends_broadcasts() {
                 stack.taker_funding_addr(),
                 1_000,
                 500,
+                &[],
             )
             .await
             .expect("create_swap_psbt_buy");
@@ -510,6 +512,7 @@ async fn chain_observer_enables_consecutive_buys() {
                         stack.taker_funding_addr(),
                         gross,
                         fee,
+                        &[],
                     )
                     .await
                     .expect("create_swap_psbt_buy");
@@ -696,6 +699,7 @@ async fn sell_round_trip_two_backends_broadcasts() {
                 Some(&taker_change_invoice), // surplus 300 → taker change
                 50_000_000,
                 500,
+                &[],
             )
             .await
             .expect("create_swap_psbt_sell");
@@ -789,6 +793,7 @@ async fn buy_round_trip_witness_vout_invoice_broadcasts() {
                 stack.taker_funding_addr(),
                 1_000,
                 500,
+                &[],
             )
             .await
             .expect("create_swap_psbt_buy (witness-vout)");
@@ -822,3 +827,103 @@ async fn buy_round_trip_witness_vout_invoice_broadcasts() {
         .expect("bitcoind accepts the witness-vout buy swap tx");
     assert_eq!(broadcast_txid, expected_wt);
 }
+
+#[tokio::test]
+#[ignore = "needs the regtest stack up + tools installed; see file header"]
+async fn buy_swap_piggybacks_change_into_a_ladder_rung() {
+    // Settlement-piggyback (buy side): the maker's RGB change rides this swap
+    // split into a denomination-ladder rung on a fresh k0 output + a host
+    // remainder, instead of one change allocation. Full two-backend flow, then
+    // assert the rung lands as recognized maker inventory.
+    let stack = common::stack().await;
+    let asset = stack.asset();
+
+    // Sell `amount` (= T/4) to the taker; change = 3T/4, split into one rung
+    // (= T/2) + a T/4 host remainder (rung distinct from remainder).
+    let (invoice, maker_outpoints, amount, rung) = {
+        let maker = stack.maker_backend().await;
+        let inv = maker
+            .list_inventory_utxos(&asset)
+            .await
+            .expect("list_inventory_utxos");
+        let total: u64 = inv.iter().map(|u| u.amount).sum();
+        assert!(total >= 4, "maker RGB total {total} too small");
+        let amount = total / 4;
+        let rung = total / 2;
+        let invoice = maker
+            .create_invoice(&asset, amount)
+            .await
+            .expect("create_invoice");
+        let outpoints: Vec<Outpoint> = inv.iter().map(|u| u.outpoint.clone()).collect();
+        (invoice, outpoints, amount, rung)
+    };
+
+    let (partial_psbt, consignment, expected_wt) = {
+        let taker_btc_input = {
+            let taker = stack.taker_backend().await;
+            taker
+                .spare_btc_input(&asset)
+                .await
+                .expect("taker spare BTC input")
+        };
+        let maker = stack.maker_backend().await;
+        let transfer = maker
+            .create_swap_psbt_buy(
+                &invoice,
+                amount,
+                &maker_outpoints,
+                std::slice::from_ref(&taker_btc_input),
+                stack.taker_funding_addr(),
+                1_000,
+                500,
+                &[rung],
+            )
+            .await
+            .expect("compose buy with a change rung");
+        let consignment = transfer.consignment.expect("buy emits consignment");
+        let wt = transfer
+            .expected_witness_txid
+            .clone()
+            .expect("stable witness txid");
+        (transfer.partial_psbt, consignment, wt)
+    };
+
+    let signed_psbt = {
+        let taker = stack.taker_backend().await;
+        taker.sign_and_finalize(&partial_psbt).expect("taker sign")
+    };
+    let finalized = {
+        let maker = stack.maker_backend().await;
+        maker
+            .finalize_after_taker_sign(&signed_psbt, &consignment)
+            .await
+            .expect("finalize")
+    };
+    assert_eq!(finalized.witness_txid, expected_wt);
+    let broadcast_txid = stack.broadcast(&finalized.raw_tx).expect("broadcast");
+    assert_eq!(broadcast_txid, expected_wt);
+
+    // The change rung is recognized maker inventory on the swap tx.
+    let maker = stack.maker_backend().await;
+    let inv = maker
+        .list_inventory_utxos(&asset)
+        .await
+        .expect("inventory (post)");
+    assert!(
+        inv.iter()
+            .any(|u| u.outpoint.txid == expected_wt && u.amount == rung),
+        "expected the change rung ({rung} units) on the swap tx; got {:#?}",
+        inv.iter()
+            .filter(|u| u.outpoint.txid == expected_wt)
+            .map(|u| u.amount)
+            .collect::<Vec<_>>()
+    );
+}
+
+// NOTE: a sell-side BTC-change piggyback e2e would mirror
+// `sell_round_trip_two_backends_broadcasts`, but that fixture is order-dependent
+// (the taker's RGB consignment flow only resolves in full-suite order — the test
+// fails standalone too). The sell-side no-op invariant is covered by
+// `maker-node`'s `broker_round_trip` (buy+sell). The BTC-change split is plain
+// k0 outputs (no RGB transition); its arithmetic is value-conserving by the same
+// assemble path the buy-side e2e exercises. Left as a follow-up under #35.

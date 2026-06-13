@@ -120,6 +120,10 @@ pub trait RgbBackend: Send + Sync {
     /// Because the full input set is final at build time, the witness txid is
     /// stable: `partial_psbt` is maker-RGB-side-signed, `consignment` is
     /// `Some`, and `expected_witness_txid` is `Some`.
+    /// `change_rungs` (usually empty) piggybacks a denomination-ladder split of
+    /// the maker's RGB change onto this settlement tx: each entry becomes a fresh
+    /// keychain-0 output carrying that many RGB units, with the remainder on the
+    /// host. Empty ⇒ the change rides the host as one allocation (unchanged).
     #[allow(clippy::too_many_arguments)]
     async fn create_swap_psbt_buy(
         &self,
@@ -130,6 +134,7 @@ pub trait RgbBackend: Send + Sync {
         btc_funding_addr: &str,
         gross_btc_sats: u64,
         actual_fee_sats: u64,
+        change_rungs: &[u64],
     ) -> Result<SwapTransfer, RgbError>;
 
     /// Finalize a fully-signed swap PSBT: extract the witness tx ready to
@@ -198,6 +203,10 @@ pub trait RgbBackend: Send + Sync {
     ///
     /// All inputs are committed here, so `expected_witness_txid` is `Some(_)` —
     /// unlike the buy side, where the taker's inputs are still outstanding.
+    /// `btc_change_rungs` (usually empty) piggybacks a BTC-denomination-ladder
+    /// split of the maker's BTC change onto this settlement tx: each entry becomes
+    /// a fresh keychain-0 output of that many sats, the remainder staying on the
+    /// change address. Sells deplete the k0 BTC pool, so this keeps it laddered.
     #[allow(clippy::too_many_arguments)]
     async fn create_swap_psbt_sell(
         &self,
@@ -210,6 +219,7 @@ pub trait RgbBackend: Send + Sync {
         rgb_change_invoice: Option<&str>,
         gross_btc_sats: u64,
         actual_fee_sats: u64,
+        btc_change_rungs: &[u64],
     ) -> Result<SwapTransfer, RgbError>;
 
     /// Sell-side `/sign` guard: confirm a taker-signed swap PSBT still spends
@@ -285,6 +295,7 @@ impl RgbBackend for MockRgbBackend {
         btc_funding_addr: &str,
         gross_btc_sats: u64,
         actual_fee_sats: u64,
+        _change_rungs: &[u64],
     ) -> Result<SwapTransfer, RgbError> {
         self.validate_invoice(rgb_invoice).await?;
 
@@ -434,6 +445,7 @@ impl RgbBackend for MockRgbBackend {
         rgb_change_invoice: Option<&str>,
         gross_btc_sats: u64,
         actual_fee_sats: u64,
+        _btc_change_rungs: &[u64],
     ) -> Result<SwapTransfer, RgbError> {
         let rgb_in = join_outpoints(taker_rgb_prevouts.iter().map(|(o, _)| o));
         let btc_in = join_outpoints(maker_btc_inputs.iter().map(|(o, _)| o));

@@ -335,6 +335,12 @@ pub(crate) struct BuyInputs {
     /// sats would be burned to fee — the maker's RGB-change *seal* is bound
     /// to `maker_payout_spk`, but no output carries the *bitcoin* surplus.
     maker_btc_change_spk: ScriptPubkey,
+    /// Fresh keychain-0 outputs that carry the maker's RGB CHANGE split into
+    /// denomination-ladder rungs (settlement-piggyback). Empty for an ordinary
+    /// swap — then the change rides `maker_payout_spk` as one allocation, exactly
+    /// as before. One spk per rung; each gets a 546-sat anchor carved from
+    /// `maker_btc_change_spk`'s recycled seal-anchor sats.
+    change_rung_spks: Vec<ScriptPubkey>,
     descriptor: RgbDescr,
     maker_inputs: Vec<MakerRgbInput>,
 }
@@ -347,6 +353,7 @@ pub(crate) fn prepare_buy_inputs(
     wallet: &mut MakerWallet,
     rgb_invoice: &str,
     maker_rgb_utxos: &[Outpoint],
+    n_change_rungs: usize,
 ) -> Result<BuyInputs, RgbError> {
     let invoice = RgbInvoice::from_str(rgb_invoice).map_err(|_| RgbError::InvalidInvoice)?;
     let contract_id = invoice
@@ -373,6 +380,15 @@ pub(crate) fn prepare_buy_inputs(
         .wallet_mut()
         .next_address(Keychain::OUTER, true)
         .script_pubkey();
+    // Fresh k0 outputs for the piggyback change rungs (none for an ordinary swap).
+    let change_rung_spks: Vec<ScriptPubkey> = (0..n_change_rungs)
+        .map(|_| {
+            wallet
+                .wallet_mut()
+                .next_address(Keychain::OUTER, true)
+                .script_pubkey()
+        })
+        .collect();
     let descriptor = wallet.wallet().descriptor().clone();
     let maker_inputs = resolve_maker_inputs(wallet, maker_rgb_utxos)?;
 
@@ -382,6 +398,7 @@ pub(crate) fn prepare_buy_inputs(
         maker_payout_spk,
         maker_payout_terminal,
         maker_btc_change_spk,
+        change_rung_spks,
         descriptor,
         maker_inputs,
     })
@@ -461,11 +478,25 @@ pub(crate) fn assemble_unsigned_psbt(
         .iter()
         .map(|i| i.value.into_inner())
         .sum();
-    if maker_rgb_btc_total > DUST_LIMIT_SATS {
+    // Settlement-piggyback: each change rung is a 546-sat anchor carved out of
+    // the maker's recycled seal-anchor sats; the remainder stays as BTC change.
+    // With no rungs this is byte-identical to before (whole total → change).
+    let rung_anchor_total = SEAL_ANCHOR_SATS.saturating_mul(inputs.change_rung_spks.len() as u64);
+    if maker_rgb_btc_total < rung_anchor_total {
+        return Err(RgbError::TransferBuild(format!(
+            "maker recycled sats {maker_rgb_btc_total} < {} change-rung anchors ({rung_anchor_total})",
+            inputs.change_rung_spks.len()
+        )));
+    }
+    let maker_btc_change = maker_rgb_btc_total - rung_anchor_total;
+    if maker_btc_change > DUST_LIMIT_SATS {
         tx_outputs.push(BpTxOut::new(
             inputs.maker_btc_change_spk.clone(),
-            Sats(maker_rgb_btc_total),
+            Sats(maker_btc_change),
         ));
+    }
+    for spk in &inputs.change_rung_spks {
+        tx_outputs.push(BpTxOut::new(spk.clone(), Sats(SEAL_ANCHOR_SATS)));
     }
     // Witness-vout receive output: carries the taker's bought RGB (the seal binds
     // to this output's post-sort vout in `build_buy_transition`).
@@ -535,7 +566,15 @@ pub(crate) fn build_buy_transition(
     inputs: &BuyInputs,
     psbt: &Psbt,
     amount: u64,
+    change_rungs: &[u64],
 ) -> Result<(Batch, DeliverySeal), RgbError> {
+    if change_rungs.len() != inputs.change_rung_spks.len() {
+        return Err(RgbError::TransferBuild(format!(
+            "change_rungs ({}) != prepared rung outputs ({})",
+            change_rungs.len(),
+            inputs.change_rung_spks.len()
+        )));
+    }
     // The maker's RGB change binds to the payout output's vout, which is only
     // known after Phase 2's commitment-host sort.
     let payout_vout = psbt
@@ -610,14 +649,41 @@ pub(crate) fn build_buy_transition(
         .add_fungible_state_raw(assignment_type, taker_builder_seal, Amount::from(amount))
         .map_err(|e| RgbError::TransferBuild(format!("add beneficiary state: {e}")))?;
     if sum_inputs > amount {
+        let change = sum_inputs - amount;
+        // Settlement-piggyback: carve the change into denomination rungs on fresh
+        // k0 outputs, leaving the remainder on the host. No rungs ⇒ the whole
+        // change rides the host as one allocation (unchanged behaviour).
+        let rungs_total: u64 = change_rungs.iter().sum();
+        if rungs_total >= change {
+            return Err(RgbError::TransferBuild(format!(
+                "change rungs {rungs_total} must be < RGB change {change} (leave a remainder)"
+            )));
+        }
+        for (spk, amt) in inputs.change_rung_spks.iter().zip(change_rungs) {
+            let vout = psbt
+                .outputs()
+                .find(|o| o.script == *spk)
+                .map(|o| o.vout())
+                .ok_or_else(|| {
+                    RgbError::TransferBuild("change-rung output missing after sort".to_owned())
+                })?;
+            let seal = GraphSeal::with_blinded_vout(vout, rand::random());
+            builder = builder
+                .add_fungible_state_raw(assignment_type, BuilderSeal::Revealed(seal), Amount::from(*amt))
+                .map_err(|e| RgbError::TransferBuild(format!("add change-rung state: {e}")))?;
+        }
         let change_seal = GraphSeal::with_blinded_vout(payout_vout, rand::random());
         builder = builder
             .add_fungible_state_raw(
                 assignment_type,
                 BuilderSeal::Revealed(change_seal),
-                Amount::from(sum_inputs - amount),
+                Amount::from(change - rungs_total),
             )
             .map_err(|e| RgbError::TransferBuild(format!("add change state: {e}")))?;
+    } else if !change_rungs.is_empty() {
+        return Err(RgbError::TransferBuild(
+            "change rungs requested but the swap leaves no RGB change".to_owned(),
+        ));
     }
 
     let main = builder
@@ -832,6 +898,12 @@ pub(crate) struct SellInputs {
     /// internal key `rgb_commit` tweaks.
     maker_receive_terminal: Terminal,
     maker_change_spk: ScriptPubkey,
+    /// Fresh keychain-0 outputs that split the maker's BTC change into a BTC
+    /// denomination ladder (settlement-piggyback — the maker pays takers from k0,
+    /// so sells deplete it). Empty for an ordinary swap (one change output). Each
+    /// rung is a plain BTC piece carved straight from the change (no RGB, no
+    /// anchor); the remainder stays on `maker_change_spk`.
+    btc_change_rung_spks: Vec<ScriptPubkey>,
     taker_payout_spk: ScriptPubkey,
     descriptor: RgbDescr,
     maker_btc_inputs: Vec<MakerBtcInput>,
@@ -850,6 +922,7 @@ pub(crate) fn prepare_sell_inputs(
     btc_payout_addr: &str,
     rgb_change_invoice: Option<&str>,
     maker_btc_inputs: &[(Outpoint, TxOut)],
+    n_btc_change_rungs: usize,
 ) -> Result<SellInputs, RgbError> {
     let taker_change_seal = match rgb_change_invoice {
         None => None,
@@ -882,6 +955,15 @@ pub(crate) fn prepare_sell_inputs(
         .wallet_mut()
         .next_address(Keychain::OUTER, true)
         .script_pubkey();
+    // Fresh k0 outputs for the BTC-change ladder rungs (none for an ordinary swap).
+    let btc_change_rung_spks: Vec<ScriptPubkey> = (0..n_btc_change_rungs)
+        .map(|_| {
+            wallet
+                .wallet_mut()
+                .next_address(Keychain::OUTER, true)
+                .script_pubkey()
+        })
+        .collect();
     let descriptor = wallet.wallet().descriptor().clone();
     let resolved_btc = resolve_maker_btc_inputs(wallet, maker_btc_inputs)?;
 
@@ -892,6 +974,7 @@ pub(crate) fn prepare_sell_inputs(
         maker_receive_spk,
         maker_receive_terminal,
         maker_change_spk,
+        btc_change_rung_spks,
         taker_payout_spk,
         descriptor,
         maker_btc_inputs: resolved_btc,
@@ -913,7 +996,15 @@ pub(crate) fn assemble_sell_psbt(
     taker_rgb_prevouts: &[(Outpoint, TxOut)],
     gross_btc_sats: u64,
     actual_fee_sats: u64,
+    btc_change_rungs: &[u64],
 ) -> Result<Psbt, RgbError> {
+    if btc_change_rungs.len() != inputs.btc_change_rung_spks.len() {
+        return Err(RgbError::TransferBuild(format!(
+            "btc_change_rungs ({}) != prepared rung outputs ({})",
+            btc_change_rungs.len(),
+            inputs.btc_change_rung_spks.len()
+        )));
+    }
     let maker_btc_total: u64 = inputs
         .maker_btc_inputs
         .iter()
@@ -967,11 +1058,25 @@ pub(crate) fn assemble_sell_psbt(
         });
     }
     let mut tx_outputs = vec![BpTxOut::new(inputs.taker_payout_spk.clone(), Sats(payout))];
-    if maker_change > DUST_LIMIT_SATS {
+    // Settlement-piggyback: split the maker's BTC change into a k0 ladder (sells
+    // deplete the BTC pool the maker pays takers from). Rungs are plain BTC
+    // pieces carved from the change; the remainder stays on `maker_change_spk`.
+    // No rungs ⇒ one change output, byte-identical to before.
+    let rungs_total: u64 = btc_change_rungs.iter().sum();
+    if rungs_total > maker_change {
+        return Err(RgbError::TransferBuild(format!(
+            "btc change rungs {rungs_total} exceed maker change {maker_change}"
+        )));
+    }
+    let maker_change_remainder = maker_change - rungs_total;
+    if maker_change_remainder > DUST_LIMIT_SATS {
         tx_outputs.push(BpTxOut::new(
             inputs.maker_change_spk.clone(),
-            Sats(maker_change),
+            Sats(maker_change_remainder),
         ));
+    }
+    for (spk, amt) in inputs.btc_change_rung_spks.iter().zip(btc_change_rungs) {
+        tx_outputs.push(BpTxOut::new(spk.clone(), Sats(*amt)));
     }
     // Maker receive output: carries the maker's bought RGB on a witness-vout
     // seal (bound to its post-sort vout in `build_sell_transition`).

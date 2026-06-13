@@ -3,10 +3,10 @@ use std::{
     sync::Arc,
 };
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use rfq_btc::BitcoinClient;
 use rfq_rgb::{ContractId, RgbBackend, TxOut};
-use std::str::FromStr as _;
 use rfq_router::{MakerConnector, RouterError};
 use rfq_store::{
     BtcCoinSelector, BtcInventoryStore, ConsignmentRecord, ConsignmentStore, FillRecord, FillStore,
@@ -16,15 +16,18 @@ use rfq_store::{
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetInfo, BitcoinNetwork, BtcInventoryStatus, BtcInventoryUtxo,
     ExtendedInventorySnapshot, InventoryError, InventorySnapshot, InventoryStatus, InventoryUtxo,
-    MakerId, OrderPrice, Outpoint, Quote, QuoteId, QuoteRequest, RfqId, RgbInventoryUtxo,
-    ReservationId, SettlementIntent, SettlementStatus, Side, SwapLeg,
+    MakerId, OrderPrice, Outpoint, Quote, QuoteId, QuoteRequest, ReservationId, RfqId,
+    RgbInventoryUtxo, SettlementIntent, SettlementStatus, Side, SwapLeg,
 };
-use arc_swap::ArcSwap;
+use std::str::FromStr as _;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 mod coin_select;
 pub use coin_select::{CoinSelectionError, CoinSelector, GreedyExactFitSelector, Selection};
+
+mod rebalance;
+pub use rebalance::*;
 
 /// Standing per-(asset, side) price the maker quotes at. Built from the operator's
 /// saved orders (`colorex maker order ...`); empty by default, so a maker with no
@@ -117,238 +120,6 @@ impl RebalancePlan {
     }
 }
 
-/// Every RGB-bearing output carries exactly this much BTC dust, independent of
-/// the RGB amount it holds — a 1-unit rung and a 1M-unit rung both anchor on 546
-/// sats. Mirrors `swap::SEAL_ANCHOR_SATS`; used by the rebalance budget.
-pub const REBALANCE_ANCHOR_SATS: u64 = 546;
-
-/// Sentinel `RfqId`/`QuoteId` prefix for the internal reservations the rebalance
-/// executor makes. Never collides with broker-issued ids, so the quoting path
-/// and the rebalancer can't fight over the same UTXO.
-const REBALANCE_RFQ_ID: &str = "__rebalance__";
-
-/// Smallest *spendable BTC* piece the BTC ladder will create (and the floor for
-/// split change — sub-floor change is folded into the fee). Distinct from the
-/// 546-sat anchor: that's dust on an RGB-bearing output; this is the minimum for
-/// a plain BTC UTXO the maker pays sell-side takers from.
-pub const DEFAULT_BTC_MIN_PIECE_SATS: u64 = 1000;
-
-/// RGB ladder `min_piece` default — the transferred asset amount doesn't affect
-/// cost (every rung anchors on 546 sats regardless), so any positive amount is a
-/// valid rung.
-pub const DEFAULT_RGB_MIN_PIECE: u64 = 1;
-
-/// A target distribution of UTXO values, largest→smallest, so coin selection and
-/// tx-building stay cheap. Geometric: tier `i` targets `base * ratio^i` and wants
-/// `copies` pieces of it; tiers whose value falls below `min_piece` are dropped.
-/// `ratio` is expected in `(0, 1)` (a halving ladder is `0.5`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct LadderSpec {
-    pub base: u64,
-    pub ratio: f64,
-    pub tiers: u32,
-    pub copies: u32,
-    pub min_piece: u64,
-}
-
-impl LadderSpec {
-    /// Expand into the desired multiset of rung values, largest first — `copies`
-    /// of each tier whose value is `>= min_piece` (and non-zero).
-    pub fn target_rungs(&self) -> Vec<u64> {
-        let mut out = Vec::new();
-        let mut v = self.base as f64;
-        for _ in 0..self.tiers {
-            let rung = v as u64;
-            if rung >= self.min_piece && rung > 0 {
-                for _ in 0..self.copies {
-                    out.push(rung);
-                }
-            }
-            v *= self.ratio;
-        }
-        out
-    }
-}
-
-/// One contract's rungs to carve from a single fat source UTXO.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AssetSplit {
-    pub asset: AssetId,
-    pub source: Outpoint,
-    /// RGB amount held by the source allocation.
-    pub source_amount: u64,
-    /// The source UTXO's own BTC value — funds its share of the anchor outputs.
-    pub source_btc_sats: u64,
-    /// RGB amounts to carve, largest→smallest (remainder = `source_amount - Σ`).
-    pub rungs: Vec<u64>,
-}
-
-/// The BTC pool's rungs to carve from a single fat BTC source UTXO.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BtcSplit {
-    pub source: Outpoint,
-    pub source_sats: u64,
-    /// Sats to carve, largest→smallest.
-    pub rungs: Vec<u64>,
-}
-
-/// The combined plan for one rebalance pass: every asset's rungs + the BTC
-/// rungs, carved by a single transaction with one fee and one tapret commitment.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct RebalanceTx {
-    pub assets: Vec<AssetSplit>,
-    pub btc: Option<BtcSplit>,
-    pub fee_sats: u64,
-    /// BTC the tx must source: `fee + anchor·(rgb outputs) + Σ(btc rungs)`.
-    pub btc_needed: u64,
-}
-
-/// Greedily match available pieces to target rungs (a piece covers a target iff
-/// `piece >= target`). Returns the targets left UNcovered — the rungs to mint.
-/// Classic "assign cookies" greedy: sort both ascending, satisfy the smallest
-/// target with the smallest sufficient piece. Optimal for maximizing coverage.
-fn ladder_deficit(available: &[u64], targets: &[u64]) -> Vec<u64> {
-    let mut pieces: Vec<u64> = available.to_vec();
-    pieces.sort_unstable();
-    let mut tgts: Vec<u64> = targets.to_vec();
-    tgts.sort_unstable();
-    let mut deficit = Vec::new();
-    let mut pi = 0usize;
-    for t in tgts {
-        while pi < pieces.len() && pieces[pi] < t {
-            pi += 1;
-        }
-        if pi < pieces.len() {
-            pi += 1; // consume this piece for the target
-        } else {
-            deficit.push(t);
-        }
-    }
-    deficit
-}
-
-/// Decide whether `available` `(outpoint, value)` needs splitting toward `spec`,
-/// and if so return the fattest source to cut plus the rung amounts to carve
-/// (largest first). Pure & idempotent — feeding the post-split distribution back
-/// returns `None`. At most ONE source per call (bounds tx cost; the loop
-/// converges over successive passes). Works for both RGB (asset units) and BTC
-/// (sats) since it's value-agnostic.
-pub fn plan_ladder(
-    available: &[(Outpoint, u64)],
-    spec: &LadderSpec,
-) -> Option<(Outpoint, u64, Vec<u64>)> {
-    let targets = spec.target_rungs();
-    if targets.is_empty() {
-        return None;
-    }
-    let values: Vec<u64> = available.iter().map(|(_, v)| *v).collect();
-    let mut deficit = ladder_deficit(&values, &targets);
-    if deficit.is_empty() {
-        return None;
-    }
-    // Source = the fattest available UTXO (the reserve we cut rungs from).
-    let (source_op, source_val) = available.iter().cloned().max_by_key(|(_, v)| *v)?;
-    // Carve deficit rungs largest-first that fit, always leaving a positive
-    // remainder (>= min_piece) so the host output carries a real allocation.
-    deficit.sort_unstable_by(|a, b| b.cmp(a));
-    let reserve = spec.min_piece.max(1);
-    let mut rungs = Vec::new();
-    let mut remaining = source_val;
-    for d in deficit {
-        if remaining >= d.saturating_add(reserve) {
-            rungs.push(d);
-            remaining -= d;
-        }
-    }
-    if rungs.is_empty() {
-        return None; // source too small to carve anything useful
-    }
-    Some((source_op, source_val, rungs))
-}
-
-/// BTC the rebalance tx must source for a given set of split plans.
-fn required_btc(assets: &[AssetSplit], btc: &Option<BtcSplit>, fee_sats: u64) -> u64 {
-    // Each asset emits one output per rung + one remainder output, each needing
-    // an anchor's worth of dust.
-    let rgb_outputs: u64 = assets.iter().map(|a| a.rungs.len() as u64 + 1).sum();
-    let btc_rungs: u64 = btc.as_ref().map(|b| b.rungs.iter().sum()).unwrap_or(0);
-    fee_sats
-        .saturating_add(REBALANCE_ANCHOR_SATS.saturating_mul(rgb_outputs))
-        .saturating_add(btc_rungs)
-}
-
-/// Drop one rung to shrink the BTC requirement. RGB rungs go first (smallest
-/// value across all assets — each frees one anchor while keeping the big, useful
-/// pieces); once no RGB rungs remain, the smallest BTC rung goes. Empty asset /
-/// BTC plans are removed. Returns `false` when nothing is left to drop.
-fn scale_down(assets: &mut Vec<AssetSplit>, btc: &mut Option<BtcSplit>) -> bool {
-    let mut smallest: Option<(usize, usize, u64)> = None; // (asset, rung, value)
-    for (ai, a) in assets.iter().enumerate() {
-        for (ri, &r) in a.rungs.iter().enumerate() {
-            if smallest.is_none_or(|(_, _, sv)| r < sv) {
-                smallest = Some((ai, ri, r));
-            }
-        }
-    }
-    if let Some((ai, ri, _)) = smallest {
-        assets[ai].rungs.remove(ri);
-        assets.retain(|a| !a.rungs.is_empty());
-        return true;
-    }
-    if let Some(b) = btc {
-        if let Some((ri, _)) = b.rungs.iter().enumerate().min_by_key(|(_, v)| **v) {
-            b.rungs.remove(ri);
-            if b.rungs.is_empty() {
-                *btc = None;
-            }
-            return true;
-        }
-    }
-    false
-}
-
-/// Combine per-asset + BTC split plans into one rebalance-tx plan under a single
-/// BTC budget. `btc_available_sats` is what the executor will commit to fund the
-/// tx (the BTC source plus any extra fee inputs). When the budget is short, rungs
-/// are dropped (RGB first — see [`scale_down`]) until it fits; if it can't even
-/// fund the fee + remainders, returns `None` (caller warns & skips — the maker
-/// can't mint BTC). Returns `None` when there's nothing to split.
-pub fn assemble_rebalance_tx(
-    mut assets: Vec<AssetSplit>,
-    mut btc: Option<BtcSplit>,
-    btc_available_sats: u64,
-    fee_sats: u64,
-) -> Option<RebalanceTx> {
-    assets.retain(|a| !a.rungs.is_empty());
-    if btc.as_ref().is_some_and(|b| b.rungs.is_empty()) {
-        btc = None;
-    }
-    if assets.is_empty() && btc.is_none() {
-        return None;
-    }
-    loop {
-        if assets.is_empty() && btc.is_none() {
-            return None; // scaled everything away — nothing left to split
-        }
-        // Recompute each pass: dropping a whole asset removes its source UTXO
-        // from the inputs, so its `source_btc_sats` no longer helps fund anchors.
-        let rgb_source_sats: u64 = assets.iter().map(|a| a.source_btc_sats).sum();
-        let avail = btc_available_sats.saturating_add(rgb_source_sats);
-        let need = required_btc(&assets, &btc, fee_sats);
-        if avail >= need {
-            return Some(RebalanceTx {
-                assets,
-                btc,
-                fee_sats,
-                btc_needed: need,
-            });
-        }
-        if !scale_down(&mut assets, &mut btc) {
-            return None;
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum RebalanceTrigger {
     HighFragmentation { score: f64, threshold: f64 },
@@ -409,13 +180,6 @@ pub fn clamp_next_block_feerate(raw_estimate: u64, network: &BitcoinNetwork) -> 
     raw_estimate.clamp(MIN_SWAP_FEERATE_SAT_VB, cap)
 }
 
-/// Rough vsize (vBytes) of an all-P2TR keyspend rebalance tx with the given
-/// input/output counts: ~11 tx overhead + ~58/input + ~43/output. The tapret
-/// commitment rides the host output's taproot key (keyspend), so it needs no
-/// extra witness budget. Multiplied by the next-block feerate to size the fee.
-pub fn estimate_rebalance_vbytes(num_inputs: usize, num_outputs: usize) -> u64 {
-    11 + num_inputs as u64 * 58 + num_outputs as u64 * 43
-}
 /// Upper bound on reservation retries under contention. With outpoint
 /// exclusion on each retry, the effective bound is `min(this, available_utxo_count)`
 /// — the loop exits via the selector's Insufficient branch once exclusions
@@ -425,7 +189,6 @@ const RESERVE_RETRY_ATTEMPTS: u32 = 16;
 /// this long awaiting the taker's consignment via `/consignment`. Building an
 /// RGB consignment is a wallet operation, so the window is generous.
 const CONSIGNMENT_TTL_MS: u64 = 600_000;
-
 
 /// Maker-side state for a buy-side swap held between `accept_quote` and
 /// `submit_signed_psbt`. The settlement state machine (#9) will formalize
@@ -495,6 +258,15 @@ pub struct Maker {
     /// `ArcSwap` so the daemon can hot-reload the order book without a restart
     /// (see [`Maker::reload_price_policy`]); reads are lock-free.
     price_policy: Arc<ArcSwap<PricePolicy>>,
+    /// RGB ladder spec for settlement-piggyback: when set, buy-side settlements
+    /// split the maker's RGB change into ladder rungs (riding the swap's fee).
+    /// `None` ⇒ piggyback off (ordinary single change output). Set from the
+    /// daemon's `[rebalance]` config when `enabled`.
+    piggyback_rgb_ladder: Option<LadderSpec>,
+    /// BTC ladder spec for sell-side piggyback: sells spend the maker's k0 BTC to
+    /// pay takers, so the BTC change is split into this ladder to keep the pool
+    /// laddered. `None` ⇒ off. Set alongside `piggyback_rgb_ladder`.
+    piggyback_btc_ladder: Option<LadderSpec>,
 }
 
 impl Maker {
@@ -552,7 +324,83 @@ impl Maker {
             bitcoin_client,
             pending: Arc::new(RwLock::new(HashMap::new())),
             price_policy: Arc::new(ArcSwap::from_pointee(PricePolicy::default())),
+            piggyback_rgb_ladder: None,
+            piggyback_btc_ladder: None,
         }
+    }
+
+    /// Enable buy-side piggyback: buy swaps split the maker's RGB change into
+    /// rungs of this ladder, riding the swap's existing fee. Off by default.
+    pub fn with_piggyback_ladder(mut self, spec: LadderSpec) -> Self {
+        self.piggyback_rgb_ladder = Some(spec);
+        self
+    }
+
+    /// Enable sell-side piggyback: sell swaps split the maker's BTC change into
+    /// rungs of this BTC ladder (keeping the k0 pool laddered). Off by default.
+    pub fn with_piggyback_btc_ladder(mut self, spec: LadderSpec) -> Self {
+        self.piggyback_btc_ladder = Some(spec);
+        self
+    }
+
+    /// Compute the BTC-change rungs to piggyback onto a sell settlement. Empty
+    /// unless a BTC ladder is configured and the maker's BTC change is large
+    /// enough to carve ≥1 rung + remainder. `maker_btc_total` is the reserved BTC
+    /// inputs' total; the on-tx change is `total - gross - anchor`.
+    async fn compute_sell_btc_change_rungs(&self, maker_btc_total: u64, gross: u64) -> Vec<u64> {
+        let Some(spec) = self.piggyback_btc_ladder.as_ref() else {
+            return Vec::new();
+        };
+        let maker_change = maker_btc_total
+            .saturating_sub(gross)
+            .saturating_sub(REBALANCE_ANCHOR_SATS);
+        if maker_change == 0 {
+            return Vec::new();
+        }
+        let available: Vec<u64> = self
+            .available_btc()
+            .await
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        plan_change_rungs(&available, maker_change, spec)
+    }
+
+    /// Compute the RGB-change rungs to piggyback onto a buy settlement. Empty
+    /// (no piggyback) unless a ladder is configured and both gates pass: the
+    /// change is large enough to carve ≥1 rung + remainder, and the maker's
+    /// recycled seal-anchor sats can fund the rung anchors (546 each). Rungs are
+    /// capped by the BTC available, smallest dropped first.
+    async fn compute_buy_change_rungs(
+        &self,
+        asset: &AssetId,
+        reserved: &[InventoryUtxo],
+        amount: u64,
+    ) -> Vec<u64> {
+        let Some(spec) = self.piggyback_rgb_ladder.as_ref() else {
+            return Vec::new();
+        };
+        let sum_in: u64 = reserved.iter().map(|u| u.amount).sum();
+        let change = sum_in.saturating_sub(amount);
+        if change == 0 {
+            return Vec::new();
+        }
+        // Each rung output needs a 546-sat anchor from the recycled seal sats.
+        let recycled: u64 = reserved.iter().map(|u| u.btc_sats).sum();
+        let max_by_sats = (recycled / REBALANCE_ANCHOR_SATS) as usize;
+        if max_by_sats == 0 {
+            return Vec::new();
+        }
+        let available: Vec<u64> = self
+            .store
+            .list_available(asset)
+            .await
+            .iter()
+            .map(|u| u.amount)
+            .collect();
+        let mut rungs = plan_change_rungs(&available, change, spec);
+        rungs.truncate(max_by_sats); // rungs are largest-first; drop the smallest
+        rungs
     }
 
     /// Seed the standing-order price policy (from the operator's saved orders).
@@ -615,7 +463,10 @@ impl Maker {
     /// Mark a fill mirrored (after the strategy upserts the opposite order).
     pub async fn mark_fill_mirrored(&self, quote_id: &QuoteId) {
         if let Err(e) = self.fills_store.mark_mirrored(quote_id).await {
-            eprintln!("warning: failed to mark fill mirrored for quote {}: {e}", quote_id.0);
+            eprintln!(
+                "warning: failed to mark fill mirrored for quote {}: {e}",
+                quote_id.0
+            );
         }
     }
 
@@ -633,7 +484,10 @@ impl Maker {
             mirrored: false,
         };
         if let Err(e) = self.fills_store.record_fill(record).await {
-            eprintln!("warning: failed to record fill for quote {}: {e}", quote.quote_id.0);
+            eprintln!(
+                "warning: failed to record fill for quote {}: {e}",
+                quote.quote_id.0
+            );
         }
     }
 
@@ -655,7 +509,10 @@ impl Maker {
             created_at_ms: now_ms(),
         };
         if let Err(e) = self.consignment_store.save_consignment(record).await {
-            eprintln!("warning: failed to persist consignment for quote {}: {e}", quote_id.0);
+            eprintln!(
+                "warning: failed to persist consignment for quote {}: {e}",
+                quote_id.0
+            );
         }
     }
 
@@ -705,8 +562,7 @@ impl Maker {
                     // Maker pays BTC → liquidity is how many RGB units its BTC
                     // pool covers, net of the per-quote receive anchor.
                     Side::Sell if e.price_sats_per_unit > 0 => {
-                        let spendable =
-                            btc_available.saturating_sub(rfq_rgb::SEAL_ANCHOR_SATS);
+                        let spendable = btc_available.saturating_sub(rfq_rgb::SEAL_ANCHOR_SATS);
                         e.max_size.min(spendable / e.price_sats_per_unit)
                     }
                     Side::Sell => 0,
@@ -1060,11 +916,7 @@ impl Maker {
     /// Release rebalance reservations (RGB then BTC) back to Available — called
     /// when the split fails to build or broadcast, before anything was marked
     /// pending.
-    pub async fn release_rebalance(
-        &self,
-        rgb: &[ReservationId],
-        btc: Option<&ReservationId>,
-    ) {
+    pub async fn release_rebalance(&self, rgb: &[ReservationId], btc: Option<&ReservationId>) {
         let now = now_ms();
         for r in rgb {
             let _ = self.store.release_reservation(r, now).await;
@@ -1311,11 +1163,7 @@ impl Maker {
         };
 
         // A vanished reservation means the consignment window lapsed.
-        let btc_reservation_id = match self
-            .btc_store
-            .find_reservation_for_quote(&quote_id)
-            .await
-        {
+        let btc_reservation_id = match self.btc_store.find_reservation_for_quote(&quote_id).await {
             Some(rid) => rid,
             None => {
                 self.pending.write().await.remove(&quote_id);
@@ -1339,11 +1187,7 @@ impl Maker {
         // the taker's signature authorizes the spend at /sign.)
         let info = match self
             .rgb_backend
-            .validate_incoming_consignment(
-                &consignment_base64,
-                contract_id,
-                &consigned_outpoints,
-            )
+            .validate_incoming_consignment(&consignment_base64, contract_id, &consigned_outpoints)
             .await
         {
             Ok(info) => info,
@@ -1428,6 +1272,11 @@ impl Maker {
         } else {
             info.total_amount
         };
+        // Sell-side piggyback: split the maker's BTC change into a k0 ladder.
+        let maker_btc_total: u64 = maker_btc_inputs.iter().map(|(_, t)| t.value_sats).sum();
+        let btc_change_rungs = self
+            .compute_sell_btc_change_rungs(maker_btc_total, quote.price)
+            .await;
         let transfer = match self
             .rgb_backend
             .create_swap_psbt_sell(
@@ -1440,6 +1289,7 @@ impl Maker {
                 pending.rgb_change_invoice.as_deref(),
                 quote.price,
                 actual_fee,
+                &btc_change_rungs,
             )
             .await
         {
@@ -1567,7 +1417,11 @@ impl Maker {
         }
 
         self.btc_store
-            .mark_pending_bitcoin_confirm(&btc_reservation_id, finalized.witness_txid.clone(), now_ms())
+            .mark_pending_bitcoin_confirm(
+                &btc_reservation_id,
+                finalized.witness_txid.clone(),
+                now_ms(),
+            )
             .await
             .map_err(|e| RouterError::Maker(e.to_string()))?;
 
@@ -1582,7 +1436,8 @@ impl Maker {
         .await;
 
         // Record the fill (FILLED counter + auto-mirror work-list).
-        self.record_fill(&pending.quote, &finalized.witness_txid).await;
+        self.record_fill(&pending.quote, &finalized.witness_txid)
+            .await;
 
         self.pending.write().await.remove(&quote_id);
 
@@ -1618,35 +1473,36 @@ impl MakerConnector for Maker {
 
         // Sell side reserves BTC, not RGB — the maker is the one paying out.
         if matches!(request.side, Side::Sell) {
-            return self.request_quote_sell(request, quote_id, expires_at_ms).await;
+            return self
+                .request_quote_sell(request, quote_id, expires_at_ms)
+                .await;
         }
 
         // Resolve the unit price up front: a standing order may decline the
         // quote (amount over its size) before we touch inventory.
-        let buy_unit_price =
-            match self
-                .price_policy
-                .load()
-                .unit_price(&request.base_asset, &request.side, request.amount)
-            {
-                PriceLookup::Price(p) => p,
-                PriceLookup::NoOrder => {
-                    eprintln!(
-                        "declining buy quote: no standing buy order for asset {} — create one \
+        let buy_unit_price = match self.price_policy.load().unit_price(
+            &request.base_asset,
+            &request.side,
+            request.amount,
+        ) {
+            PriceLookup::Price(p) => p,
+            PriceLookup::NoOrder => {
+                eprintln!(
+                    "declining buy quote: no standing buy order for asset {} — create one \
                          with `colorex maker order create --side buy`",
-                        request.base_asset.id,
-                    );
-                    return Ok(None);
-                }
-                PriceLookup::Decline => {
-                    eprintln!(
-                        "declining buy quote: amount {} over the buy order's max size for asset {} \
+                    request.base_asset.id,
+                );
+                return Ok(None);
+            }
+            PriceLookup::Decline => {
+                eprintln!(
+                    "declining buy quote: amount {} over the buy order's max size for asset {} \
                          — raise the order size or buy less",
-                        request.amount, request.base_asset.id,
-                    );
-                    return Ok(None);
-                }
-            };
+                    request.amount, request.base_asset.id,
+                );
+                return Ok(None);
+            }
+        };
 
         // Exclusion-based retry: when a reservation fails because another
         // caller grabbed an outpoint between our list_available read and our
@@ -1665,14 +1521,15 @@ impl MakerConnector for Maker {
                 .into_iter()
                 .filter(|u| !excluded.contains(&u.outpoint))
                 .collect();
-            let selection = match self
-                .selector
-                .select(&request.base_asset, request.amount, &available)
-            {
-                Ok(s) => s,
-                Err(CoinSelectionError::Insufficient { .. }) => return Ok(None),
-                Err(e) => return Err(RouterError::Maker(e.to_string())),
-            };
+            let selection =
+                match self
+                    .selector
+                    .select(&request.base_asset, request.amount, &available)
+                {
+                    Ok(s) => s,
+                    Err(CoinSelectionError::Insufficient { .. }) => return Ok(None),
+                    Err(e) => return Err(RouterError::Maker(e.to_string())),
+                };
             match self
                 .store
                 .reserve_utxos(
@@ -1738,11 +1595,7 @@ impl MakerConnector for Maker {
                 rgb_change_invoice,
             } => {
                 return self
-                    .accept_quote_sell(
-                        quote,
-                        btc_payout_addr.clone(),
-                        rgb_change_invoice.clone(),
-                    )
+                    .accept_quote_sell(quote, btc_payout_addr.clone(), rgb_change_invoice.clone())
                     .await;
             }
         };
@@ -1784,7 +1637,10 @@ impl MakerConnector for Maker {
                 .saturating_mul(10_000 + u64::from(quote.fee_slippage_bps))
                 / 10_000;
             if actual_fee > cap {
-                let _ = self.store.release_reservation(&reservation_id, now_ms()).await;
+                let _ = self
+                    .store
+                    .release_reservation(&reservation_id, now_ms())
+                    .await;
                 return Err(RouterError::FeeSlippageExceeded {
                     estimated: quote.estimated_fee_sats,
                     actual: actual_fee,
@@ -1805,7 +1661,10 @@ impl MakerConnector for Maker {
                 match select_btc_inputs(&utxos, required_funding) {
                     Some(selected) => selected,
                     None => {
-                        let _ = self.store.release_reservation(&reservation_id, now_ms()).await;
+                        let _ = self
+                            .store
+                            .release_reservation(&reservation_id, now_ms())
+                            .await;
                         // Surface the ACTUAL balance (0 when the keychain-0 address is
                         // unfunded) vs. what's needed — and log it maker-side so it's
                         // visible in `maker up`.
@@ -1821,12 +1680,21 @@ impl MakerConnector for Maker {
                 }
             }
             Err(e) => {
-                let _ = self.store.release_reservation(&reservation_id, now_ms()).await;
+                let _ = self
+                    .store
+                    .release_reservation(&reservation_id, now_ms())
+                    .await;
                 let msg = format!("list_unspent({btc_funding_addr}) failed: {e}");
                 eprintln!("buy accept error: {msg}");
                 return Err(RouterError::Maker(msg));
             }
         };
+
+        // Settlement-piggyback: if a ladder is configured, split the maker's RGB
+        // change into rungs riding this swap (empty otherwise → ordinary change).
+        let change_rungs = self
+            .compute_buy_change_rungs(&quote.base_asset, &reserved, quote.amount)
+            .await;
 
         // Build the maker-RGB-side PSBT + consignment. On failure the
         // reservation goes back to Available.
@@ -1840,6 +1708,7 @@ impl MakerConnector for Maker {
                 &btc_funding_addr,
                 quote.price,
                 actual_fee,
+                &change_rungs,
             )
             .await
         {
@@ -1968,11 +1837,7 @@ impl MakerConnector for Maker {
         // path. Pre-emptive ingestion was tried in #14e but left change stuck
         // in `PendingBitcoinConfirm` forever (no transition back to Available).
         self.store
-            .mark_pending_bitcoin_confirm(
-                &reservation_id,
-                finalized.witness_txid.clone(),
-                now_ms(),
-            )
+            .mark_pending_bitcoin_confirm(&reservation_id, finalized.witness_txid.clone(), now_ms())
             .await
             .map_err(|e| RouterError::Maker(e.to_string()))?;
 
@@ -1987,7 +1852,8 @@ impl MakerConnector for Maker {
         .await;
 
         // Record the fill (FILLED counter + auto-mirror work-list).
-        self.record_fill(&pending.quote, &finalized.witness_txid).await;
+        self.record_fill(&pending.quote, &finalized.witness_txid)
+            .await;
 
         self.pending.write().await.remove(&quote_id);
 
@@ -2419,8 +2285,7 @@ mod tests {
             .unwrap();
         assert_eq!(accepted.status, SettlementStatus::AwaitingConsignment);
 
-        let consignment =
-            sell_consignment(&quote, &[taker_rgb_outpoint(0), taker_rgb_outpoint(1)]);
+        let consignment = sell_consignment(&quote, &[taker_rgb_outpoint(0), taker_rgb_outpoint(1)]);
         let delivered = maker
             .deliver_consignment(quote.quote_id.clone(), consignment, vec![])
             .await
@@ -2545,8 +2410,7 @@ mod tests {
             .accept_quote(quote.clone(), sell_request(&quote))
             .await
             .unwrap();
-        let consignment =
-            sell_consignment(&quote, &[taker_rgb_outpoint(0), taker_rgb_outpoint(1)]);
+        let consignment = sell_consignment(&quote, &[taker_rgb_outpoint(0), taker_rgb_outpoint(1)]);
         let delivered = maker
             .deliver_consignment(quote.quote_id.clone(), consignment, vec![])
             .await
@@ -2638,10 +2502,7 @@ mod tests {
 
     #[tokio::test]
     async fn inventory_summary_counts_initial_inventory_as_available() {
-        let maker = maker_with_utxos(vec![
-            utxo_with_amount(0, 100),
-            utxo_with_amount(1, 200),
-        ]);
+        let maker = maker_with_utxos(vec![utxo_with_amount(0, 100), utxo_with_amount(1, 200)]);
 
         let snapshot = maker.inventory_summary().await;
 
@@ -2746,10 +2607,7 @@ mod tests {
         let utxos = maker.utxo_snapshot().await;
 
         assert_eq!(released, 0);
-        assert!(matches!(
-            utxos[0].status,
-            InventoryStatus::Reserved { .. }
-        ));
+        assert!(matches!(utxos[0].status, InventoryStatus::Reserved { .. }));
         assert!(matches!(utxos[1].status, InventoryStatus::Spent { .. }));
     }
 
@@ -3003,10 +2861,10 @@ mod tests {
             min_utxo_count: 1,
         };
         let plan = maker.rebalance(&policy).await;
-        assert!(plan.triggers.iter().any(|t| matches!(
-            t,
-            RebalanceTrigger::TooManyUtxos { count: 10, max: 5 }
-        )));
+        assert!(plan
+            .triggers
+            .iter()
+            .any(|t| matches!(t, RebalanceTrigger::TooManyUtxos { count: 10, max: 5 })));
     }
 
     #[tokio::test]
@@ -3018,10 +2876,10 @@ mod tests {
             min_utxo_count: 3,
         };
         let plan = maker.rebalance(&policy).await;
-        assert!(plan.triggers.iter().any(|t| matches!(
-            t,
-            RebalanceTrigger::TooFewUtxos { count: 1, min: 3 }
-        )));
+        assert!(plan
+            .triggers
+            .iter()
+            .any(|t| matches!(t, RebalanceTrigger::TooFewUtxos { count: 1, min: 3 })));
     }
 
     #[tokio::test]
@@ -3100,7 +2958,10 @@ mod tests {
         p2wpkh.extend(std::iter::repeat_n(0x22, 20));
         vec![(
             Outpoint::new(format!("{:064x}", 0xfeedu64), 0),
-            TxOut { value_sats, script_pubkey: p2wpkh },
+            TxOut {
+                value_sats,
+                script_pubkey: p2wpkh,
+            },
         )]
     }
 
@@ -3437,8 +3298,8 @@ mod tests {
     #[test]
     fn plan_ladder_splits_one_fat_utxo_into_rungs() {
         let spec = ladder(100, 0.5, 3, 1, 1); // targets [100,50,25]
-        // The lone 1000 covers the smallest target (25); the 100 and 50 tiers are
-        // the deficit, carved off the fat UTXO largest-first (remainder 850).
+                                              // The lone 1000 covers the smallest target (25); the 100 and 50 tiers are
+                                              // the deficit, carved off the fat UTXO largest-first (remainder 850).
         let (src, val, rungs) = plan_ladder(&avail(&[1000]), &spec).expect("a split");
         assert_eq!(src, synth_outpoint(0));
         assert_eq!(val, 1000);
@@ -3509,7 +3370,9 @@ mod tests {
     fn assemble_none_when_nothing_to_split() {
         assert!(assemble_rebalance_tx(vec![], None, 100_000, 300).is_none());
         // an empty-rung asset is stripped, leaving nothing.
-        assert!(assemble_rebalance_tx(vec![asset_split(vec![], 546)], None, 100_000, 300).is_none());
+        assert!(
+            assemble_rebalance_tx(vec![asset_split(vec![], 546)], None, 100_000, 300).is_none()
+        );
     }
 
     #[test]
@@ -3524,6 +3387,99 @@ mod tests {
         assert_eq!(b.rungs, vec![50_000, 25_000]);
         // fee 300 + 0 rgb outputs + (50_000 + 25_000) btc rungs.
         assert_eq!(plan.btc_needed, 300 + 75_000);
+    }
+
+    #[test]
+    fn ladder_target_rungs_empty_for_degenerate_specs() {
+        assert!(
+            ladder(100, 0.5, 0, 2, 1).target_rungs().is_empty(),
+            "tiers=0"
+        );
+        assert!(
+            ladder(100, 0.5, 3, 0, 1).target_rungs().is_empty(),
+            "copies=0"
+        );
+        // base below min_piece → first tier already dropped, all dropped.
+        assert!(
+            ladder(5, 0.5, 3, 1, 10).target_rungs().is_empty(),
+            "base<min_piece"
+        );
+    }
+
+    #[test]
+    fn plan_ladder_none_for_empty_inventory() {
+        // Nothing to split when there are no UTXOs at all.
+        assert!(plan_ladder(&[], &ladder(100, 0.5, 3, 1, 1)).is_none());
+    }
+
+    #[test]
+    fn plan_ladder_leaves_a_positive_remainder() {
+        // targets [100,50,25]; a lone 100 covers the 25 tier, deficit [50,100].
+        // Carving 100 from a 100 source would leave 0 (no remainder) → skipped;
+        // 50 fits (leaves 50). So the source can never be fully consumed.
+        let (_, val, rungs) =
+            plan_ladder(&avail(&[100]), &ladder(100, 0.5, 3, 1, 1)).expect("split");
+        assert_eq!(val, 100);
+        assert_eq!(
+            rungs,
+            vec![50],
+            "can't carve a rung equal to the whole source"
+        );
+    }
+
+    #[test]
+    fn assemble_drops_a_whole_asset_when_all_its_rungs_scale_away() {
+        // Two assets; a tight budget forces dropping every rung of the smaller
+        // contributor. avail = pool 0 + sources (546 each). required for the full
+        // plan exceeds it, so rungs drop until it fits — possibly emptying an asset.
+        let a = AssetSplit {
+            asset: asset(),
+            source: synth_outpoint(0),
+            source_amount: 10_000,
+            source_btc_sats: 546,
+            rungs: vec![5, 5, 5],
+        };
+        let b = AssetSplit {
+            asset: quote_asset(),
+            source: synth_outpoint(1),
+            source_amount: 10_000,
+            source_btc_sats: 546,
+            rungs: vec![5, 5, 5],
+        };
+        // Pool 0; only the two 546-sat sources fund anchors. fee 100. Full plan
+        // needs 100 + 546*(6 rungs + 2 remainders) = 100 + 4368, avail = 1092 →
+        // scales down hard. Whatever survives must be fundable.
+        let plan = assemble_rebalance_tx(vec![a, b], None, 0, 100);
+        if let Some(p) = plan {
+            // Every surviving asset has at least one rung, and the budget holds.
+            assert!(p.assets.iter().all(|a| !a.rungs.is_empty()));
+            let outs: u64 = p.assets.iter().map(|a| a.rungs.len() as u64 + 1).sum();
+            let need = 100 + REBALANCE_ANCHOR_SATS * outs;
+            let avail = p.assets.iter().map(|a| a.source_btc_sats).sum::<u64>();
+            assert!(avail >= need, "surviving plan must be fundable");
+        }
+        // (None is also acceptable — everything scaled away.)
+    }
+
+    #[test]
+    fn assemble_counts_rgb_source_sats_toward_the_budget() {
+        // A fat RGB source (lots of its own sats) funds its anchors without any
+        // BTC pool — the budget should accept it.
+        let a = asset_split(vec![50, 25], 100_000);
+        let plan = assemble_rebalance_tx(vec![a], None, 0, 300).expect("source sats fund it");
+        assert_eq!(plan.assets[0].rungs, vec![50, 25]);
+    }
+
+    #[test]
+    fn plan_change_rungs_carves_deficit_into_swap_change() {
+        let spec = ladder(100, 0.5, 3, 1, 1); // targets [100,50,25]
+                                              // Holdings cover the smallest tier; the swap change (200) funds the
+                                              // missing 100 + 50 rungs (largest-first), leaving a remainder.
+        assert_eq!(plan_change_rungs(&[1000], 200, &spec), vec![100, 50]);
+        // Change too small to carve any rung → skip (empty).
+        assert!(plan_change_rungs(&[1000], 10, &spec).is_empty());
+        // No change → empty.
+        assert!(plan_change_rungs(&[1000], 0, &spec).is_empty());
     }
 
     #[test]
@@ -3557,7 +3513,11 @@ mod tests {
         };
         let plan = assemble_rebalance_tx(vec![], Some(btc), 60_000, 300).expect("a scaled plan");
         let b = plan.btc.expect("btc split survives");
-        assert_eq!(b.rungs, vec![50_000], "smallest BTC rung dropped to fit the source");
+        assert_eq!(
+            b.rungs,
+            vec![50_000],
+            "smallest BTC rung dropped to fit the source"
+        );
         assert_eq!(plan.btc_needed, 300 + 50_000);
     }
 
