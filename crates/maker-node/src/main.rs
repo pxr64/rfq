@@ -9,6 +9,11 @@ use commands::*;
 
 #[tokio::main]
 async fn main() {
+    // rustls 0.23 needs an explicit crypto provider when the dep tree carries
+    // more than one (aws-lc-rs via reqwest + ring transitively) — otherwise the
+    // broker `wss://` stream panics with "Could not automatically determine the
+    // process-level CryptoProvider". Pin aws-lc-rs to match reqwest's default.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     if let Err(error) = run_cli().await {
         eprintln!("colorex error: {error}");
         std::process::exit(1);

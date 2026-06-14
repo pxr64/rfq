@@ -25,6 +25,7 @@ rfq-router = { path = "../rfq-router" }
 rfq-store = { path = "../rfq-store", features = ["sqlite"] }
 rfq-types = { path = "../rfq-types" }
 rfq-wallet = { path = "../rfq-wallet" }
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
 secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
 serde.workspace = true
 serde_json.workspace = true
