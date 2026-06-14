@@ -980,7 +980,9 @@ pub fn spawn_strategy_loop(
                 }
                 // Operator-pinned guard: don't overwrite a hand-set opposite order.
                 let opp = orders::opposite(f.side.clone());
-                match order_store.get(&f.asset_id, side_str(&opp)).await {
+                // Accumulate onto the standing opposite-side mirror order so
+                // repeated fills grow the buy-back instead of clobbering it.
+                let base_size = match order_store.get(&f.asset_id, side_str(&opp)).await {
                     Ok(Some(existing)) if !existing.mirror => {
                         eprintln!(
                             "strategy: mirror skipped (opposite-side order is operator-pinned)"
@@ -988,18 +990,20 @@ pub fn spawn_strategy_loop(
                         maker.mark_fill_mirrored(&f.quote_id).await;
                         continue;
                     }
+                    Ok(Some(existing)) => existing.size,
+                    Ok(None) => 0,
                     Err(e) => {
                         eprintln!("strategy: opposite lookup failed: {e}");
                         continue;
                     }
-                    _ => {}
-                }
+                };
                 let unit = f.price / f.amount;
                 let mirror = orders::build_mirror_order(
                     &f.asset_id,
                     f.side.clone(),
                     unit,
                     f.amount,
+                    base_size,
                     src.mirror_spread_bps,
                 );
                 let mirror_side = mirror.side.clone();

@@ -98,34 +98,66 @@ pub fn opposite(side: Side) -> Side {
 }
 
 /// Build the auto-mirror order for a fill: the OPPOSITE side, sized to the
-/// filled amount, priced off the fill's per-unit price by `spread_bps`, and
-/// itself mirror-enabled so the loop continues.
+/// standing opposite order plus this fill, priced off the fill's per-unit price
+/// by `spread_bps`, and itself mirror-enabled so the loop continues.
 ///
 /// - maker SOLD RGB (a `buy` order filled) → mirror is a `sell` buy-back,
 ///   **cheaper** (`-spread`).
 /// - maker BOUGHT RGB (a `sell` order filled) → mirror is a `buy` re-sell,
 ///   **dearer** (`+spread`).
 ///
-/// `fill_unit_price` is the per-unit price (TOTAL gross sats ÷ amount); the
-/// multiply-before-divide keeps precision and the result is clamped to ≥ 1.
+/// `base_size` is the existing opposite-side order's size (0 if none): the
+/// mirror **accumulates** `base_size + fill_amount` so repeated fills grow the
+/// buy-back instead of clobbering it down to the last fill. No cap — sizes are
+/// re-set out of band.
+///
+/// `fill_unit_price` is the per-unit price (TOTAL gross sats ÷ amount). Prices
+/// are denominated sats-per-smallest-unit, so the per-unit integer is small and
+/// a plain `bps` multiply truncates the spread away (a 50 bps move on a price of
+/// 101 floors back to 101 — zero edge). We instead round *directionally* away
+/// from the fill — floor on the cheaper side, ceil on the dearer side — and force
+/// the result strictly past the fill by ≥ 1 unit whenever a spread is configured,
+/// so the mirror always carries a nonzero edge. The trade-off (per the chosen
+/// fix): on low-priced assets the effective spread is quantized to the per-unit
+/// granularity and can overshoot the configured bps. Result is clamped to ≥ 1.
 pub fn build_mirror_order(
     asset_id: &str,
     filled_side: Side,
     fill_unit_price: u64,
     fill_amount: u64,
+    base_size: u64,
     spread_bps: u16,
 ) -> OrderRecord {
     let mirror_side = opposite(filled_side.clone());
-    let factor = match filled_side {
-        Side::Buy => 10_000u64.saturating_sub(spread_bps as u64), // buy back cheaper
-        Side::Sell => 10_000u64 + spread_bps as u64,              // re-sell dearer
+    let mirror_unit = match &filled_side {
+        // maker SOLD RGB → mirror buys it back *cheaper*: floor, forced strictly
+        // below the fill price by ≥ 1 (never below 1).
+        Side::Buy => {
+            let factor = 10_000u64.saturating_sub(spread_bps as u64);
+            let target = fill_unit_price.saturating_mul(factor) / 10_000; // floor
+            if spread_bps == 0 {
+                target.max(1)
+            } else {
+                target.min(fill_unit_price.saturating_sub(1)).max(1)
+            }
+        }
+        // maker BOUGHT RGB → mirror re-sells it *dearer*: ceil, forced strictly
+        // above the fill price by ≥ 1.
+        Side::Sell => {
+            let factor = 10_000u64 + spread_bps as u64;
+            let target = fill_unit_price.saturating_mul(factor).div_ceil(10_000);
+            if spread_bps == 0 {
+                target.max(1)
+            } else {
+                target.max(fill_unit_price.saturating_add(1))
+            }
+        }
     };
-    let mirror_unit = (fill_unit_price.saturating_mul(factor) / 10_000).max(1);
     new_order(
         rfq_store::side_str(&mirror_side),
         asset_id.to_owned(),
         mirror_unit,
-        fill_amount,
+        base_size.saturating_add(fill_amount),
         true,
         spread_bps,
     )
@@ -201,7 +233,7 @@ mod tests {
     #[test]
     fn mirror_of_a_sell_order_filled_is_a_dearer_buy() {
         // maker BOUGHT (a `sell` order filled) at unit 100, spread 200bps (2%).
-        let m = build_mirror_order("rgb:x", Side::Sell, 100, 500, 200);
+        let m = build_mirror_order("rgb:x", Side::Sell, 100, 500, 0, 200);
         assert_eq!(m.side, "buy");
         assert_eq!(m.price, 102); // 100 * 10200 / 10000
         assert_eq!(m.size, 500);
@@ -212,7 +244,7 @@ mod tests {
     #[test]
     fn mirror_of_a_buy_order_filled_is_a_cheaper_sell() {
         // maker SOLD (a `buy` order filled) at unit 100, spread 200bps.
-        let m = build_mirror_order("rgb:x", Side::Buy, 100, 500, 200);
+        let m = build_mirror_order("rgb:x", Side::Buy, 100, 500, 0, 200);
         assert_eq!(m.side, "sell");
         assert_eq!(m.price, 98); // 100 * 9800 / 10000
         assert_eq!(m.size, 500);
@@ -221,8 +253,45 @@ mod tests {
     #[test]
     fn mirror_price_clamps_to_at_least_one() {
         // Tiny unit price with a large spread would floor to 0 — clamp to 1.
-        let m = build_mirror_order("rgb:x", Side::Buy, 1, 10, 9000);
+        let m = build_mirror_order("rgb:x", Side::Buy, 1, 10, 0, 9000);
         assert_eq!(m.price, 1);
+    }
+
+    #[test]
+    fn small_spread_on_low_price_still_moves_by_at_least_one() {
+        // Per-smallest-unit price of 101 with a 50bps spread: a plain bps multiply
+        // truncates back to 101 (zero edge). Directional rounding must still move.
+        let dearer = build_mirror_order("rgb:x", Side::Sell, 101, 10, 0, 50);
+        assert_eq!(dearer.side, "buy");
+        assert_eq!(dearer.price, 102); // ceil(101 * 10050 / 10000) = ceil(101.5) = 102, > 101
+        let cheaper = build_mirror_order("rgb:x", Side::Buy, 101, 10, 0, 50);
+        assert_eq!(cheaper.side, "sell");
+        assert_eq!(cheaper.price, 100); // floor(101 * 9950 / 10000) = 100, < 101
+    }
+
+    #[test]
+    fn tiny_spread_is_forced_past_the_fill_price() {
+        // 10bps on price 101 rounds back to 101 both ways — force ±1 so there's edge.
+        let dearer = build_mirror_order("rgb:x", Side::Sell, 101, 10, 0, 10);
+        assert_eq!(dearer.price, 102); // max(ceil(101.101), 101+1) = 102
+        let cheaper = build_mirror_order("rgb:x", Side::Buy, 101, 10, 0, 10);
+        assert_eq!(cheaper.price, 100); // min(floor(100.899)=100, 101-1=100) = 100
+    }
+
+    #[test]
+    fn zero_spread_does_not_force_a_move() {
+        // No configured spread → no forced ±1; mirror sits at the fill price.
+        let dearer = build_mirror_order("rgb:x", Side::Sell, 101, 10, 0, 0);
+        assert_eq!(dearer.price, 101);
+        let cheaper = build_mirror_order("rgb:x", Side::Buy, 101, 10, 0, 0);
+        assert_eq!(cheaper.price, 101);
+    }
+
+    #[test]
+    fn mirror_size_accumulates_onto_the_standing_opposite_order() {
+        // A standing opposite order of 300 plus a 400 fill → 700 (no clobber, no cap).
+        let m = build_mirror_order("rgb:x", Side::Buy, 100, 400, 300, 200);
+        assert_eq!(m.size, 700);
     }
 
     #[tokio::test]
