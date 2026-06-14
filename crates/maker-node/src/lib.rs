@@ -38,6 +38,7 @@ use rfq_types::{
     QuoteId, QuoteRequest, RgbInventoryUtxo, SettlementIntent,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tokio::{task::JoinHandle, time};
 
 /// Top-level config for the `colorex maker` daemon. Loaded from a TOML file
@@ -382,6 +383,12 @@ pub struct MakerNodeRuntime {
     /// The standing-order store (maker.db `orders` table, or in-memory for the
     /// mock fallback) — driven by the order-reload + strategy loops in `run()`.
     pub order_store: Arc<dyn OrderStore>,
+    /// Asset id → decimal precision, snapshot from the contract registry at
+    /// startup. Used to price orders in sats-per-token (a quote of `amount`
+    /// smallest units costs `price * amount / 10^precision`). Snapshot, not live:
+    /// importing a new contract needs a daemon restart to be traded anyway
+    /// (inventory is reconciled per asset at startup), so precision follows suit.
+    pub precisions: Arc<HashMap<String, u8>>,
 }
 
 /// Shared with the chain observer so it can drive `LibRgbBackend::sync_wallet`
@@ -566,6 +573,15 @@ pub async fn build_runtime(
                 std::fs::create_dir_all(parent)?;
             }
             let contract_store = SqliteContractStore::open(&db_path).await?;
+            // Snapshot asset id → precision so orders price in sats-per-token.
+            let precisions: Arc<HashMap<String, u8>> = Arc::new(
+                contract_store
+                    .list()
+                    .await?
+                    .into_iter()
+                    .map(|c| (c.contract_id, c.precision))
+                    .collect(),
+            );
             let assets = load_registered_assets(&contract_store, network).await?;
 
             let now_ms = now_ms();
@@ -622,6 +638,7 @@ pub async fn build_runtime(
                     assets,
                 }),
                 order_store,
+                precisions,
             })
         }
         None => {
@@ -651,6 +668,7 @@ pub async fn build_runtime(
                 chain_observer: None,
                 rebalance_executor: None,
                 order_store: Arc::new(InMemoryOrderStore::new()),
+                precisions: Arc::new(HashMap::new()),
             })
         }
     }
@@ -916,6 +934,7 @@ impl From<rfq_router::RouterError> for MakerNodeHttpError {
 pub fn spawn_order_reload_loop(
     maker: Maker,
     order_store: Arc<dyn OrderStore>,
+    precisions: Arc<HashMap<String, u8>>,
     reload_interval: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -926,7 +945,7 @@ pub fn spawn_order_reload_loop(
             match order_store.list().await {
                 Ok(orders) => {
                     let count = orders.len();
-                    maker.reload_price_policy(crate::orders::price_policy(&orders));
+                    maker.reload_price_policy(crate::orders::price_policy(&orders, &precisions));
                     if last != Some(count) {
                         println!("reloaded standing orders: {count}");
                         last = Some(count);
@@ -947,6 +966,7 @@ pub fn spawn_order_reload_loop(
 pub fn spawn_strategy_loop(
     maker: Maker,
     order_store: Arc<dyn OrderStore>,
+    precisions: Arc<HashMap<String, u8>>,
     interval: Duration,
 ) -> JoinHandle<()> {
     use crate::orders;
@@ -997,7 +1017,14 @@ pub fn spawn_strategy_loop(
                         continue;
                     }
                 };
-                let unit = f.price / f.amount;
+                // Fill price is TOTAL gross sats; recover the per-token unit price
+                // (sats per whole token): total_sats * 10^precision / amount,
+                // rounded to nearest. f.amount is guaranteed non-zero above.
+                let precision = precisions.get(&f.asset_id).copied().unwrap_or(0);
+                let scale = 10u128.pow(precision as u32);
+                let unit = (((f.price as u128) * scale + (f.amount as u128) / 2)
+                    / (f.amount as u128))
+                    .min(u64::MAX as u128) as u64;
                 let mirror = orders::build_mirror_order(
                     &f.asset_id,
                     f.side.clone(),
@@ -1015,14 +1042,14 @@ pub fn spawn_strategy_loop(
                 maker.mark_fill_mirrored(&f.quote_id).await;
                 placed = true;
                 println!(
-                    "mirror placed: {mirror_side} {} @ {mirror_price}/unit (from fill {})",
+                    "mirror placed: {mirror_side} {} @ {mirror_price}/token (from fill {})",
                     f.amount, f.quote_id.0
                 );
             }
             if placed {
                 // Instant effect (don't wait for the 5s reload tick).
                 if let Ok(orders) = order_store.list().await {
-                    maker.reload_price_policy(orders::price_policy(&orders));
+                    maker.reload_price_policy(orders::price_policy(&orders, &precisions));
                 }
             }
         }

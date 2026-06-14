@@ -79,7 +79,7 @@ The two guides below expand each step. The command tables that follow are the fu
 | `maker up` | Start the daemon: HTTP quote server + cleanup / rebalance / chain-observer + strategy loops. Loads standing orders for pricing. |
 | `maker health` | Probe the broker. |
 | `maker inventory [--btc]` | Print the per-contract RGB inventory snapshot (`--btc` for the BTC-pool + drift diagnostic). |
-| `maker order create --side --price --size [--asset] [--mirror --mirror-spread-bps]` | Create/replace the standing order (price the maker quotes) for an (asset, side). `--price` is sats per smallest unit. |
+| `maker order create --side --price --size [--asset] [--mirror --mirror-spread-bps]` | Create/replace the standing order (price the maker quotes) for an (asset, side). `--price` is sats per whole token (a quote of `amount` smallest units costs `price * amount / 10^precision`). |
 | `maker order list` / `cancel <id>` / `clear` | List / cancel one / clear all standing orders (persisted to `maker.db`). |
 | `maker contract import <id> [--consignment <file\|base64>]` / `list` / `remove <id>` | Manage the tradeable-asset **registry** (lives in `maker.db`; replaced the old `[rgb] contract_id`). |
 | `maker wallet …` | Wallet + funding ops — see the next table. |

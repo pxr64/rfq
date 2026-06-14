@@ -88,7 +88,12 @@ pub struct AssetInfo {
 pub struct OrderPrice {
     pub contract_id: String,
     pub side: Side,
-    pub price_sats_per_unit: u64,
+    /// Unit price in sats per **whole token**. A quote of `amount` smallest
+    /// units costs `price_sats_per_token * amount / 10^precision` sats.
+    pub price_sats_per_token: u64,
+    /// The asset's decimal precision, so clients can convert between the
+    /// per-token price and the smallest-unit `*_size` fields below.
+    pub precision: u8,
     /// The standing order's configured per-quote size cap (in smallest RGB
     /// units). The static upper bound — what the maker *would* fill if fully
     /// stocked.

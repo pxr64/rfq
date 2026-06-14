@@ -1033,7 +1033,15 @@ pub(crate) async fn warn_low_balance(
                 .iter()
                 .map(|u| u.value_sats)
                 .sum();
-            let need = size.saturating_mul(price);
+            // `price` is sats-per-token; the gross for a `size`-smallest-unit
+            // quote is `price * size / 10^precision`. Look up precision from the
+            // registry (default 0 if unknown) so the estimate matches a real quote.
+            let precision = match rfq_store::SqliteContractStore::open(&db_path).await {
+                Ok(s) => s.get(asset_id).await.ok().flatten().map(|c| c.precision),
+                Err(_) => None,
+            }
+            .unwrap_or(0);
+            let need = rfq_maker::quote_total_sats(price, size, precision, true);
             if avail < need {
                 output::step_warn(&format!(
                     "maker BTC pool is {avail} sats (< ~{need} for a full {size}-unit quote) — a \
@@ -1058,7 +1066,7 @@ pub(crate) async fn order_list(config_path: &Path) -> Result<(), Box<dyn std::er
             String::new()
         };
         println!(
-            "{}  side={}  asset={}  price/unit={}  size={}{mirror}",
+            "{}  side={}  asset={}  price/token={}  size={}{mirror}",
             o.id, o.side, o.asset_id, o.price, o.size
         );
     }
@@ -1154,6 +1162,7 @@ pub(crate) async fn run(
 
     let runtime = build_runtime(&config).await?;
     let order_store = runtime.order_store;
+    let precisions = runtime.precisions;
     // One-time import of any legacy orders.json into the maker.db `orders` table.
     orders::migrate_orders_json(order_store.as_ref(), config_path).await?;
 
@@ -1162,7 +1171,7 @@ pub(crate) async fn run(
     let order_count = standing.len();
     let maker = runtime
         .maker
-        .with_price_policy(orders::price_policy(&standing));
+        .with_price_policy(orders::price_policy(&standing, &precisions));
     let chain_observer_deps = runtime.chain_observer;
     let rebalance_executor_deps = runtime.rebalance_executor;
     let app = maker_app(maker.clone());
@@ -1212,11 +1221,13 @@ pub(crate) async fn run(
     let order_reload_task = spawn_order_reload_loop(
         maker.clone(),
         order_store.clone(),
+        precisions.clone(),
         std::time::Duration::from_secs(5),
     );
     let strategy_task = spawn_strategy_loop(
         maker.clone(),
         order_store.clone(),
+        precisions.clone(),
         config.intervals.strategy,
     );
     let cleanup_task = spawn_cleanup_loop(maker.clone(), config.intervals.cleanup);

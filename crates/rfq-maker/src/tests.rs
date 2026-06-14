@@ -39,7 +39,8 @@ fn default_test_policy() -> PricePolicy {
             .map(|side| PriceEntry {
                 asset_id: asset().id,
                 side,
-                price_sats_per_unit: 101,
+                price_sats_per_token: 101,
+                precision: 0,
                 max_size: 1_000_000_000,
             })
             .collect(),
@@ -51,14 +52,15 @@ fn price_policy_resolves_match_decline_and_no_order() {
     let policy = PricePolicy::from_entries(vec![PriceEntry {
         asset_id: asset().id,
         side: Side::Buy,
-        price_sats_per_unit: 250,
+        price_sats_per_token: 250,
+        precision: 0,
         max_size: 1_000,
     }]);
 
     // Matching (asset, side) within size → the order's price.
     assert!(matches!(
         policy.unit_price(&asset(), &Side::Buy, 1_000),
-        PriceLookup::Price(250)
+        PriceLookup::Price { price_sats_per_token: 250, .. }
     ));
     // Over the order's size → decline.
     assert!(matches!(
@@ -75,6 +77,35 @@ fn price_policy_resolves_match_decline_and_no_order() {
         policy.unit_price(&quote_asset(), &Side::Buy, 10),
         PriceLookup::NoOrder
     ));
+}
+
+#[test]
+fn quote_total_sats_scales_by_precision_and_rounds_by_side() {
+    // precision 0: token == smallest unit → total is just price * amount.
+    assert_eq!(quote_total_sats(20, 50, 0, true), 1_000);
+    assert_eq!(quote_total_sats(20, 50, 0, false), 1_000);
+
+    // precision 2: 1.00 token = 100 smallest units. 100 sats/token, amount 250
+    // smallest units (2.50 tokens) → 250 sats exactly.
+    assert_eq!(quote_total_sats(100, 250, 2, true), 250);
+    assert_eq!(quote_total_sats(100, 250, 2, false), 250);
+
+    // Non-exact: 101 sats/token, amount 250 (2.50 tokens) → 252.5 sats.
+    // Taker pays (round up) → 253; maker pays out (round down) → 252.
+    assert_eq!(quote_total_sats(101, 250, 2, true), 253);
+    assert_eq!(quote_total_sats(101, 250, 2, false), 252);
+}
+
+#[test]
+fn units_for_sats_floors_to_avoid_overcommitting() {
+    // precision 0: 100 sats buys 100/20 = 5 units.
+    assert_eq!(units_for_sats(20, 100, 0), 5);
+    // precision 2: 250 sats at 100 sats/token → 2.50 tokens = 250 smallest units.
+    assert_eq!(units_for_sats(100, 250, 2), 250);
+    // Floors: 199 sats at 100 sats/token (prec 2) → 1.99 tokens = 199 units.
+    assert_eq!(units_for_sats(100, 199, 2), 199);
+    // Zero price → zero (guards the div).
+    assert_eq!(units_for_sats(0, 1_000, 2), 0);
 }
 
 fn utxo_with_amount(idx: usize, amount: u64) -> RgbInventoryUtxo {

@@ -89,7 +89,11 @@ async fn fill_records_and_auto_mirrors_the_opposite_order() {
     };
     order_store.upsert(buy_order).await.expect("seed buy order");
     let seeded = order_store.list().await.expect("list");
-    maker.reload_price_policy(orders::price_policy(&seeded));
+    // Empty precision map → precision 0 (token == smallest unit), matching the
+    // legacy sats-per-unit math this test's expectations were written against.
+    let precisions: Arc<std::collections::HashMap<String, u8>> =
+        Arc::new(std::collections::HashMap::new());
+    maker.reload_price_policy(orders::price_policy(&seeded, &precisions));
 
     let app = maker_app(maker.clone());
     let listener = TcpListener::bind(&config.maker.listen_addr)
@@ -108,11 +112,13 @@ async fn fill_records_and_auto_mirrors_the_opposite_order() {
     let reload = spawn_order_reload_loop(
         maker.clone(),
         order_store.clone(),
+        precisions.clone(),
         Duration::from_millis(300),
     );
     let strategy = spawn_strategy_loop(
         maker.clone(),
         order_store.clone(),
+        precisions.clone(),
         config.intervals.strategy,
     );
 

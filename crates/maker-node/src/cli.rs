@@ -255,7 +255,8 @@ pub(crate) enum OrderCmd {
         /// RGB contract id. Defaults to the sole registered contract.
         #[arg(long)]
         asset: Option<String>,
-        /// Price in SATS per smallest RGB unit.
+        /// Price in SATS per whole token (1.0 unit). A quote of `amount`
+        /// smallest units costs `price * amount / 10^precision` sats.
         #[arg(long)]
         price: u64,
         /// Max single-quote size, in smallest RGB units, this order backs.

@@ -11,6 +11,7 @@
 //! A legacy `orders.json` (the pre-maker.db format) is auto-imported once via
 //! [`migrate_orders_json`].
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -56,9 +57,11 @@ pub fn new_order(
     }
 }
 
-/// A flat both-sides [`PricePolicy`] for one asset at `price` sats/unit up to
-/// `size`. Convenience for setup/tests that just need the maker to quote an asset
-/// (the maker declines any (asset, side) with no order, so a policy is required).
+/// A flat both-sides [`PricePolicy`] for one asset at `price` sats per **token**
+/// up to `size`. Convenience for setup/tests that just need the maker to quote an
+/// asset (the maker declines any (asset, side) with no order, so a policy is
+/// required). Precision is 0 — i.e. token == smallest unit — so `price * amount`
+/// is the total, matching the legacy behaviour these helpers were written for.
 pub fn flat_policy(asset_id: &str, price: u64, size: u64) -> PricePolicy {
     PricePolicy::from_entries(
         [rfq_types::Side::Buy, rfq_types::Side::Sell]
@@ -66,7 +69,8 @@ pub fn flat_policy(asset_id: &str, price: u64, size: u64) -> PricePolicy {
             .map(|side| PriceEntry {
                 asset_id: asset_id.to_owned(),
                 side,
-                price_sats_per_unit: price,
+                price_sats_per_token: price,
+                precision: 0,
                 max_size: size,
             })
             .collect(),
@@ -74,14 +78,17 @@ pub fn flat_policy(asset_id: &str, price: u64, size: u64) -> PricePolicy {
 }
 
 /// Build the maker's [`PricePolicy`] from the orders with a recognized side.
-pub fn price_policy(orders: &[OrderRecord]) -> PricePolicy {
+/// `precisions` maps asset id → decimal precision (from the contract registry);
+/// an asset missing from the map prices at precision 0.
+pub fn price_policy(orders: &[OrderRecord], precisions: &HashMap<String, u8>) -> PricePolicy {
     let entries = orders
         .iter()
         .filter_map(|o| {
             parse_side(&o.side).map(|side| PriceEntry {
                 asset_id: o.asset_id.clone(),
                 side,
-                price_sats_per_unit: o.price,
+                price_sats_per_token: o.price,
+                precision: precisions.get(&o.asset_id).copied().unwrap_or(0),
                 max_size: o.size,
             })
         })
@@ -337,7 +344,7 @@ mod tests {
                 mirror_spread_bps: 0,
             },
         ];
-        let policy = price_policy(&orders);
+        let policy = price_policy(&orders, &HashMap::new());
         assert!(matches!(
             policy.unit_price(
                 &rfq_types::AssetId {
@@ -348,7 +355,7 @@ mod tests {
                 &Side::Buy,
                 1000,
             ),
-            rfq_maker::PriceLookup::Price(250)
+            rfq_maker::PriceLookup::Price { price_sats_per_token: 250, .. }
         ));
     }
 }

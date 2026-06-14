@@ -154,10 +154,10 @@ declines** — it quotes only what you've explicitly priced (no flat fallback), 
 set an order for every side you want to trade.
 
 ```bash
-# Back taker BUYS of FOO (you sell RGB) at 250 sats/unit, up to 1,000 units/quote:
+# Back taker BUYS of FOO (you sell RGB) at 250 sats per whole token, up to 1,000 units/quote:
 colorex maker order create --side buy --price 250 --size 1000 --asset rgb:FOO
 
-# Back taker SELLS of FOO (you buy RGB, paying BTC) at 240 sats/unit, up to 2,000:
+# Back taker SELLS of FOO (you buy RGB, paying BTC) at 240 sats per whole token, up to 2,000:
 colorex maker order create --side sell --price 240 --size 2000 --asset rgb:FOO
 
 colorex maker order list

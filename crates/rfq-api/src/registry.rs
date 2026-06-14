@@ -290,8 +290,8 @@ impl MakerRegistry {
                     None => best.push(p.clone()),
                     Some(b) => {
                         let better = match p.side {
-                            rfq_types::Side::Buy => p.price_sats_per_unit < b.price_sats_per_unit,
-                            rfq_types::Side::Sell => p.price_sats_per_unit > b.price_sats_per_unit,
+                            rfq_types::Side::Buy => p.price_sats_per_token < b.price_sats_per_token,
+                            rfq_types::Side::Sell => p.price_sats_per_token > b.price_sats_per_token,
                         };
                         if better {
                             *b = p.clone();

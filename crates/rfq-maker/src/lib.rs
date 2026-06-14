@@ -39,26 +39,59 @@ pub struct PricePolicy {
     entries: Vec<PriceEntry>,
 }
 
-/// One standing order's pricing terms: a unit price (sats per smallest RGB
-/// unit) and the largest single-quote amount it backs.
+/// One standing order's pricing terms: a unit price (sats per **whole token**)
+/// plus the asset's decimal `precision`, and the largest single-quote amount it
+/// backs. The total sats for a quote of `amount` smallest units is
+/// `price_sats_per_token * amount / 10^precision` (see [`quote_total_sats`]).
 #[derive(Debug, Clone)]
 pub struct PriceEntry {
     pub asset_id: String,
     pub side: Side,
-    pub price_sats_per_unit: u64,
+    pub price_sats_per_token: u64,
+    pub precision: u8,
     pub max_size: u64,
 }
 
 /// Outcome of consulting the [`PricePolicy`] for a quote.
 pub enum PriceLookup {
-    /// Quote at this unit price (sats per smallest RGB unit).
-    Price(u64),
+    /// Quote at this unit price (sats per whole token) with the asset's
+    /// `precision`. Convert to a total with [`quote_total_sats`].
+    Price { price_sats_per_token: u64, precision: u8 },
     /// A matching order exists but the requested amount exceeds its size —
     /// decline the quote.
     Decline,
     /// No standing order for this (asset, side) — decline. The maker quotes only
     /// what an operator has explicitly priced; there is no flat fallback.
     NoOrder,
+}
+
+/// Total sats for a quote of `amount` smallest units priced at
+/// `price_sats_per_token` sats per whole token (`amount = tokens * 10^precision`):
+/// `price * amount / 10^precision`. `round_up` controls the integer-division
+/// rounding so the maker never loses sats — round **up** when the taker pays
+/// (buy side) and **down** when the maker pays out (sell side).
+pub fn quote_total_sats(
+    price_sats_per_token: u64,
+    amount: u64,
+    precision: u8,
+    round_up: bool,
+) -> u64 {
+    let denom = 10u128.pow(precision as u32);
+    let num = price_sats_per_token as u128 * amount as u128;
+    let total = if round_up { num.div_ceil(denom) } else { num / denom };
+    total.min(u64::MAX as u128) as u64
+}
+
+/// How many smallest units `sats` can cover at `price_sats_per_token`:
+/// `sats * 10^precision / price`. Floors, so the maker never over-commits RGB
+/// against its BTC pool. Used for sell-side available depth.
+pub fn units_for_sats(price_sats_per_token: u64, sats: u64, precision: u8) -> u64 {
+    if price_sats_per_token == 0 {
+        return 0;
+    }
+    let scale = 10u128.pow(precision as u32);
+    let units = sats as u128 * scale / price_sats_per_token as u128;
+    units.min(u64::MAX as u128) as u64
 }
 
 impl PricePolicy {
@@ -70,7 +103,8 @@ impl PricePolicy {
         &self.entries
     }
 
-    /// Resolve the unit price for a quote of `amount` on (`asset`, `side`).
+    /// Resolve the unit price (sats per token) + precision for a quote of
+    /// `amount` on (`asset`, `side`).
     pub fn unit_price(&self, asset: &AssetId, side: &Side, amount: u64) -> PriceLookup {
         match self
             .entries
@@ -78,7 +112,10 @@ impl PricePolicy {
             .find(|e| e.asset_id == asset.id && &e.side == side)
         {
             None => PriceLookup::NoOrder,
-            Some(e) if amount <= e.max_size => PriceLookup::Price(e.price_sats_per_unit),
+            Some(e) if amount <= e.max_size => PriceLookup::Price {
+                price_sats_per_token: e.price_sats_per_token,
+                precision: e.precision,
+            },
             Some(_) => PriceLookup::Decline,
         }
     }
@@ -561,16 +598,18 @@ impl Maker {
                     }
                     // Maker pays BTC → liquidity is how many RGB units its BTC
                     // pool covers, net of the per-quote receive anchor.
-                    Side::Sell if e.price_sats_per_unit > 0 => {
+                    Side::Sell if e.price_sats_per_token > 0 => {
                         let spendable = btc_available.saturating_sub(rfq_rgb::SEAL_ANCHOR_SATS);
-                        e.max_size.min(spendable / e.price_sats_per_unit)
+                        e.max_size
+                            .min(units_for_sats(e.price_sats_per_token, spendable, e.precision))
                     }
                     Side::Sell => 0,
                 };
                 OrderPrice {
                     contract_id: e.asset_id.clone(),
                     side: e.side.clone(),
-                    price_sats_per_unit: e.price_sats_per_unit,
+                    price_sats_per_token: e.price_sats_per_token,
+                    precision: e.precision,
                     max_size: e.max_size,
                     available_size,
                 }
@@ -985,7 +1024,12 @@ impl Maker {
                 .load()
                 .unit_price(&request.base_asset, &request.side, amount)
             {
-                PriceLookup::Price(p) => p.saturating_mul(amount),
+                // Maker pays this out → round the total DOWN so rounding never
+                // costs the maker sats.
+                PriceLookup::Price {
+                    price_sats_per_token,
+                    precision,
+                } => quote_total_sats(price_sats_per_token, amount, precision, false),
                 // Surface the decline (else a sell returns no quote and "looks
                 // broken"): either no standing order, or the amount is over its size.
                 PriceLookup::NoOrder => {
@@ -1480,12 +1524,15 @@ impl MakerConnector for Maker {
 
         // Resolve the unit price up front: a standing order may decline the
         // quote (amount over its size) before we touch inventory.
-        let buy_unit_price = match self.price_policy.load().unit_price(
+        let (buy_price_sats_per_token, buy_precision) = match self.price_policy.load().unit_price(
             &request.base_asset,
             &request.side,
             request.amount,
         ) {
-            PriceLookup::Price(p) => p,
+            PriceLookup::Price {
+                price_sats_per_token,
+                precision,
+            } => (price_sats_per_token, precision),
             PriceLookup::NoOrder => {
                 eprintln!(
                     "declining buy quote: no standing buy order for asset {} — create one \
@@ -1565,7 +1612,13 @@ impl MakerConnector for Maker {
             quote_asset: request.quote_asset,
             side: request.side,
             amount: selection.requested,
-            price: buy_unit_price.saturating_mul(selection.requested),
+            // Taker pays this → round the total UP so rounding never costs the maker.
+            price: quote_total_sats(
+                buy_price_sats_per_token,
+                selection.requested,
+                buy_precision,
+                true,
+            ),
             expires_at_ms,
             estimated_fee_sats,
             // 20% slippage cap — the v0 default per docs/swap-flows.md.

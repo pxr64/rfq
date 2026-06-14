@@ -91,7 +91,8 @@ fn flat_price_policy(asset_id: &str) -> rfq_maker::PricePolicy {
             .map(|side| rfq_maker::PriceEntry {
                 asset_id: asset_id.to_owned(),
                 side,
-                price_sats_per_unit: 101,
+                price_sats_per_token: 101,
+                precision: 0,
                 max_size: 1_000_000_000,
             })
             .collect(),

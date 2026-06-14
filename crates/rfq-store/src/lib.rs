@@ -339,7 +339,8 @@ pub fn parse_side_str(s: &str) -> Option<Side> {
     }
 }
 
-/// One standing maker order. `price` is sats per smallest RGB unit; `size` is
+/// One standing maker order. `price` is sats per **whole token** (a quote of
+/// `amount` smallest units costs `price * amount / 10^precision`); `size` is
 /// the largest single quote (smallest RGB units) it backs. `mirror` opts the
 /// order into the auto-mirror strategy: on fill, the opposite-side order is
 /// auto-upserted at `mirror_spread_bps` off the fill price.
