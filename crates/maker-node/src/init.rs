@@ -309,6 +309,23 @@ fn render_toml(r: &RenderInput<'_>) -> String {
         out.push_str(&format!("account_file = \"{}\"\n", rgb.account_file));
         out.push_str(&format!("password     = \"{}\"\n", rgb.password));
     }
+    // Scaffold the rebalance/piggyback section so the feature is discoverable.
+    // Written disabled-by-default with the ladder knobs inline; flip `enabled`
+    // to turn on proactive UTXO laddering + settlement-piggyback. Every value
+    // here is also the serde default, so deleting the block changes nothing.
+    out.push('\n');
+    out.push_str("[rebalance]\n");
+    out.push_str("# Proactive UTXO laddering: split inventory into large→small pieces so\n");
+    out.push_str("# coin selection / tx-building stays cheap. Off by default; also drives\n");
+    out.push_str("# settlement-piggyback (split swap change onto the settlement tx).\n");
+    out.push_str("enabled                = false\n");
+    out.push_str("rgb_ladder_base        = 1000      # largest RGB rung (asset units), per asset\n");
+    out.push_str("btc_ladder_base_sats   = 50000     # largest BTC rung (sats)\n");
+    out.push_str("ladder_ratio           = 0.5       # tier shrink factor (0.5 = halving)\n");
+    out.push_str("ladder_tiers           = 4         # number of distinct rung sizes\n");
+    out.push_str("ladder_copies          = 2         # desired pieces per tier\n");
+    out.push_str("min_btc_reserve_sats   = 5000      # keep this much BTC for sell payouts\n");
+    out.push_str("rebalance_max_fee_sats = 10000     # cap; fee = next-block feerate × vsize\n");
     out
 }
 
@@ -397,8 +414,15 @@ mod tests {
         });
         // Contracts are no longer a TOML field — they live in the registry.
         assert!(!toml.contains("contract_id"));
+        // The rebalance section is scaffolded (discoverable), disabled by
+        // default, and parses — including the ladder_ratio (0,1) validation.
+        assert!(toml.contains("[rebalance]"), "init scaffolds the rebalance section");
         let cfg = crate::MakerNodeConfig::load_str(&toml).expect("rendered TOML parses");
         assert_eq!(cfg.maker.node_id, "node·beef");
+        assert!(!cfg.rebalance.enabled, "rebalance ships disabled by default");
+        assert_eq!(cfg.rebalance.rgb_ladder_base, 1000);
+        assert_eq!(cfg.rebalance.ladder_ratio, 0.5);
+        assert_eq!(cfg.rebalance.min_btc_reserve_sats, 5000);
         let rgb_cfg = cfg.rgb.expect("rgb block parsed");
         assert_eq!(rgb_cfg.wallet_name, "maker");
         assert_eq!(rgb_cfg.signer.password, "");
