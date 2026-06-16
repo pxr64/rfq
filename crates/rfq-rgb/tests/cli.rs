@@ -126,10 +126,19 @@ async fn validate_incoming_consignment_accepts_a_real_consignment() {
         base64::engine::general_purpose::STANDARD.encode(stack.consignment_bytes());
 
     let backend = stack.maker_backend().await;
-    // TODO(provenance): pass the taker's consigned outpoints once this e2e fixture
-    // is updated to the provenance model (see docs/provenance-consignment-proposal.md).
+    // The bootstrap issuer→maker transfer landed RGB on the maker's own outpoint(s);
+    // name them so the validator confirms + sums the received amount. Their witnesses
+    // are mined (`transfer_rgb` broadcasts + mines), so the sell-side gate accepts it.
+    let consigned: Vec<Outpoint> = backend
+        .list_inventory_utxos(&stack.asset())
+        .await
+        .expect("list_inventory_utxos")
+        .iter()
+        .map(|u| u.outpoint.clone())
+        .collect();
+    assert!(!consigned.is_empty(), "maker should hold the bootstrap RGB");
     let info = backend
-        .validate_incoming_consignment(&consignment_b64, stack.contract_id(), &[])
+        .validate_incoming_consignment(&consignment_b64, stack.contract_id(), &consigned)
         .await
         .expect("validate_incoming_consignment should accept the bootstrap transfer");
 
@@ -140,22 +149,40 @@ async fn validate_incoming_consignment_accepts_a_real_consignment() {
     );
     assert!(
         !info.outpoints.is_empty(),
-        "expected at least one input outpoint extracted from the validated transfer",
+        "expected at least one consigned outpoint",
     );
 }
+
+// SECURITY regression for the sell-side mined-ancestry gate
+// (docs/consignment-validation-hardening-plan.md): a consignment whose witness tx was
+// never mined MUST be rejected before the maker commits BTC. Verified manually red→green
+// (original code returns `Ok(..)` for an unmined `taker_consignment_for` consignment; the
+// fix returns `Err`). NOT kept as an e2e test here: `taker_consignment_for`'s destructive
+// "fake-broadcast" stash mutation can't coexist with the provenance `sell_round_trip` in
+// the shared single-bootstrap suite (whichever runs first starves the other of taker RGB).
+// The permanent regression lives as an isolated unit test in the Phase 1 `rfq-consignment`
+// crate (docs/consignment-validation-hardening-plan.md Phase 1).
 
 #[tokio::test]
 #[ignore = "needs the regtest stack up + tools installed; see file header"]
 async fn create_swap_psbt_buy_produces_psbt_and_consignment() {
     let stack = common::stack().await;
     let asset = stack.asset();
-    let backend = stack.maker_backend().await;
 
-    // RGB composition smoke test: the maker mints an invoice against its own
-    // contract, the maker's own RGB inventory provides the inputs, taker BTC
-    // inputs are empty (BTC side is exercised at the rfq-maker layer). This
-    // asserts the RGB transition build + embed + commit + transfer +
-    // maker-sign path yields a stable witness txid.
+    // RGB composition smoke test: the maker mints an invoice against its own contract,
+    // the maker's own RGB inventory provides the RGB inputs, and the taker declares a
+    // real funded BTC input (the declared-funding buy requires funding ≥ price + fee).
+    // Asserts the RGB transition build + embed + commit + transfer + maker-sign path
+    // yields a stable witness txid. (Taker guard scoped so it's released before the
+    // maker guard is taken.)
+    let taker_btc_input = {
+        let taker = stack.taker_backend().await;
+        taker
+            .spare_btc_input(&asset)
+            .await
+            .expect("taker spare_btc_input")
+    };
+    let backend = stack.maker_backend().await;
     let invoice = backend
         .create_invoice(&asset, 100)
         .await
@@ -175,8 +202,8 @@ async fn create_swap_psbt_buy_produces_psbt_and_consignment() {
             &invoice,
             100,
             &maker_outpoints,
-            &[],
-            "bcrt1qtaker",
+            std::slice::from_ref(&taker_btc_input),
+            stack.taker_funding_addr(),
             1_000,
             100,
             &[],
@@ -304,45 +331,64 @@ async fn create_swap_psbt_sell_produces_psbt() {
 async fn finalize_after_taker_sign_returns_extractable_witness_tx() {
     let stack = common::stack().await;
     let asset = stack.asset();
-    let backend = stack.maker_backend().await;
 
-    // Reuse the buy composition with no taker BTC inputs: the PSBT then has
-    // only maker inputs, so the maker's own descriptor finalizes everything
-    // and finalize_after_taker_sign can be exercised end-to-end without a
-    // second-party signer. A real two-backend round-trip is B5 territory.
-    let invoice = backend
-        .create_invoice(&asset, 100)
-        .await
-        .expect("create_invoice");
-    let utxos = backend
-        .list_inventory_utxos(&asset)
-        .await
-        .expect("list_inventory_utxos");
-    let maker_outpoints: Vec<Outpoint> = utxos.iter().map(|u| u.outpoint.clone()).collect();
-    let transfer = backend
-        .create_swap_psbt_buy(
-            &invoice,
-            100,
-            &maker_outpoints,
-            &[],
-            "bcrt1qtaker",
-            1_000,
-            100,
-            &[],
-        )
-        .await
-        .expect("create_swap_psbt_buy should compose a swap PSBT");
+    // Exercise finalize_after_taker_sign end-to-end (no broadcast). The declared-funding
+    // buy requires a real taker BTC input, so the taker declares + signs its input and the
+    // maker finalizes. Guards are scoped so only one is held at a time.
+    let taker_btc_input = {
+        let taker = stack.taker_backend().await;
+        taker
+            .spare_btc_input(&asset)
+            .await
+            .expect("taker spare_btc_input")
+    };
 
-    let consignment = transfer.consignment.expect("buy emits consignment");
-    let expected_wt = transfer
-        .expected_witness_txid
-        .clone()
-        .expect("declared-funding buy commits a stable witness txid");
+    let (partial_psbt, consignment, expected_wt) = {
+        let backend = stack.maker_backend().await;
+        let invoice = backend
+            .create_invoice(&asset, 100)
+            .await
+            .expect("create_invoice");
+        let utxos = backend
+            .list_inventory_utxos(&asset)
+            .await
+            .expect("list_inventory_utxos");
+        let maker_outpoints: Vec<Outpoint> = utxos.iter().map(|u| u.outpoint.clone()).collect();
+        let transfer = backend
+            .create_swap_psbt_buy(
+                &invoice,
+                100,
+                &maker_outpoints,
+                std::slice::from_ref(&taker_btc_input),
+                stack.taker_funding_addr(),
+                1_000,
+                100,
+                &[],
+            )
+            .await
+            .expect("create_swap_psbt_buy should compose a swap PSBT");
+        let consignment = transfer.consignment.expect("buy emits consignment");
+        let expected_wt = transfer
+            .expected_witness_txid
+            .clone()
+            .expect("declared-funding buy commits a stable witness txid");
+        (transfer.partial_psbt, consignment, expected_wt)
+    };
 
-    let finalized = backend
-        .finalize_after_taker_sign(&transfer.partial_psbt, &consignment)
-        .await
-        .expect("finalize should succeed when the maker is the sole signer");
+    let signed_psbt = {
+        let taker = stack.taker_backend().await;
+        taker
+            .sign_and_finalize(&partial_psbt)
+            .expect("taker sign+finalize")
+    };
+
+    let finalized = {
+        let backend = stack.maker_backend().await;
+        backend
+            .finalize_after_taker_sign(&signed_psbt, &consignment)
+            .await
+            .expect("finalize should succeed after the taker signs")
+    };
 
     assert_eq!(
         finalized.witness_txid, expected_wt,
@@ -630,17 +676,20 @@ async fn chain_observer_enables_consecutive_buys() {
 #[tokio::test]
 #[ignore = "needs the regtest stack up + tools installed; see file header"]
 async fn sell_round_trip_two_backends_broadcasts() {
-    // B5 sell happy path: maker mints invoice → taker uses `rgb transfer`
-    // to build a real RGB consignment to the maker → maker validates +
-    // composes swap PSBT (taker RGB inputs + maker BTC inputs) → taker
-    // signs/finalizes its RGB inputs → maker finalize+extract → bitcoind
-    // accepts. Mirrors the buy round-trip, but with the value flow
-    // reversed: taker delivers RGB, maker delivers BTC.
+    // B5 sell happy path (PROVENANCE model): maker mints invoice → taker exports a
+    // provenance consignment for its existing, already-MINED RGB outpoint(s) (no new
+    // transfer) → maker validates (the sell-side gate now requires the consigned history
+    // be mined) + composes swap PSBT (taker RGB inputs + maker BTC inputs) → taker
+    // signs/finalizes its RGB inputs → maker finalize+extract → bitcoind accepts.
+    // Mirrors the buy round-trip, but with the value flow reversed: taker delivers RGB,
+    // maker delivers BTC.
     let stack = common::stack().await;
     let asset = stack.asset();
 
     // --- Maker side: mint invoice + parse it back to typed components -----
-    let (maker_invoice, maker_parts, maker_btc_input, maker_payout_addr) = {
+    // Provenance sell: the maker mints no invoice for the delivery; we still create one
+    // only to recover the typed contract id via `parse_maker_invoice` (→ `maker_parts`).
+    let (_maker_invoice, maker_parts, maker_btc_input, maker_payout_addr) = {
         let maker = stack.maker_backend().await;
         let maker_invoice = maker
             .create_invoice(&asset, 200)
@@ -671,43 +720,60 @@ async fn sell_round_trip_two_backends_broadcasts() {
         // drop MakerGuard → release lock for the taker
     };
 
-    // --- Taker mints a change invoice + builds the consignment ----------
-    // The taker's 500 RGB exceeds the maker's 200 invoice, so a change
-    // invoice is needed for the 300 surplus. Its `amount` field is
-    // irrelevant — swap.rs only reads the beneficiary seal off it.
-    let (taker_change_invoice, consignment_b64) = {
+    // --- Taker mints a change invoice + exports a PROVENANCE consignment ----
+    // The taker's 500 RGB exceeds the maker's 200 invoice, so a change invoice is
+    // needed for the surplus. Its `amount` is irrelevant — swap.rs only reads the
+    // beneficiary seal off it. Provenance model: the taker does NOT build a new
+    // transfer; it exports a provenance consignment for the outpoints that already
+    // hold its RGB (the bootstrap issuer→taker allocation, which is MINED). The maker
+    // spends those outpoints into the swap tx. Consigning the taker's full inventory
+    // keeps the deliver(200)+change accounting equivalent to the old fixture while
+    // the consigned history stays fully mined (required by the sell-side gate).
+    let (taker_change_invoice, consignment_b64, consigned_outpoints) = {
         let taker = stack.taker_backend().await;
         let change_invoice = taker
             .create_invoice(&asset, 300)
             .await
             .expect("taker create_invoice (change)");
 
-        use base64::Engine as _;
-        let bytes = stack
-            .taker_consignment_for(&maker_invoice)
-            .expect("taker_consignment_for");
-        (
-            change_invoice,
-            base64::engine::general_purpose::STANDARD.encode(bytes),
-        )
+        let inv = taker.inventory(&asset).await.expect("taker inventory");
+        let consigned_outpoints: Vec<Outpoint> =
+            inv.iter().map(|u| u.outpoint.clone()).collect();
+        assert!(
+            !consigned_outpoints.is_empty(),
+            "taker must hold mined RGB from the bootstrap to sell"
+        );
+        let outpoint_strs: Vec<String> = consigned_outpoints
+            .iter()
+            .map(|o| format!("{}:{}", o.txid, o.vout))
+            .collect();
+
+        // `export_provenance` already returns a base64 consignment — pass it through
+        // (unlike `taker_consignment_for`, which returned raw bytes to encode here).
+        let consignment_b64 = taker
+            .export_provenance(stack.contract_id_str(), &outpoint_strs)
+            .expect("export_provenance");
+        (change_invoice, consignment_b64, consigned_outpoints)
     };
 
-    // --- Maker validates: returns the taker's *input* outpoints directly,
-    // and absorbs the taker's transition into the maker's stash so
-    // `contract_assignments_for(taker_inputs)` in `create_swap_psbt_sell`
-    // sees the allocations.
+    // --- Maker validates the provenance consignment, requiring mined history,
+    // and absorbs the taker's allocations into the maker's stash so
+    // `contract_assignments_for(taker_inputs)` in `create_swap_psbt_sell` sees them.
+    // The named `consigned_outpoints` are the taker's RGB-bearing outpoints.
     let consignment_info = {
         let maker = stack.maker_backend().await;
-        // TODO(provenance): pass the taker's consigned outpoints once this e2e
-        // fixture is updated to the provenance model.
         maker
-            .validate_incoming_consignment(&consignment_b64, maker_parts.contract_id, &[])
+            .validate_incoming_consignment(
+                &consignment_b64,
+                maker_parts.contract_id,
+                &consigned_outpoints,
+            )
             .await
             .expect("validate_incoming_consignment")
     };
     assert!(
         !consignment_info.outpoints.is_empty(),
-        "validate should surface the taker's RGB input outpoints"
+        "validate should surface the taker's RGB outpoints"
     );
 
     // --- Resolve taker_rgb_prevouts from the validated input outpoints ----

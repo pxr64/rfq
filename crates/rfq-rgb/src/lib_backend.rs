@@ -1,3 +1,4 @@
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -1365,19 +1366,30 @@ impl RgbBackend for LibRgbBackend {
             )));
         }
 
-        // Cryptographic validation: resolver fetches witness txes; the typed
-        // system from the maker's stash anchors the validator's trust root.
-        // `mut` because we `accept_transfer` after the introspection below —
-        // sell-side `create_swap_psbt_sell` then sees the taker's allocations
-        // via `stock.contract_assignments_for(...)`. `Stock::load(_, true)`
-        // autosaves on drop, so the accepted state persists to the next call.
+        // SECURITY (sell-side gate): validate against a CHAIN-ONLY resolver and
+        // REQUIRE every witness in the consigned history be mined, BEFORE the maker
+        // builds/signs/broadcasts the swap. We deliberately do NOT seed the resolver
+        // with the consignment's own txes (`add_consignment_txes`): that path forces
+        // every witness to `WitnessOrd::Tentative` without any chain lookup, so a
+        // fabricated history riding never-mined witness txs would validate and the
+        // maker would pay BTC for RGB that never existed. With a plain chain resolver:
+        //   - a never-broadcast witness resolves to `Unresolved` → the validator
+        //     hard-errors (`SealNoPubWitness`), and
+        //   - `safe_height = u32::MAX` flags any merely-`Tentative` (0-conf / mempool)
+        //     witness as `UnsafeHistory` → validity downgrades to `Warnings`, rejected
+        //     by the `!= Valid` check below.
+        // Net: the whole ancestry must be mined (>=1 conf). Mainnet should tighten this
+        // to `safe_height = tip - K + 1` for K confirmations — tracked in the
+        // rfq-consignment crate work (docs/consignment-validation-hardening-plan.md).
+        // `mut` stock because we `accept_transfer` after the introspection below;
+        // `Stock::load(_, true)` autosaves on drop so accepted state persists.
         let mut stock = self.load_stock()?;
 
-        let mut resolver = self.resolver()?;
-        resolver.add_consignment_txes(&consignment);
+        let resolver = self.resolver()?;
 
         let validation_config = ValidationConfig {
             chain_net: chain_net_for(self.parse_network()?),
+            safe_height: Some(NonZeroU32::MAX),
             trusted_typesystem: stock
                 .as_stash_provider()
                 .type_system()
