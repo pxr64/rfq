@@ -11,7 +11,7 @@ serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-rfq-api = { path = "../rfq-api" }
+rfq-api = { path = "../../services/broker" }
 axum.workspace = true
 tokio.workspace = true
 

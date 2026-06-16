@@ -17,14 +17,14 @@ futures.workspace = true
 hex = "0.4"
 humantime-serde = "1"
 rand = "0.8"
-rfq-btc = { path = "../rfq-btc", features = ["electrum"] }
-rfq-client = { path = "../rfq-client" }
-rfq-maker = { path = "../rfq-maker" }
-rfq-rgb = { path = "../rfq-rgb" }
-rfq-router = { path = "../rfq-router" }
-rfq-store = { path = "../rfq-store", features = ["sqlite"] }
-rfq-types = { path = "../rfq-types" }
-rfq-wallet = { path = "../rfq-wallet" }
+rfq-btc = { path = "../../crates/rfq-btc", features = ["electrum"] }
+rfq-client = { path = "../../crates/rfq-client" }
+rfq-maker = { path = "../../crates/rfq-maker" }
+rfq-rgb = { path = "../../crates/rfq-rgb" }
+rfq-router = { path = "../../crates/rfq-router" }
+rfq-store = { path = "../../crates/rfq-store", features = ["sqlite"] }
+rfq-types = { path = "../../crates/rfq-types" }
+rfq-wallet = { path = "../../crates/rfq-wallet" }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
 secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
 serde.workspace = true
@@ -38,11 +38,11 @@ toml = "0.8"
 serde_json.workspace = true
 tower.workspace = true
 # Pull in rfq-rgb's e2e harness for the regtest HTTP integration test.
-rfq-rgb = { path = "../rfq-rgb", features = ["test-helpers"] }
+rfq-rgb = { path = "../../crates/rfq-rgb", features = ["test-helpers"] }
 # Lib-side PSBT primitives the HTTP test uses to drive taker signing.
 bp-std = { version = "=0.11.1-alpha.2", features = ["client-side-validation", "serde", "signers"] }
 bp-wallet = { version = "=0.11.1-alpha.2", features = ["fs", "signers", "electrum"] }
 # Reach into the maker_app via HTTP in the regtest integration test.
 reqwest.workspace = true
 # Spin up the broker in-process for the broker_round_trip test.
-rfq-api = { path = "../rfq-api" }
+rfq-api = { path = "../broker" }

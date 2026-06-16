@@ -213,7 +213,7 @@ colorex maker health        # probe the broker
 colorex maker inventory     # RGB inventory snapshot
 ```
 
-A taker can now trade against it via `colorex-taker` (see `crates/taker-cli`).
+A taker can now trade against it via `colorex-taker` (see `tools/taker-cli`).
 
 ## 6. Maintenance & recovery
 

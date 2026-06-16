@@ -158,7 +158,7 @@ Three new TTL constants in [crates/rfq-maker/src/lib.rs](../crates/rfq-maker/src
 | `TAKER_SIGNATURE_TTL_MS` | 600_000 (10 min) | `AwaitingTakerSignature` (both sides) |
 | `BROADCAST_CONFIRM_TTL_MS` | 7_200_000 (2 hr) | `PendingBitcoinConfirm` |
 
-`SettlementIntent` carries `expires_at_ms` for its current stage. `spawn_cleanup_loop` in [crates/maker-node/src/main.rs](../crates/maker-node/src/main.rs) polls and transitions expired stages via the appropriate `InventoryStore` failure method.
+`SettlementIntent` carries `expires_at_ms` for its current stage. `spawn_cleanup_loop` in [services/maker-node/src/main.rs](../services/maker-node/src/main.rs) polls and transitions expired stages via the appropriate `InventoryStore` failure method.
 
 ## Failure-path mapping
 

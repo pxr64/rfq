@@ -6,13 +6,13 @@ members = [
     "crates/rfq-rgb",
     "crates/rfq-consignment",
     "crates/rfq-btc",
-    "crates/rfq-api",
     "crates/rfq-maker",
     "crates/rfq-store",
     "crates/rfq-client",
     "crates/rfq-wallet",
-    "crates/maker-node",
-    "crates/taker-cli",
+    "services/broker",
+    "services/maker-node",
+    "tools/taker-cli",
 ]
 resolver = "2"
 

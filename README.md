@@ -41,15 +41,15 @@ tokens, run a maker, trade) and is network-agnostic: `regtest` / `signet` /
 so on-chain a swap looks like an ordinary P2TR spend.
 
 Run via `cargo run -p maker-node -- <args>` (or `cargo install --path
-crates/maker-node` then `colorex <args>`). The taker is the separate `colorex-taker`
-binary (`crates/taker-cli`).
+services/maker-node` then `colorex <args>`). The taker is the separate `colorex-taker`
+binary (`tools/taker-cli`).
 
 ### Quickstart — run a maker from scratch (signet)
 
 End to end, a new maker is seven steps. Each links to the deep guide; the worked
 examples use `signet` but every command takes `--network`.
 
-1. **Build the binary.** `cargo install --path crates/maker-node` (then `colorex …`),
+1. **Build the binary.** `cargo install --path services/maker-node` (then `colorex …`),
    or run inline with `cargo run -p maker-node -- …`.
 2. **Stand up chain access** — a signet `bitcoind` + a romanz `electrs`:
    `docker compose -f infra/signet/maker-chain.docker-compose.yml up -d --build`

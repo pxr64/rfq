@@ -10,12 +10,12 @@ concrete public-network case; swap it for any other network (and the matching
 electrum endpoint) without changing the command shapes.
 
 > **Status.** Every command + flag below is verified against the current CLI
-> (`crates/maker-node/src/main.rs`), and the issue → fund → distribute round-trip
+> (`services/maker-node/src/main.rs`), and the issue → fund → distribute round-trip
 > has been exercised live on signet.
 
 ## Prerequisites
 
-- A built `colorex` binary: `cargo install --path crates/maker-node` (or run via
+- A built `colorex` binary: `cargo install --path services/maker-node` (or run via
   `cargo run -p maker-node -- <args>`).
 - An **electrum** endpoint for your network. Mind the two URL forms (see below).
 - A way to fund addresses manually — a faucet on a test network, or real coins on

@@ -61,15 +61,15 @@ flowchart TD
 ```
 
 All four boxes share the same `Arc`-backed `Maker`. Key symbols (in
-`crates/maker-node/src/lib.rs`): `MakerNodeRuntime`
-[:262](../crates/maker-node/src/lib.rs#L262), `ChainObserverDeps`
-[:270](../crates/maker-node/src/lib.rs#L270), `build_runtime`
-[:281](../crates/maker-node/src/lib.rs#L281), `maker_app`
-[:396](../crates/maker-node/src/lib.rs#L396), `spawn_cleanup_loop`
-[:524](../crates/maker-node/src/lib.rs#L524), `spawn_rebalance_loop`
-[:543](../crates/maker-node/src/lib.rs#L543), `spawn_chain_observer_loop`
-[:574](../crates/maker-node/src/lib.rs#L574). Daemon assembly: `run()` in
-[main.rs:70](../crates/maker-node/src/main.rs#L70).
+`services/maker-node/src/lib.rs`): `MakerNodeRuntime`
+[:262](../services/maker-node/src/lib.rs#L262), `ChainObserverDeps`
+[:270](../services/maker-node/src/lib.rs#L270), `build_runtime`
+[:281](../services/maker-node/src/lib.rs#L281), `maker_app`
+[:396](../services/maker-node/src/lib.rs#L396), `spawn_cleanup_loop`
+[:524](../services/maker-node/src/lib.rs#L524), `spawn_rebalance_loop`
+[:543](../services/maker-node/src/lib.rs#L543), `spawn_chain_observer_loop`
+[:574](../services/maker-node/src/lib.rs#L574). Daemon assembly: `run()` in
+[main.rs:70](../services/maker-node/src/main.rs#L70).
 
 ### Why "a Maker **and** a chain observer"
 
@@ -107,7 +107,7 @@ pub struct Maker {
 ```
 
 (The *quote* store is **not** on `Maker` — it lives on `MakerNodeState`
-alongside the maker, at [lib.rs:391](../crates/maker-node/src/lib.rs#L391).)
+alongside the maker, at [lib.rs:391](../services/maker-node/src/lib.rs#L391).)
 
 The trait boundary is what lets the same `Maker` run two ways:
 
@@ -119,7 +119,7 @@ The trait boundary is what lets the same `Maker` run two ways:
 `build_runtime` picks the mode from config: `Some(rgb)` → real backend +
 electrum + an initial inventory snapshot + `ChainObserverDeps`; `None` → mock
 backends seeded with deterministic UTXOs and no observer
-([lib.rs:281](../crates/maker-node/src/lib.rs#L281)).
+([lib.rs:281](../services/maker-node/src/lib.rs#L281)).
 
 The `RgbBackend` trait (both backends implement it) is in
 [crates/rfq-rgb/src/lib.rs](../crates/rfq-rgb/src/lib.rs); the real swap-PSBT
@@ -130,7 +130,7 @@ composition is in [crates/rfq-rgb/src/swap.rs](../crates/rfq-rgb/src/swap.rs).
 ## 4. HTTP surface
 
 `maker_app` exposes six endpoints
-([crates/maker-node/src/lib.rs:396](../crates/maker-node/src/lib.rs#L396)):
+([services/maker-node/src/lib.rs:396](../services/maker-node/src/lib.rs#L396)):
 
 | Method & path                  | Purpose                                                       |
 |--------------------------------|--------------------------------------------------------------|
@@ -176,7 +176,7 @@ stateDiagram-v2
 Two loops drive transitions the request path can't:
 - **cleanup loop** releases `Reserved` UTXOs whose taker-signature window
   lapsed, returning them to `Available`
-  ([lib.rs:524](../crates/maker-node/src/lib.rs#L524)).
+  ([lib.rs:524](../services/maker-node/src/lib.rs#L524)).
 - **chain observer** advances `PendingBitcoinConfirm → Settled` via
   `sweep_confirmations`, and ingests swap *change* UTXOs as `Available`.
 
@@ -185,7 +185,7 @@ Two loops drive transitions the request path can't:
 ## 6. The chain observer in detail
 
 Spawned only with a real RGB backend. Each tick (default 5s,
-[crates/maker-node/src/lib.rs:574](../crates/maker-node/src/lib.rs#L574)) does
+[services/maker-node/src/lib.rs:574](../services/maker-node/src/lib.rs#L574)) does
 four things in order:
 
 ```text
@@ -212,7 +212,7 @@ Notes:
 ## 7. Configuration
 
 TOML at `~/.config/colorex/maker.toml` (or `--config <path>`). Full annotated
-example: [crates/maker-node/config.toml.example](../crates/maker-node/config.toml.example).
+example: [services/maker-node/config.toml.example](../services/maker-node/config.toml.example).
 
 ```toml
 [maker]
@@ -245,7 +245,7 @@ password     = ""                                       # empty for regtest
 The presence of `[rgb]` is the single switch between mock and real mode.
 `node_id` is load-bearing: the broker routes settlement calls by matching it.
 
-`colorex` subcommands ([crates/maker-node/src/main.rs:32](../crates/maker-node/src/main.rs#L32)):
+`colorex` subcommands ([services/maker-node/src/main.rs:32](../services/maker-node/src/main.rs#L32)):
 `maker init` (generate keypair + write config), `maker up` (run daemon),
 `maker health` (probe broker), `maker inventory` (print snapshot).
 
