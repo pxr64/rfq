@@ -19,6 +19,7 @@ test-helpers = ["dep:tempfile", "dep:tokio"]
 [dependencies]
 async-trait.workspace = true
 rfq-btc = { path = "../rfq-btc", features = ["electrum"] }
+rfq-consignment = { path = "../rfq-consignment" }
 rfq-types = { path = "../rfq-types" }
 thiserror.workspace = true
 base64 = "0.22"

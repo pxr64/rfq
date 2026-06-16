@@ -1,9 +1,10 @@
-use std::num::NonZeroU32;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 use async_trait::async_trait;
 use rfq_btc::{BitcoinClient, ElectrumClient};
+use rfq_consignment::MinedChecker;
 use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo, SwapTransfer};
 
 use amplify::Wrapper as _;
@@ -24,8 +25,7 @@ use rgb::persistence::fs::FsBinStore;
 use rgb::persistence::{StashReadProvider, Stock};
 use rgb::resolvers::{AnyResolver, ContractIssueResolver};
 use rgb::stl::{AssetSpec, ContractTerms, RicardianContract};
-use rgb::validation::{ResolveWitness, ValidationConfig, Validity, WitnessStatus};
-use rgb::vm::WitnessOrd;
+use rgb::validation::{ResolveWitness, ValidationConfig, Validity};
 use rgb::{
     Amount, ChainNet, ContractId, GenesisSeal, GraphSeal, Identity, OutputSeal, RgbDescr,
     RgbKeychain, RgbWallet, StateType, TapretKey, TransferParams,
@@ -510,24 +510,24 @@ impl LibRgbBackend {
             )));
         }
 
-        // (b) Mined-ancestry gate. `tx_ord_map` holds every witness the validator walked;
-        // re-resolve each against a CHAIN-ONLY resolver (not seeded) and require `Mined`,
-        // skipping only the expected swap tx. A never-broadcast / 0-conf ancestry witness
-        // resolves to Unresolved/Tentative and is rejected here.
-        let chain = self.resolver()?;
-        for txid in validated.validation_status().tx_ord_map.keys() {
-            if txid.to_string() == expected_witness_txid {
-                continue; // the swap hop; the taker is signing/broadcasting it now
-            }
-            match chain.resolve_witness(*txid) {
-                Ok(WitnessStatus::Resolved(_, WitnessOrd::Mined(_))) => {}
-                _ => {
-                    return Err(RgbError::TransferBuild(format!(
-                        "buy consignment ancestry witness {txid} is not mined on-chain; \
-                         refusing to sign"
-                    )));
-                }
-            }
+        // (b) Mined-ancestry gate via the shared `MinedChecker`: every witness the validator
+        // walked must be mined on-chain, EXCEPT the expected swap tx (the not-yet-broadcast
+        // terminal hop the taker is about to sign/broadcast).
+        let txids: Vec<String> = validated
+            .validation_status()
+            .tx_ord_map
+            .keys()
+            .map(|t| t.to_string())
+            .collect();
+        let exempt = HashSet::from([expected_witness_txid.to_owned()]);
+        let verdict = MinedChecker::new(vec![self.electrum_url.clone()], 1)
+            .check(&txids, &exempt)
+            .map_err(|e| RgbError::TransferBuild(format!("mined-ancestry check: {e}")))?;
+        if !verdict.all_mined {
+            return Err(RgbError::TransferBuild(format!(
+                "buy consignment ancestry not mined on-chain (refusing to sign): {:?}",
+                verdict.unmined
+            )));
         }
         Ok(())
     }
@@ -1449,30 +1449,21 @@ impl RgbBackend for LibRgbBackend {
             )));
         }
 
-        // SECURITY (sell-side gate): validate against a CHAIN-ONLY resolver and
-        // REQUIRE every witness in the consigned history be mined, BEFORE the maker
-        // builds/signs/broadcasts the swap. We deliberately do NOT seed the resolver
-        // with the consignment's own txes (`add_consignment_txes`): that path forces
-        // every witness to `WitnessOrd::Tentative` without any chain lookup, so a
-        // fabricated history riding never-mined witness txs would validate and the
-        // maker would pay BTC for RGB that never existed. With a plain chain resolver:
-        //   - a never-broadcast witness resolves to `Unresolved` → the validator
-        //     hard-errors (`SealNoPubWitness`), and
-        //   - `safe_height = u32::MAX` flags any merely-`Tentative` (0-conf / mempool)
-        //     witness as `UnsafeHistory` → validity downgrades to `Warnings`, rejected
-        //     by the `!= Valid` check below.
-        // Net: the whole ancestry must be mined (>=1 conf). Mainnet should tighten this
-        // to `safe_height = tip - K + 1` for K confirmations — tracked in the
-        // rfq-consignment crate work (docs/consignment-validation-hardening-plan.md).
-        // `mut` stock because we `accept_transfer` after the introspection below;
-        // `Stock::load(_, true)` autosaves on drop so accepted state persists.
+        // SECURITY (sell-side gate): REQUIRE every witness in the consigned history to be
+        // mined on-chain BEFORE the maker builds/signs/broadcasts the swap — otherwise a
+        // fabricated history riding never-mined witness txs would validate and the maker
+        // would pay BTC for RGB that never existed. Graph-validate with a SEEDED resolver
+        // (so the validator has the full witness graph), then enforce mining explicitly via
+        // the shared `MinedChecker` (every witness must be mined — no exemptions on a sell;
+        // the swap tx is built afterwards). `mut` stock because we `accept_transfer` below;
+        // `Stock::load(_, true)` autosaves on drop.
         let mut stock = self.load_stock()?;
 
-        let resolver = self.resolver()?;
+        let mut resolver = self.resolver()?;
+        resolver.add_consignment_txes(&consignment);
 
         let validation_config = ValidationConfig {
             chain_net: chain_net_for(self.parse_network()?),
-            safe_height: Some(NonZeroU32::MAX),
             trusted_typesystem: stock
                 .as_stash_provider()
                 .type_system()
@@ -1489,6 +1480,24 @@ impl RgbBackend for LibRgbBackend {
             return Err(RgbError::TransferBuild(format!(
                 "consignment invalid: {}",
                 validated.validation_status()
+            )));
+        }
+
+        // Mined-ancestry gate (pipelined). Reject BEFORE `accept_transfer` so a bad
+        // consignment never mutates the stash. (min_confs = 1; mainnet tip-based K is future.)
+        let txids: Vec<String> = validated
+            .validation_status()
+            .tx_ord_map
+            .keys()
+            .map(|t| t.to_string())
+            .collect();
+        let verdict = MinedChecker::new(vec![self.electrum_url.clone()], 1)
+            .check(&txids, &HashSet::new())
+            .map_err(|e| RgbError::TransferBuild(format!("mined-ancestry check: {e}")))?;
+        if !verdict.all_mined {
+            return Err(RgbError::TransferBuild(format!(
+                "consignment ancestry not mined on-chain: {:?}",
+                verdict.unmined
             )));
         }
 

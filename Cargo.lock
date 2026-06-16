@@ -2488,6 +2488,7 @@ dependencies = [
  "bp-wallet",
  "rand 0.9.4",
  "rfq-btc",
+ "rfq-consignment",
  "rfq-types",
  "rgb-api",
  "rgb-psbt-utils",
