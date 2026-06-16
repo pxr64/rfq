@@ -583,6 +583,20 @@ impl<'a> TakerGuard<'a> {
             .map_err(|e| e.to_string())
     }
 
+    /// Buy-side gate: validate the maker consignment's ancestry is mined before signing.
+    /// See [`Taker::validate_buy_consignment`].
+    pub async fn validate_buy_consignment(
+        &self,
+        asset: &AssetId,
+        consignment_base64: &str,
+        expected_witness_txid: &str,
+    ) -> Result<(), String> {
+        self.taker()
+            .validate_buy_consignment(asset, consignment_base64, expected_witness_txid)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// Look up a specific taker UTXO and return its (Outpoint, TxOut). Used
     /// by the sell round-trip to build `taker_rgb_prevouts` from the
     /// outpoints the validated consignment reports.

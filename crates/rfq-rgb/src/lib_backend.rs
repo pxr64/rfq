@@ -24,7 +24,8 @@ use rgb::persistence::fs::FsBinStore;
 use rgb::persistence::{StashReadProvider, Stock};
 use rgb::resolvers::{AnyResolver, ContractIssueResolver};
 use rgb::stl::{AssetSpec, ContractTerms, RicardianContract};
-use rgb::validation::{ResolveWitness, ValidationConfig, Validity};
+use rgb::validation::{ResolveWitness, ValidationConfig, Validity, WitnessStatus};
+use rgb::vm::WitnessOrd;
 use rgb::{
     Amount, ChainNet, ContractId, GenesisSeal, GraphSeal, Identity, OutputSeal, RgbDescr,
     RgbKeychain, RgbWallet, StateType, TapretKey, TransferParams,
@@ -446,6 +447,88 @@ impl LibRgbBackend {
             .update_witnesses(chain_resolver, 0, vec![])
             .map_err(|e| RgbError::StashLoad(format!("update_witnesses: {e}")))?;
 
+        Ok(())
+    }
+
+    /// SECURITY (buy-side gate): the taker calls this on the maker-delivered consignment
+    /// BEFORE it signs/pays. A malicious maker could otherwise fabricate its inventory
+    /// ancestry (RGB whose history was never mined on-chain) and take the taker's BTC for
+    /// nonexistent RGB. Unlike the sell-side gate, the consignment's TERMINAL witness is
+    /// the swap tx itself — not yet broadcast at sign time, so legitimately unmined. We
+    /// therefore:
+    ///   (a) graph-validate with a seeded resolver (so the unmined swap tx is available as
+    ///       `Tentative` and the graph/schema/commitment checks pass), then
+    ///   (b) require every OTHER witness (the maker's inventory ancestry) to be `Mined`,
+    ///       resolved against a chain-only resolver. `expected_witness_txid` (the swap tx)
+    ///       is the one hop allowed to be unmined.
+    /// Reject on any unmined ancestry witness, or a graph-invalid consignment.
+    pub async fn validate_buy_consignment(
+        &self,
+        consignment_base64: &str,
+        expected_contract_id: ContractId,
+        expected_witness_txid: &str,
+    ) -> Result<(), RgbError> {
+        let _guard = self.guard();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(consignment_base64.trim())
+            .map_err(|e| {
+                RgbError::TransferBuild(format!("consignment is not valid base64: {e}"))
+            })?;
+        let consignment = Transfer::load(bytes.as_slice())
+            .map_err(|e| RgbError::TransferBuild(format!("consignment decode: {e}")))?;
+        if consignment.contract_id() != expected_contract_id {
+            return Err(RgbError::TransferBuild(format!(
+                "consignment contract {} does not match expected {}",
+                consignment.contract_id(),
+                expected_contract_id
+            )));
+        }
+
+        // (a) Graph validation. Seed the consignment txes so the not-yet-broadcast swap tx
+        // (the terminal hop) resolves as `Tentative` and the graph checks pass. No
+        // `safe_height` here precisely because that terminal is legitimately unmined; the
+        // ancestry mining requirement is enforced explicitly in (b).
+        let stock = self.load_stock()?;
+        let mut resolver = self.resolver()?;
+        resolver.add_consignment_txes(&consignment);
+        let validation_config = ValidationConfig {
+            chain_net: chain_net_for(self.parse_network()?),
+            trusted_typesystem: stock
+                .as_stash_provider()
+                .type_system()
+                .map_err(|e| RgbError::StashLoad(format!("type system: {e}")))?
+                .clone(),
+            ..Default::default()
+        };
+        let validated = consignment
+            .validate(&resolver, &validation_config)
+            .map_err(|e| RgbError::TransferBuild(format!("buy consignment validation: {e:?}")))?;
+        if validated.validation_status().validity() != Validity::Valid {
+            return Err(RgbError::TransferBuild(format!(
+                "buy consignment invalid: {}",
+                validated.validation_status()
+            )));
+        }
+
+        // (b) Mined-ancestry gate. `tx_ord_map` holds every witness the validator walked;
+        // re-resolve each against a CHAIN-ONLY resolver (not seeded) and require `Mined`,
+        // skipping only the expected swap tx. A never-broadcast / 0-conf ancestry witness
+        // resolves to Unresolved/Tentative and is rejected here.
+        let chain = self.resolver()?;
+        for txid in validated.validation_status().tx_ord_map.keys() {
+            if txid.to_string() == expected_witness_txid {
+                continue; // the swap hop; the taker is signing/broadcasting it now
+            }
+            match chain.resolve_witness(*txid) {
+                Ok(WitnessStatus::Resolved(_, WitnessOrd::Mined(_))) => {}
+                _ => {
+                    return Err(RgbError::TransferBuild(format!(
+                        "buy consignment ancestry witness {txid} is not mined on-chain; \
+                         refusing to sign"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 

@@ -121,6 +121,22 @@ impl Taker {
             .await
     }
 
+    /// Buy-side gate: validate the maker-delivered consignment's ancestry is mined on-chain
+    /// BEFORE signing/paying. `expected_witness_txid` is the swap tx (the one hop allowed to
+    /// be unmined). See [`LibRgbBackend::validate_buy_consignment`].
+    pub async fn validate_buy_consignment(
+        &self,
+        asset: &AssetId,
+        consignment_base64: &str,
+        expected_witness_txid: &str,
+    ) -> Result<(), RgbError> {
+        let contract_id = ContractId::from_str(&asset.id)
+            .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
+        self.lib_backend()
+            .validate_buy_consignment(consignment_base64, contract_id, expected_witness_txid)
+            .await
+    }
+
     /// Build the taker's sell consignment: a unilateral RGB transfer to the
     /// maker's invoice. The taker does NOT broadcast this — the maker anchors
     /// it into the swap tx and broadcasts. See

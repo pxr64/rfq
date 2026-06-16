@@ -489,9 +489,15 @@ async fn buy_round_trip_two_backends_broadcasts() {
         (transfer.partial_psbt, consignment, expected_wt)
     };
 
-    // --- Taker signs + finalizes its own inputs ---------------------------
+    // --- Taker gate: validate the maker consignment's ancestry is mined, then signs ---
     let signed_psbt = {
         let taker = stack.taker_backend().await;
+        // Buy-side security gate: refuse to sign/pay unless the maker's RGB ancestry is
+        // mined on-chain (the swap tx itself is the only allowed-unmined hop).
+        taker
+            .validate_buy_consignment(&asset, &consignment, &expected_wt)
+            .await
+            .expect("buy consignment ancestry must validate as mined before signing");
         taker
             .sign_and_finalize(&partial_psbt)
             .expect("taker sign+finalize")

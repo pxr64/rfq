@@ -311,6 +311,20 @@ async fn buy(
         println!("dumped maker partial PSBT (base64) → {path}");
     }
 
+    // Buy-side security gate: refuse to sign/pay unless the maker's RGB ancestry is mined
+    // on-chain (the swap tx — `expected_witness_txid` — is the only allowed-unmined hop).
+    let consignment = transfer
+        .consignment
+        .as_deref()
+        .ok_or("buy accept did not return a consignment to validate before signing")?;
+    let expected_wt = transfer
+        .expected_witness_txid
+        .as_deref()
+        .ok_or("buy accept did not return an expected witness txid to validate against")?;
+    taker
+        .validate_buy_consignment(asset, consignment, expected_wt)
+        .await?;
+
     let signed = taker.sign_and_finalize(&transfer.partial_psbt)?;
     let settled = client.submit_signed_psbt(quote.quote_id, signed).await?;
     let txid = settled
