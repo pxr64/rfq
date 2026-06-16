@@ -34,7 +34,7 @@ use rgb::RgbDescr;
 
 // Was `use rfq_rgb::{...}` when this file lived in tests/common/mod.rs;
 // it's now part of rfq-rgb's lib, so refer to siblings via `crate::`.
-use crate::{ContractId, LibRgbBackend, RgbBackend, Taker, TxOut};
+use crate::{ContractId, LibRgbBackend, Taker, TxOut};
 use tempfile::TempDir;
 use tokio::sync::{Mutex, MutexGuard, OnceCell};
 
@@ -442,18 +442,28 @@ impl<'a> MakerGuard<'a> {
     /// usable as `maker_btc_inputs[0]` in a sell-side swap PSBT. Uses the
     /// guard's already-locked backend, so no extra lock acquisition.
     pub async fn spare_btc_outpoint(&self) -> Outpoint {
-        let rgb_utxos = self
+        // Must return an UNSPENT, non-RGB maker BTC outpoint. The static
+        // `maker_funding_outpoints` list includes the original RGB host, which a prior buy
+        // already SPENT (the RGB moved to a new k10 output) — handing that back makes
+        // `create_swap_psbt_sell` fail with "not in the maker wallet" (rescan can't recover
+        // a spent outpoint). So intersect the static list with the wallet's *live* UTXO set
+        // (`list_btc_only_utxos`): prefer a stable bootstrap outpoint that is still unspent,
+        // and fall back to any live non-RGB coin.
+        let asset = self.stack.asset();
+        let live: Vec<Outpoint> = self
             .backend
-            .list_inventory_utxos(&self.stack.asset())
+            .list_btc_only_utxos(std::slice::from_ref(&asset), 0)
             .await
-            .expect("list_inventory_utxos for spare-outpoint lookup");
-        let rgb_set: std::collections::HashSet<&Outpoint> =
-            rgb_utxos.iter().map(|u| &u.outpoint).collect();
+            .expect("list_btc_only_utxos for spare-outpoint lookup")
+            .into_iter()
+            .map(|u| u.outpoint)
+            .collect();
         self.stack
             .maker_funding_outpoints
             .iter()
-            .find(|op| !rgb_set.contains(op))
+            .find(|op| live.contains(op))
             .cloned()
+            .or_else(|| live.into_iter().next())
             .expect(
                 "no spare maker BTC outpoint — bump the funding count in \
                  bootstrap if that ever happens",

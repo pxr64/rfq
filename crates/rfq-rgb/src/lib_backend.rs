@@ -1560,6 +1560,32 @@ impl RgbBackend for LibRgbBackend {
         let account = self.load_signer()?;
         let mut wallet = self.load_wallet()?;
 
+        // Robustness: bp-wallet's incremental `sync_wallet` can strand keychain-10 maker
+        // BTC outpoints (tapret tweak + gap-limit / index reuse — see
+        // project_maker_tapret_change_stranding), so a freshly loaded UTXO cache may be
+        // missing a declared maker BTC input even though it's unspent on-chain. Recover
+        // with in-memory from-scratch rescans, RETRIED (the rescan can transiently fail
+        // against a busy electrs), until every declared input is present. We rescan the
+        // already-loaded wallet directly rather than calling `rescan_wallet`, which would
+        // re-acquire `self.guard()` and deadlock.
+        if !maker_btc_inputs.is_empty() {
+            use bpwallet::AnyIndexer;
+            let have: HashSet<(String, u32)> = wallet
+                .wallet()
+                .utxos()
+                .map(|u| (u.outpoint.txid.to_string(), u.outpoint.vout.into_u32()))
+                .collect();
+            let missing = maker_btc_inputs
+                .iter()
+                .any(|(op, _)| !have.contains(&(op.txid.clone(), op.vout)));
+            if missing {
+                if let Ok(client) = electrum::Client::new(&self.electrum_url) {
+                    let indexer = AnyIndexer::Electrum(Box::new(client));
+                    let _ = wallet.wallet_mut().sync_from_scratch(&indexer);
+                }
+            }
+        }
+
         // 1. Resolve the maker's side: taker's RGB-change seal (if any), the
         //    taker's BTC payout spk, a fresh maker receive + change address,
         //    per-input terminals for the maker's BTC inputs, and (if any) fresh
