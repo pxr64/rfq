@@ -2445,6 +2445,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rfq-consignment"
+version = "0.1.0"
+dependencies = [
+ "bp-electrum",
+ "serde_json",
+]
+
+[[package]]
 name = "rfq-core"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,9 @@
+[package]
+name = "rfq-consignment"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+bp-electrum = "=0.11.1-alpha.2"
+serde_json = { workspace = true }
