@@ -11,6 +11,13 @@ use std::collections::HashSet;
 use crate::merkle::compute_merkle_root;
 use crate::proofpack::SpvProofPack;
 
+/// Default ceiling on how many witnesses a single consignment may carry before validation
+/// refuses it. A forged consignment could otherwise present an enormous ancestry to force
+/// thousands of merkle folds / electrum round-trips (a DoS). Real consignments are far
+/// smaller; callers needing more can raise it. Shared by [`verify_pack`] and
+/// [`crate::MinedChecker`] so both halves enforce the same bound.
+pub const DEFAULT_MAX_WITNESSES: usize = 10_000;
+
 /// What a [`HeaderSource`] vouches for about a block: its real merkle root (internal byte
 /// order, as in header bytes 36..68) and how deep it is buried on the source's most-work chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +52,8 @@ pub enum RejectReason {
     Unmined { confirmations: u32 },
     /// A hash field in the pack was malformed (bad hex / wrong length).
     Malformed,
+    /// The whole ancestry exceeded the size cap; rejected before any per-witness work.
+    AncestryTooLarge { count: usize, cap: usize },
 }
 
 /// Outcome of verifying a full witness set against a pack.
@@ -72,6 +81,22 @@ pub fn verify_pack<H: HeaderSource>(
     let k = min_confs.max(1);
     let mut rejected = Vec::new();
     let mut checked = 0usize;
+
+    // Size cap first: refuse an oversized ancestry before doing any per-witness work.
+    let to_check = witness_txids.iter().filter(|t| !exempt.contains(*t)).count();
+    if to_check > DEFAULT_MAX_WITNESSES {
+        return SpvVerdict {
+            all_mined: false,
+            rejected: vec![(
+                "<ancestry>".to_owned(),
+                RejectReason::AncestryTooLarge {
+                    count: to_check,
+                    cap: DEFAULT_MAX_WITNESSES,
+                },
+            )],
+            checked: to_check,
+        };
+    }
 
     for txid in witness_txids {
         if exempt.contains(txid) {
@@ -227,6 +252,20 @@ mod tests {
             v.rejected,
             vec![(TXID.to_owned(), RejectReason::Unmined { confirmations: 2 })]
         );
+    }
+
+    #[test]
+    fn rejects_oversized_ancestry() {
+        let (pack, headers) = single_tx_fixture(TXID, BLOCK, 6);
+        let txids: Vec<String> = (0..DEFAULT_MAX_WITNESSES + 1)
+            .map(|i| format!("{i:064x}"))
+            .collect();
+        let v = verify_pack(&txids, &HashSet::new(), &pack, &headers, 1);
+        assert!(!v.all_mined);
+        assert!(matches!(
+            v.rejected.first(),
+            Some((_, RejectReason::AncestryTooLarge { .. }))
+        ));
     }
 
     #[test]

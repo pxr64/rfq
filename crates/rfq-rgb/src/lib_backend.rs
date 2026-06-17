@@ -520,7 +520,7 @@ impl LibRgbBackend {
             .map(|t| t.to_string())
             .collect();
         let exempt = HashSet::from([expected_witness_txid.to_owned()]);
-        let verdict = MinedChecker::new(vec![self.electrum_url.clone()], 1)
+        let verdict = MinedChecker::new(vec![self.electrum_url.clone()], self.min_confs())
             .check(&txids, &exempt)
             .map_err(|e| RgbError::TransferBuild(format!("mined-ancestry check: {e}")))?;
         if !verdict.all_mined {
@@ -1128,6 +1128,15 @@ impl LibRgbBackend {
             other => Err(RgbError::StashLoad(format!("unknown network `{other}`"))),
         }
     }
+
+    /// Confirmation depth K the mined-ancestry gates require before treating a witness as
+    /// final. Network-aware via the single policy in `rfq_consignment::Network`
+    /// (mainnet 6, testnet 3, signet/regtest 1); unknown label falls back to 1.
+    fn min_confs(&self) -> u32 {
+        rfq_consignment::Network::from_label(&self.network)
+            .map(|n| n.recommended_confs())
+            .unwrap_or(1)
+    }
 }
 
 /// A single wallet UTXO: BTC value plus its derivation terminal. Role-agnostic
@@ -1510,14 +1519,14 @@ impl RgbBackend for LibRgbBackend {
         }
 
         // Mined-ancestry gate (pipelined). Reject BEFORE `accept_transfer` so a bad
-        // consignment never mutates the stash. (min_confs = 1; mainnet tip-based K is future.)
+        // consignment never mutates the stash. K is network-aware (`self.min_confs()`).
         let txids: Vec<String> = validated
             .validation_status()
             .tx_ord_map
             .keys()
             .map(|t| t.to_string())
             .collect();
-        let verdict = MinedChecker::new(vec![self.electrum_url.clone()], 1)
+        let verdict = MinedChecker::new(vec![self.electrum_url.clone()], self.min_confs())
             .check(&txids, &HashSet::new())
             .map_err(|e| RgbError::TransferBuild(format!("mined-ancestry check: {e}")))?;
         if !verdict.all_mined {

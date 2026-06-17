@@ -70,10 +70,16 @@ impl SpvConfig {
     fn from_env() -> Option<Self> {
         let electrum_url = std::env::var("BROKER_ELECTRUM_URL").ok()?;
         let network = std::env::var("BROKER_NETWORK").unwrap_or_else(|_| "regtest".to_owned());
+        // Explicit BROKER_CONFIRMATIONS wins; otherwise derive K from the network policy
+        // (mainnet 6, testnet 3, signet/regtest 1) — the same source the maker gates use.
         let min_confs = std::env::var("BROKER_CONFIRMATIONS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
+            .unwrap_or_else(|| {
+                rfq_consignment::Network::from_label(&network)
+                    .map(|n| n.recommended_confs())
+                    .unwrap_or(1)
+            });
         Some(Self {
             electrum_url,
             network,

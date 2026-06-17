@@ -45,6 +45,17 @@ impl Network {
         }
     }
 
+    /// Recommended confirmation depth K before treating a witness as final — the single
+    /// source of truth for the maker gates, broker precheck, and thin-client verifiers.
+    /// Mainnet buries deep (reorg risk is real); test networks tolerate K=1.
+    pub fn recommended_confs(&self) -> u32 {
+        match self {
+            Network::Mainnet => 6,
+            Network::Testnet3 | Network::Testnet4 => 3,
+            Network::Signet | Network::Regtest => 1,
+        }
+    }
+
     /// Whether header proof-of-work is the validity anchor for this network.
     ///
     /// Only mainnet today: testnet3's 20-minute min-difficulty rule and signet's
@@ -316,5 +327,13 @@ mod tests {
         assert_eq!(Network::from_label("signet"), Some(Network::Signet));
         assert_eq!(Network::from_label("regtest"), Some(Network::Regtest));
         assert_eq!(Network::from_label("nope"), None);
+    }
+
+    #[test]
+    fn recommended_confs_policy() {
+        assert_eq!(Network::Mainnet.recommended_confs(), 6);
+        assert_eq!(Network::Testnet3.recommended_confs(), 3);
+        assert_eq!(Network::Signet.recommended_confs(), 1);
+        assert_eq!(Network::Regtest.recommended_confs(), 1);
     }
 }

@@ -33,6 +33,7 @@ pub struct MinedChecker {
     urls: Vec<String>,
     min_confs: u32,
     chunk: usize,
+    max_txids: usize,
 }
 
 impl MinedChecker {
@@ -45,12 +46,21 @@ impl MinedChecker {
             urls,
             min_confs: min_confs.max(1),
             chunk: 200,
+            max_txids: crate::verify::DEFAULT_MAX_WITNESSES,
         }
     }
 
     /// Override the per-`batch_call` chunk size (default 200).
     pub fn with_chunk(mut self, chunk: usize) -> Self {
         self.chunk = chunk.max(1);
+        self
+    }
+
+    /// Override the max witness count accepted before [`check`](Self::check) refuses the set
+    /// (default [`crate::verify::DEFAULT_MAX_WITNESSES`]). Guards against a forged consignment
+    /// forcing thousands of electrum round-trips.
+    pub fn with_max_txids(mut self, max_txids: usize) -> Self {
+        self.max_txids = max_txids.max(1);
         self
     }
 
@@ -67,6 +77,12 @@ impl MinedChecker {
         }
         let wanted: Vec<&String> = txids.iter().filter(|t| !exempt.contains(*t)).collect();
         let checked = wanted.len();
+        if checked > self.max_txids {
+            return Err(format!(
+                "consignment ancestry too large: {checked} witnesses > cap {}",
+                self.max_txids
+            ));
+        }
         if checked == 0 {
             return Ok(MinedVerdict {
                 all_mined: true,
@@ -180,6 +196,15 @@ mod tests {
             scanned += 1;
         }
         txids
+    }
+
+    #[test]
+    fn rejects_oversized_ancestry_before_connecting() {
+        // max_txids=1 with 2 witnesses → refused up front, no electrum needed.
+        let checker = MinedChecker::new(vec!["tcp://127.0.0.1:1".to_owned()], 1).with_max_txids(1);
+        let txids = vec!["a".repeat(64), "b".repeat(64)];
+        let err = checker.check(&txids, &HashSet::new()).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
     }
 
     #[test]
