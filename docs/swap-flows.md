@@ -34,6 +34,7 @@ sequenceDiagram
 - **Declared funding, not declared inputs.** The taker sends a single `btc_funding_addr` in `ACCEPT`. The maker calls `BitcoinClient::list_unspent(addr)` to discover that address's UTXOs and runs `GreedyLargestFirstSelector` to pick enough to cover `quote.price + actual_fee_sats`. Taker BTC change goes back to the same `btc_funding_addr`. This trades a small privacy concession (maker sees the funding address) for substantially simpler wallet integration: the taker's signer only ever sees "sign these inputs," never "compose a new input set + change output."
 - **Input set is final at step 3.** All inputs (maker RGB + taker BTC) are present when the maker signs at PSBT-build time, so SIGHASH_ALL works for every input. Witness txid is stable from step 3 — the maker stamps `PendingBitcoinConfirm` on its RGB reservation and ships a real consignment (with the correct witness_id) at step 4.
 - **Taker pays the fee, by construction.** Maker BTC payout output = `quote.price`. Taker BTC change output = `sum(selected_taker_btc_inputs) − quote.price − actual_fee_sats`. The maker computes the exact fee at PSBT-build (no taker-side fee math).
+- **Taker runs the mined-ancestry gate before signing (step 6).** "Validate consignment" is not just a graph check — the taker calls `validate_buy_consignment` to confirm the maker's RGB inventory ancestry is mined on-chain before it signs away BTC. See [Consignment validation](#consignment-validation-mined-ancestry-gate).
 
 ### Inventory transitions (maker side)
 
@@ -78,7 +79,7 @@ sequenceDiagram
 - **No maker invoice — provenance instead.** The maker mints nothing on the sell side (`maker_rgb_invoice` is `None`) and needs no spare anchor. The taker exports a **provenance consignment** for the RGB outpoints it already holds and names them on the wire; the RGB lands on a fresh maker-controlled output the maker adds when it builds the PSBT. See [provenance-consignment-proposal.md](provenance-consignment-proposal.md).
 - **Consignment names the inputs.** The taker's provenance consignment includes the RGB-bearing outpoints it is sending. The maker can't build the PSBT until it has those, which is why there's an extra round trip vs. buy side.
 - **Prevout fetch is required.** The consignment names outpoints but doesn't carry `scriptPubKey` or BTC value, which are needed to construct the PSBT inputs. The maker calls `BitcoinClient::get_outpoint` for each.
-- **Maker validates consignment in step 6.** Against the maker's Stock. This is the symmetric operation to what the taker does in buy-side step 5. Real validation lands with [#13](https://github.com/pxr64/rfq/issues/13); mock validation accepts any non-empty consignment except the literal `"rgb-invalid"`.
+- **Maker validates consignment in step 6.** Against the maker's Stock, then runs the **mined-ancestry gate** (`validate_incoming_consignment`) before committing any BTC — see [Consignment validation](#consignment-validation-mined-ancestry-gate). This is the symmetric operation to what the taker does in buy-side step 5.
 - **Taker pays the fee, by netting from payout.** The taker's BTC payout output value = `quote.price − actual_fee_sats`. Maker's BTC change = `sum(maker_btc_inputs) − quote.price`. Maker reserves `quote.price` gross from BTC inventory.
 
 ### Inventory transitions (maker side)
@@ -93,6 +94,44 @@ stateDiagram-v2
     Reserved --> PendingBitcoinConfirm: /sign
     PendingBitcoinConfirm --> Spent: N confirms
 ```
+
+## Consignment validation (mined-ancestry gate)
+
+Both sides settle BTC atomically against an RGB consignment, so before any value is committed the receiving party must independently confirm the consignment's witness history is **mined on-chain** — not merely well-formed. The RGB library's `validate()` does not give us this on its own, so each money gate runs validation in two passes.
+
+### Why `validate()` alone is insufficient
+
+RGB consensus validity is `{Valid, Warnings}` — there is no "must be mined" outcome, and an unmined witness (`WitnessOrd::Tentative`) still validates as `Valid`. Compounding this, the standard accept path seeds the resolver with the consignment's own transactions via `AnyResolver::add_consignment_txes`, which short-circuits every consignment-carried witness to `Tentative` **without ever querying the indexer** (`rgb-ops .../indexers/any.rs`). The library's own docstring warns this "could allow accepting a consignment containing TXs that have not been broadcasted." A maker (sell) or taker (buy) that trusted `validate()` alone would pay real BTC against a forged-but-unmined RGB history.
+
+Seeding can't simply be dropped, though: on the **buy** side the consignment's terminal witness is the swap tx itself, which is legitimately not broadcast at sign time. An un-seeded `validate()` would fail to resolve it (`ResolverError`) and the graph would never close. So we **seed to validate the graph, then re-check minedness separately** against the chain.
+
+### Two-pass gate
+
+1. **Graph pass (seeded).** `validate()` with a resolver seeded via `add_consignment_txes`, asserting `Validity::Valid`. This proves the cryptography — transition graph, mpc/dbc commitments, seal closing, schema/AluVM — but says nothing about chain depth (every seeded witness reports `Tentative`).
+2. **Mined-ancestry pass (chain-only).** A fresh, **un-seeded** `MinedChecker` ([crates/rfq-consignment](../crates/rfq-consignment)) re-resolves every witness in the validator's `tx_ord_map` against electrs and requires each to be **mined to K confirmations**. Any unmined witness rejects the consignment before BTC moves.
+
+Implementation: `LibRgbBackend::validate_buy_consignment` (buy) and `validate_incoming_consignment` (sell) in [crates/rfq-rgb/src/lib_backend.rs](../crates/rfq-rgb/src/lib_backend.rs). The design rationale and original vulnerability write-up live in the consignment-validation hardening plan, and a complementary SPV proof-pack anchoring scheme (so non-indexer verifiers — wallet, ICP canister, broker precheck — can verify the same property) is specified in RFQIP-1; both are internal design notes.
+
+### Buy vs sell
+
+The two gates differ only in which terminal witness is allowed to be unmined:
+
+| | Buy gate (taker, before signing) | Sell gate (maker, at `/consignment`) |
+|---|---|---|
+| Caller | `validate_buy_consignment` | `validate_incoming_consignment` |
+| Exempt witness | the swap tx (`expected_witness_txid`) — the legitimately-unmined terminal hop the taker is about to sign | **none** — the taker's whole provenance ancestry must already be mined |
+| Protects against | a malicious maker fabricating inventory ancestry to take taker BTC for nonexistent RGB | a malicious taker selling RGB whose history was never mined |
+
+The asymmetry is a direct consequence of the protocol invariant: on a buy the receiver (taker) hosts the *new* seal on the not-yet-broadcast swap tx, whereas on a sell the provenance consignment carries only RGB the taker *already holds*, all of which must be settled.
+
+### Confirmation depth K
+
+`K` is network-aware (`Network::recommended_confs`): **mainnet 6, testnet 3, signet/regtest 1**.
+
+### Performance + DoS guards
+
+- **Size cap.** The ancestry walk rejects any consignment with more than `DEFAULT_MAX_WITNESSES` (10,000) witnesses before doing any per-witness work — a forged consignment can't exhaust the gate with an enormous fake history.
+- **Bury bookmark.** Witnesses confirmed buried (≥ `BURY_DEPTH` = 100 confirmations) by a prior gate run are recorded in a `mined_bookmark` file and skipped on subsequent gates, so deep, stable maker-inventory ancestry isn't re-walked on every trade. A missing/unreadable bookmark just re-checks everything (never less safe).
 
 ## Endpoints
 
