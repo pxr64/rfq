@@ -13,3 +13,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
 bp-electrum = { version = "=0.11.1-alpha.2", optional = true }
+
+[dev-dependencies]
+# Differential-test ONLY: the hand-rolled compact/target math in `difficulty` is checked
+# byte-for-byte against rust-bitcoin. Not a runtime dep — the shipped verifier stays tiny
+# (sha2 + serde) so it vendors cleanly into the wasm wallet and the ICP canister.
+bitcoin = "0.32"

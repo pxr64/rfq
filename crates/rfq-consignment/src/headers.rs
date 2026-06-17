@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
+use crate::difficulty::{expected_retarget_bits, target_from_compact, RETARGET_INTERVAL};
 use crate::merkle::{bytes_to_hex, dsha256, header_merkle_root};
 use crate::verify::{HeaderInfo, HeaderSource};
 
@@ -101,40 +102,22 @@ fn header_prev_display(header_80: &[u8]) -> String {
     bytes_to_hex(&p)
 }
 
-/// The compact "nBits" difficulty target (header bytes 72..76, little-endian) expanded to a
-/// big-endian 256-bit value for direct comparison against a big-endian block hash.
-fn target_from_compact(bits: u32) -> [u8; 32] {
-    let exponent = (bits >> 24) as usize;
-    let mantissa = bits & 0x007f_ffff;
-    let mut target = [0u8; 32]; // big-endian
-    let mant = [
-        (mantissa >> 16) as u8,
-        (mantissa >> 8) as u8,
-        mantissa as u8,
-    ];
-    if exponent <= 3 {
-        // Mantissa is shifted right; only the low bytes survive.
-        let shifted = mantissa >> (8 * (3 - exponent));
-        target[29] = (shifted >> 16) as u8;
-        target[30] = (shifted >> 8) as u8;
-        target[31] = shifted as u8;
-    } else {
-        // MSB of the mantissa sits at big-endian index 32 - exponent.
-        let idx = 32usize.wrapping_sub(exponent);
-        for (j, b) in mant.iter().enumerate() {
-            let pos = idx.wrapping_add(j);
-            if pos < 32 {
-                target[pos] = *b;
-            }
-        }
-    }
-    target
+/// The compact "nBits" difficulty target from a header (bytes 72..76, little-endian).
+fn header_bits(header_80: &[u8]) -> u32 {
+    u32::from_le_bytes([header_80[72], header_80[73], header_80[74], header_80[75]])
 }
 
-/// True iff the header's block hash meets its stated proof-of-work target.
+/// The block timestamp from a header (bytes 68..72, little-endian).
+fn header_time(header_80: &[u8]) -> u32 {
+    u32::from_le_bytes([header_80[68], header_80[69], header_80[70], header_80[71]])
+}
+
+/// True iff the header's block hash meets its stated proof-of-work target. NOTE: this only
+/// checks the *stated* `bits`; that the `bits` are themselves *correct* is enforced
+/// separately by the retarget validation in [`CheckpointHeaderSource::new`] — without it,
+/// PoW-meets-stated-bits is forgeable for free.
 fn meets_pow(header_80: &[u8]) -> bool {
-    let bits = u32::from_le_bytes([header_80[72], header_80[73], header_80[74], header_80[75]]);
-    let target = target_from_compact(bits);
+    let target = target_from_compact(header_bits(header_80));
     let mut hash_be = dsha256(header_80); // internal (LE)
     hash_be.reverse(); // → big-endian for numeric compare
     hash_be <= target
@@ -166,6 +149,17 @@ impl CheckpointHeaderSource {
             ));
         }
 
+        // On PoW networks, difficulty validation requires the checkpoint to sit on a retarget
+        // (difficulty-epoch) boundary, so the first epoch in the run is complete from the
+        // checkpoint and every later retarget's 2016-block lookback is in-run.
+        let check_difficulty = network.checks_pow();
+        if check_difficulty && !checkpoint.height.is_multiple_of(RETARGET_INTERVAL) {
+            return Err(format!(
+                "checkpoint height {} is not on a retarget boundary (multiple of {RETARGET_INTERVAL})",
+                checkpoint.height
+            ));
+        }
+
         let mut by_hash = HashMap::with_capacity(headers.len());
         let mut prev_hash = first_hash.clone();
         for (i, header) in headers.iter().enumerate() {
@@ -179,12 +173,38 @@ impl CheckpointHeaderSource {
                 }
                 prev_hash = header_hash_display(header);
             }
-            // 3. Proof-of-work (network-gated).
-            if network.checks_pow() && !meets_pow(header) {
-                return Err(format!("header at index {i} fails its proof-of-work target"));
+            let height = checkpoint.height + i as u32;
+
+            // 3. Proof-of-work + difficulty correctness (network-gated). PoW alone is
+            //    forgeable (the attacker writes `bits`); we ALSO recompute the required
+            //    difficulty so `bits` can't be faked low.
+            if check_difficulty {
+                if !meets_pow(header) {
+                    return Err(format!(
+                        "header at index {i} (height {height}) fails its proof-of-work target"
+                    ));
+                }
+                if i > 0 {
+                    let bits = header_bits(header);
+                    let expected = if height.is_multiple_of(RETARGET_INTERVAL) {
+                        // Retarget boundary: recompute from the previous epoch's first + last
+                        // block (in-run, since the checkpoint is epoch-aligned).
+                        let last = &headers[i - 1];
+                        let first = &headers[i - RETARGET_INTERVAL as usize];
+                        expected_retarget_bits(header_bits(last), header_time(last), header_time(first))
+                    } else {
+                        // Mid-epoch: difficulty is constant, so `bits` must match the prior block.
+                        header_bits(&headers[i - 1])
+                    };
+                    if bits != expected {
+                        return Err(format!(
+                            "header at index {i} (height {height}): difficulty bits {bits:#010x} \
+                             != expected {expected:#010x}"
+                        ));
+                    }
+                }
             }
 
-            let height = checkpoint.height + i as u32;
             let root = header_merkle_root(header).ok_or("bad header length")?;
             by_hash.insert(header_hash_display(header), (root, height));
         }
@@ -284,6 +304,44 @@ mod tests {
         let headers = [raw(GENESIS), raw(BLOCK2)];
         let err = CheckpointHeaderSource::new(Network::Mainnet, &checkpoint(), &headers).unwrap_err();
         assert!(err.contains("linkage"), "{err}");
+    }
+
+    #[test]
+    fn mainnet_requires_epoch_aligned_checkpoint() {
+        // A mainnet checkpoint must sit on a retarget boundary (multiple of 2016) so the
+        // difficulty validation has a complete first epoch to anchor on.
+        let misaligned = Checkpoint {
+            height: 5, // not a multiple of 2016
+            block_hash: GENESIS_HASH.to_owned(),
+        };
+        let err =
+            CheckpointHeaderSource::new(Network::Mainnet, &misaligned, &[raw(GENESIS)]).unwrap_err();
+        assert!(err.contains("retarget boundary"), "{err}");
+
+        // The same misalignment is fine on a non-PoW network (regtest/signet skip difficulty).
+        assert!(CheckpointHeaderSource::new(Network::Regtest, &misaligned, &[raw(GENESIS)]).is_ok());
+    }
+
+    #[test]
+    fn mainnet_rejects_mid_epoch_difficulty_change() {
+        // genesis (bits 0x1d00ffff) + a forged "block 1" that links correctly but lies about
+        // its difficulty (different bits mid-epoch) → rejected by the difficulty check.
+        // We keep genesis's real PoW; only the second header's bits are tampered. Since its
+        // hash won't meet PoW either, this proves the chain refuses the forgery on mainnet.
+        let mut forged = vec![0u8; 80];
+        forged[0] = 1;
+        let prev = hash32_display_to_internal(GENESIS_HASH).unwrap();
+        forged[4..36].copy_from_slice(&prev);
+        forged[36..68].copy_from_slice(&[0x22; 32]);
+        forged[72..76].copy_from_slice(&0x1c00_ffffu32.to_le_bytes()); // different bits
+        let headers = [raw(GENESIS), forged];
+        let err =
+            CheckpointHeaderSource::new(Network::Mainnet, &checkpoint(), &headers).unwrap_err();
+        // Fails either PoW or the difficulty check — both are the gate we want.
+        assert!(
+            err.contains("proof-of-work") || err.contains("difficulty"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -20,6 +20,7 @@
 //! verification *failure*, never a false *accept* — which is what lets the prover be a
 //! standalone, replaceable service.
 
+pub mod difficulty;
 pub mod headers;
 pub mod merkle;
 pub mod proofpack;

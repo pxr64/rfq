@@ -2449,6 +2449,7 @@ dependencies = [
 name = "rfq-consignment"
 version = "0.1.0"
 dependencies = [
+ "bitcoin",
  "bp-electrum",
  "serde",
  "serde_json",
