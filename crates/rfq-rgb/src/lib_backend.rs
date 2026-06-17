@@ -520,8 +520,17 @@ impl LibRgbBackend {
             .map(|t| t.to_string())
             .collect();
         let exempt = HashSet::from([expected_witness_txid.to_owned()]);
+        // Skip witnesses already confirmed buried by a prior gate run, then bookmark any newly
+        // buried ones — so deep maker-inventory ancestry isn't re-walked on every buy.
+        let bookmark = self.load_bookmark();
+        let to_check: Vec<String> = txids
+            .iter()
+            .filter(|t| !bookmark.contains(*t))
+            .cloned()
+            .collect();
         let verdict = MinedChecker::new(vec![self.electrum_url.clone()], self.min_confs())
-            .check(&txids, &exempt)
+            .with_bury_depth(BURY_DEPTH)
+            .check(&to_check, &exempt)
             .map_err(|e| RgbError::TransferBuild(format!("mined-ancestry check: {e}")))?;
         if !verdict.all_mined {
             return Err(RgbError::TransferBuild(format!(
@@ -529,6 +538,7 @@ impl LibRgbBackend {
                 verdict.unmined
             )));
         }
+        self.extend_bookmark(&verdict.buried);
         Ok(())
     }
 
@@ -1137,7 +1147,46 @@ impl LibRgbBackend {
             .map(|n| n.recommended_confs())
             .unwrap_or(1)
     }
+
+    /// The mined-ancestry bookmark file: witness txids already confirmed buried (≥
+    /// [`BURY_DEPTH`]) by a prior gate run, so deep ancestry isn't re-walked every time.
+    fn bookmark_path(&self) -> PathBuf {
+        self.stock_path().join("mined_bookmark")
+    }
+
+    /// Load the buried-witness bookmark. Best-effort: a missing/unreadable file yields an
+    /// empty set, so the gate simply re-checks everything (never less safe).
+    fn load_bookmark(&self) -> HashSet<String> {
+        match std::fs::read_to_string(self.bookmark_path()) {
+            Ok(s) => s
+                .lines()
+                .map(|l| l.trim().to_owned())
+                .filter(|l| !l.is_empty())
+                .collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
+    /// Record newly-buried witness txids in the bookmark (dedup). Best-effort; a write
+    /// failure is non-fatal — those txids are simply re-checked next time.
+    fn extend_bookmark(&self, newly_buried: &[String]) {
+        if newly_buried.is_empty() {
+            return;
+        }
+        let mut set = self.load_bookmark();
+        let before = set.len();
+        set.extend(newly_buried.iter().cloned());
+        if set.len() == before {
+            return;
+        }
+        let body = set.into_iter().collect::<Vec<_>>().join("\n");
+        let _ = std::fs::write(self.bookmark_path(), body);
+    }
 }
+
+/// Confirmations beyond which a mined witness is treated as reorg-safe and bookmarked, so it
+/// is never re-queried. Far deeper than any K policy and any plausible reorg.
+const BURY_DEPTH: u32 = 100;
 
 /// A single wallet UTXO: BTC value plus its derivation terminal. Role-agnostic
 /// (no RGB contract needed); `keychain` is the BIP-86 keychain (0 = BTC,
@@ -1526,8 +1575,17 @@ impl RgbBackend for LibRgbBackend {
             .keys()
             .map(|t| t.to_string())
             .collect();
+        // Skip witnesses already confirmed buried by a prior gate run, then bookmark the
+        // newly buried — deep taker ancestry isn't re-walked on every sell.
+        let bookmark = self.load_bookmark();
+        let to_check: Vec<String> = txids
+            .iter()
+            .filter(|t| !bookmark.contains(*t))
+            .cloned()
+            .collect();
         let verdict = MinedChecker::new(vec![self.electrum_url.clone()], self.min_confs())
-            .check(&txids, &HashSet::new())
+            .with_bury_depth(BURY_DEPTH)
+            .check(&to_check, &HashSet::new())
             .map_err(|e| RgbError::TransferBuild(format!("mined-ancestry check: {e}")))?;
         if !verdict.all_mined {
             return Err(RgbError::TransferBuild(format!(
@@ -1535,6 +1593,7 @@ impl RgbBackend for LibRgbBackend {
                 verdict.unmined
             )));
         }
+        self.extend_bookmark(&verdict.buried);
 
         // Absorb the consignment so the taker's allocations + their full history
         // enter the maker's stash; `create_swap_psbt_sell` then spends them into the

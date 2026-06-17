@@ -24,6 +24,10 @@ pub struct MinedVerdict {
     pub unmined: Vec<String>,
     /// How many txids were actually queried (excludes `exempt`).
     pub checked: usize,
+    /// Txids confirmed at least `bury_depth` deep — reorg-safe for a caller to bookmark and
+    /// never re-query. Empty unless [`MinedChecker::with_bury_depth`] was set; conservatively
+    /// only populated on the fast batch path (per-tx fallback txids are omitted).
+    pub buried: Vec<String>,
 }
 
 /// Pipelined, multi-endpoint, chain-only mined-witness checker.
@@ -34,6 +38,7 @@ pub struct MinedChecker {
     min_confs: u32,
     chunk: usize,
     max_txids: usize,
+    bury_depth: u32,
 }
 
 impl MinedChecker {
@@ -47,6 +52,7 @@ impl MinedChecker {
             min_confs: min_confs.max(1),
             chunk: 200,
             max_txids: crate::verify::DEFAULT_MAX_WITNESSES,
+            bury_depth: u32::MAX, // nothing is "buried" unless the caller opts in
         }
     }
 
@@ -61,6 +67,14 @@ impl MinedChecker {
     /// forcing thousands of electrum round-trips.
     pub fn with_max_txids(mut self, max_txids: usize) -> Self {
         self.max_txids = max_txids.max(1);
+        self
+    }
+
+    /// Report txids confirmed at least `bury_depth` deep in [`MinedVerdict::buried`], so a
+    /// caller can bookmark them and never re-query. Choose a depth well beyond any plausible
+    /// reorg (e.g. 100); the default `u32::MAX` reports none.
+    pub fn with_bury_depth(mut self, bury_depth: u32) -> Self {
+        self.bury_depth = bury_depth.max(self.min_confs);
         self
     }
 
@@ -88,12 +102,14 @@ impl MinedChecker {
                 all_mined: true,
                 unmined: vec![],
                 checked: 0,
+                buried: vec![],
             });
         }
 
         let n_urls = self.urls.len();
         let per = wanted.len().div_ceil(n_urls);
         let mut unmined = Vec::new();
+        let mut buried = Vec::new();
 
         for (shard_idx, shard) in wanted.chunks(per).enumerate() {
             let url = &self.urls[shard_idx % n_urls];
@@ -113,12 +129,17 @@ impl MinedChecker {
                 match client.batch_call(&batch) {
                     Ok(results) => {
                         for (txid, v) in window.iter().zip(results.iter()) {
-                            if confirmations_of(v) < self.min_confs as u64 {
+                            let confs = confirmations_of(v);
+                            if confs < self.min_confs as u64 {
                                 unmined.push((*txid).clone());
+                            } else if confs >= self.bury_depth as u64 {
+                                buried.push((*txid).clone());
                             }
                         }
                     }
                     Err(_) => {
+                        // Per-tx fallback pinpoints unmined txids but doesn't track depth, so
+                        // these are conservatively never reported as buried.
                         for txid in window {
                             if !is_mined(&client, txid, self.min_confs) {
                                 unmined.push((*txid).clone());
@@ -133,6 +154,7 @@ impl MinedChecker {
             all_mined: unmined.is_empty(),
             unmined,
             checked,
+            buried,
         })
     }
 }
@@ -235,5 +257,14 @@ mod tests {
             .check(&with_fake, &HashSet::from([fake]))
             .expect("check");
         assert!(v3.all_mined, "exempting the unmined hop should pass; unmined={:?}", v3.unmined);
+
+        // (4) with bury_depth=1 every mined txid is reported buried (bookmark candidates);
+        // the default (no bury_depth) reports none.
+        let buried = MinedChecker::new(vec![electrum_url()], 1)
+            .with_bury_depth(1)
+            .check(&txids, &HashSet::new())
+            .expect("check");
+        assert_eq!(buried.buried.len(), txids.len(), "all mined ≥1 → buried");
+        assert!(v.buried.is_empty(), "default bury_depth reports nothing buried");
     }
 }
