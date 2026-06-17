@@ -10,7 +10,7 @@ use thiserror::Error;
 mod lib_backend;
 mod swap;
 mod taker;
-pub use lib_backend::{LibRgbBackend, WalletUtxo};
+pub use lib_backend::{witness_txids_of_consignment, LibRgbBackend, WalletUtxo};
 pub use swap::enrich_psbt_input;
 pub use swap::SEAL_ANCHOR_SATS;
 pub use taker::Taker;

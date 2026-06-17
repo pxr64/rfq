@@ -2404,6 +2404,7 @@ dependencies = [
  "futures",
  "http",
  "rfq-btc",
+ "rfq-consignment",
  "rfq-core",
  "rfq-maker",
  "rfq-rgb",

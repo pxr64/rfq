@@ -1153,6 +1153,32 @@ fn chain_net_for(network: Network) -> ChainNet {
     }
 }
 
+/// Enumerate every witness txid in a consignment, **structurally** — decode the base64
+/// `Transfer` and read each `WitnessBundle`'s witness id. No stock, resolver, or RGB
+/// validation: this is the cheap txid extraction the broker precheck and the SPV-prover
+/// distribution endpoint need (a caller that ALSO validates obtains the same set from the
+/// validation status' `tx_ord_map`). Returns display-order txid hex, deduplicated.
+///
+/// This is a *liveness* helper, not a trust boundary: the txids feed a mined-ancestry
+/// check (`rfq-consignment`) which is where soundness is actually enforced. A consignment
+/// that decodes here but lies about its graph is caught there and by the maker's own gate.
+pub fn witness_txids_of_consignment(consignment_base64: &str) -> Result<Vec<String>, RgbError> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(consignment_base64.trim())
+        .map_err(|e| RgbError::TransferBuild(format!("consignment is not valid base64: {e}")))?;
+    let consignment = Transfer::load(bytes.as_slice())
+        .map_err(|e| RgbError::TransferBuild(format!("consignment decode: {e}")))?;
+    let mut seen = std::collections::HashSet::new();
+    let mut txids = Vec::new();
+    for wb in consignment.bundled_witnesses() {
+        let txid = wb.witness_id().to_string();
+        if seen.insert(txid.clone()) {
+            txids.push(txid);
+        }
+    }
+    Ok(txids)
+}
+
 #[async_trait]
 impl RgbBackend for LibRgbBackend {
     async fn asset_spec(&self, asset: &AssetId) -> Result<(String, u8), RgbError> {

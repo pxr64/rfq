@@ -47,6 +47,39 @@ pub struct AppState {
     /// so a settlement recorded later at `/accept` can carry "Δ-vs-mid" + "best of
     /// N". Transient enrichment (not durable); entries are removed on accept.
     rfq_stats: Arc<RwLock<HashMap<RfqId, RfqStats>>>,
+    /// Optional SPV config (set when `BROKER_ELECTRUM_URL` is present). Enables the
+    /// additive consignment precheck on `/consignment` and the proof-pack distribution
+    /// endpoint. `None` → both are no-ops/404 and the broker is a pure router.
+    spv: Option<SpvConfig>,
+}
+
+/// Electrum config for the broker's defense-in-depth consignment work. The precheck is
+/// **additive and non-authoritative** — the maker still self-validates before paying, and
+/// the thin-client taker still verifies the proof-pack before signing. It only fails a
+/// forged/unmined consignment *faster*, sparing the maker the round-trip.
+#[derive(Clone)]
+struct SpvConfig {
+    electrum_url: String,
+    network: String,
+    min_confs: u32,
+}
+
+impl SpvConfig {
+    /// Read from `BROKER_ELECTRUM_URL` / `BROKER_NETWORK` / `BROKER_CONFIRMATIONS`
+    /// (the same electrum URL the confirmation loop uses). `None` if no electrum URL.
+    fn from_env() -> Option<Self> {
+        let electrum_url = std::env::var("BROKER_ELECTRUM_URL").ok()?;
+        let network = std::env::var("BROKER_NETWORK").unwrap_or_else(|_| "regtest".to_owned());
+        let min_confs = std::env::var("BROKER_CONFIRMATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        Some(Self {
+            electrum_url,
+            network,
+            min_confs,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -130,6 +163,7 @@ pub fn app() -> Router {
         store: InMemoryQuoteStore::new(),
         settlement_store: Arc::new(InMemorySettlementStore::new()),
         rfq_stats: Arc::new(RwLock::new(HashMap::new())),
+        spv: None,
     })
 }
 
@@ -210,6 +244,7 @@ pub fn app_with_state(state: AppState) -> Router {
         .route("/rfq", post(create_rfq))
         .route("/quotes/:id/accept", post(accept_quote))
         .route("/quotes/:id/consignment", post(deliver_consignment))
+        .route("/consignment/proof-pack", post(consignment_proof_pack))
         .route("/quotes/:id/sign", post(sign_quote))
         .route("/settlements", get(settlements))
         .route("/maker-stream", get(ws::maker_stream))
@@ -246,6 +281,9 @@ pub fn app_with_registry_and_settlements(
         store: InMemoryQuoteStore::new(),
         settlement_store,
         rfq_stats: Arc::new(RwLock::new(HashMap::new())),
+        // Enable the additive consignment precheck + proof-pack endpoint when the broker
+        // has an electrum URL (the same one the confirmation loop uses).
+        spv: SpvConfig::from_env(),
     })
 }
 
@@ -454,11 +492,88 @@ async fn deliver_consignment(
         .await
         .ok_or(ApiError::MakerNotFound)?;
 
+    // Additive, non-authoritative SPV precheck: when the broker has an electrum URL,
+    // confirm the consignment's witness ancestry is mined BEFORE handing it to the maker.
+    // The maker still runs its own mined-ancestry gate before reserving BTC — this only
+    // rejects a forged/unmined consignment faster, sparing the maker the round-trip. It is
+    // never a substitute for the maker's check (trusting the broker would relocate the vuln).
+    if let Some(spv) = &state.spv {
+        spv_precheck(spv, &body.consignment).await?;
+    }
+
     let intent = maker
         .deliver_consignment(quote_id, body.consignment, body.outpoints)
         .await?;
 
     Ok(Json(intent))
+}
+
+/// Run the broker's additive mined-ancestry precheck on a consignment. Extracts the witness
+/// txids structurally (no RGB validation — that's the maker's job) and requires every one to
+/// be mined to `min_confs` against the broker's electrs. Rejects with `ConsignmentRejected`.
+async fn spv_precheck(spv: &SpvConfig, consignment_base64: &str) -> Result<(), ApiError> {
+    let txids = rfq_rgb::witness_txids_of_consignment(consignment_base64)
+        .map_err(|e| ApiError::ConsignmentRejected(format!("consignment decode: {e}")))?;
+    if txids.is_empty() {
+        return Ok(());
+    }
+    let url = spv.electrum_url.clone();
+    let min_confs = spv.min_confs;
+    let verdict = tokio::task::spawn_blocking(move || {
+        rfq_consignment::MinedChecker::new(vec![url], min_confs)
+            .check(&txids, &std::collections::HashSet::new())
+    })
+    .await
+    .map_err(|e| ApiError::ConsignmentRejected(format!("precheck task: {e}")))?
+    .map_err(|e| ApiError::ConsignmentRejected(format!("mined-ancestry precheck: {e}")))?;
+    if !verdict.all_mined {
+        return Err(ApiError::ConsignmentRejected(format!(
+            "consignment ancestry not mined on-chain: {:?}",
+            verdict.unmined
+        )));
+    }
+    Ok(())
+}
+
+/// `POST /consignment/proof-pack` request — a base64 consignment to produce a pack for.
+#[derive(Debug, Clone, Deserialize)]
+struct ConsignmentProofPackBody {
+    consignment: String,
+}
+
+/// `POST /consignment/proof-pack` response — a self-verifying [`rfq_consignment::SpvProofPack`]
+/// the thin-client taker verifies locally (RFQIP-1), plus any txids that couldn't be proven.
+#[derive(Debug, Serialize)]
+struct ProofPackResponse {
+    pack: rfq_consignment::SpvProofPack,
+    unproven: Vec<String>,
+}
+
+/// Produce an SPV proof-pack for a consignment so a thin-client taker (wallet) can confirm
+/// its witness ancestry is mined without running a node. Distribution only — untrusted: the
+/// taker re-verifies the pack against its own header source, so the broker is not believed.
+/// 400 when the SPV endpoint is disabled (no `BROKER_ELECTRUM_URL`).
+async fn consignment_proof_pack(
+    State(state): State<AppState>,
+    Json(body): Json<ConsignmentProofPackBody>,
+) -> Result<Json<ProofPackResponse>, ApiError> {
+    let spv = state.spv.as_ref().ok_or_else(|| {
+        ApiError::BadRequest("proof-pack endpoint disabled (set BROKER_ELECTRUM_URL)".to_owned())
+    })?;
+    let txids = rfq_rgb::witness_txids_of_consignment(&body.consignment)
+        .map_err(|e| ApiError::BadRequest(format!("consignment decode: {e}")))?;
+    let url = spv.electrum_url.clone();
+    let network = spv.network.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        rfq_consignment::build_proof_pack(&url, &txids, &network)
+    })
+    .await
+    .map_err(|e| ApiError::BadRequest(format!("prover task: {e}")))?
+    .map_err(|e| ApiError::BadRequest(format!("build proof-pack: {e}")))?;
+    Ok(Json(ProofPackResponse {
+        pack: result.pack,
+        unproven: result.unproven,
+    }))
 }
 
 /// Submit the taker-signed PSBT (final step on both sides). The maker finalizes,
@@ -877,6 +992,7 @@ mod tests {
             store: InMemoryQuoteStore::new(),
             settlement_store: Arc::new(InMemorySettlementStore::new()),
             rfq_stats: Arc::new(RwLock::new(HashMap::new())),
+            spv: None,
         })
     }
 

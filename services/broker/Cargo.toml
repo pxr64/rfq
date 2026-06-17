@@ -10,6 +10,7 @@ dotenvy = "0.15"
 futures.workspace = true
 http.workspace = true
 rfq-btc = { path = "../../crates/rfq-btc", features = ["electrum"] }
+rfq-consignment = { path = "../../crates/rfq-consignment" }
 rfq-core = { path = "../../crates/rfq-core" }
 rfq-maker = { path = "../../crates/rfq-maker" }
 rfq-rgb = { path = "../../crates/rfq-rgb" }
