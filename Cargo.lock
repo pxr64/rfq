@@ -2456,6 +2456,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rfq-consignment-wasm"
+version = "0.1.0"
+dependencies = [
+ "rfq-consignment",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "rfq-core"
 version = "0.1.0"
 dependencies = [

@@ -8,6 +8,8 @@
 
 use std::collections::HashSet;
 
+use serde::Serialize;
+
 use crate::merkle::compute_merkle_root;
 use crate::proofpack::SpvProofPack;
 
@@ -40,7 +42,7 @@ pub trait HeaderSource {
 }
 
 /// Why one witness failed verification.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum RejectReason {
     /// No inclusion proof in the pack for this witness txid.
     MissingAnchor,
@@ -57,7 +59,7 @@ pub enum RejectReason {
 }
 
 /// Outcome of verifying a full witness set against a pack.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SpvVerdict {
     /// True iff every checked (non-exempt) witness verified and is ≥ K deep.
     pub all_mined: bool,

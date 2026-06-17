@@ -5,6 +5,7 @@ members = [
     "crates/rfq-router",
     "crates/rfq-rgb",
     "crates/rfq-consignment",
+    "crates/rfq-consignment-wasm",
     "crates/rfq-btc",
     "crates/rfq-maker",
     "crates/rfq-store",

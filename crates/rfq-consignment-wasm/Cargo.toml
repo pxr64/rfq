@@ -1,0 +1,13 @@
+[package]
+name = "rfq-consignment-wasm"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rfq-consignment = { path = "../rfq-consignment", default-features = false }
+wasm-bindgen = "0.2"
+serde_json = { workspace = true }

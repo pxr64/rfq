@@ -19,6 +19,8 @@
 
 use std::collections::HashMap;
 
+use serde::Deserialize;
+
 use crate::merkle::{bytes_to_hex, dsha256, header_merkle_root};
 use crate::verify::{HeaderInfo, HeaderSource};
 
@@ -68,7 +70,7 @@ impl Network {
 }
 
 /// A `(height, block-hash)` pair the client trusts a priori — shipped in the binary.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Checkpoint {
     pub height: u32,
     /// Display-order block-hash hex.
