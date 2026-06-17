@@ -12,6 +12,7 @@ members = [
     "crates/rfq-wallet",
     "services/broker",
     "services/maker-node",
+    "services/spv-prover",
     "tools/taker-cli",
 ]
 resolver = "2"

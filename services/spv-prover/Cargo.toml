@@ -1,0 +1,19 @@
+[package]
+name = "spv-prover"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "spv-prover"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rfq-consignment = { path = "../../crates/rfq-consignment" }
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
