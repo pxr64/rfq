@@ -174,10 +174,12 @@ this is acceptable for a test network and is the reason the live deployment is s
 
 ## 9. Dense multi-checkpoint + bounded runs (scaling)
 
-A single checkpoint forces a bad tradeoff (genesis anchor → huge runs; recent anchor → can't
-verify old ancestry). Instead, **one checkpoint per difficulty epoch** (every 2016 blocks; ~440
-hashes ≈ 14 KB cover all of Bitcoin history) is baked in. To verify a witness at height `W`:
+A single static checkpoint forces a bad tradeoff (a low anchor → huge runs; a recent anchor →
+can't reach older ancestry — though RGB's youth, ~2023, bounds how old that is). The design uses
+**dense checkpoints — one per difficulty epoch (every 2016 blocks)** — uniformly across networks.
+RGB-era → now is only **dozens** of hashes per network, not 440-from-genesis.
 
+To verify a witness at height `W`:
 - `nearest_checkpoint(checkpoints, W)` selects the epoch-boundary anchor at/below `W`.
 - Fetch + validate **only** the short run from that anchor to `W` — **≤ 2016 headers**, regardless
   of chain height or how long the client was offline.
@@ -185,9 +187,58 @@ hashes ≈ 14 KB cover all of Bitcoin history) is baked in. To verify a witness 
   merges them into one `HeaderSource` (the real chain tip is passed separately for confirmation
   depth, since bounded runs don't reach it).
 
-This decouples verification cost from chain height; per-witness work is bounded by one epoch.
-*(The dense checkpoint table itself is data the wallet bakes in and refreshes ~every 2 weeks; the
-mechanism is implemented + tested, the full table is a data-generation follow-up.)*
+Per-witness work is bounded by one epoch and decoupled from chain height. Uniform across
+networks (signet runs the same path, just network-gated to skip PoW/difficulty — see §8); this
+means **signet exercises the exact mainnet verification path** rather than a separate shortcut.
+
+### 9.1 Baked floor + background-validated extension
+
+Checkpoints are **baked into the binary** (not computed/saved at runtime) — auditable `(height,
+hash)` constants and the trust root. Two layers:
+
+- **Baked table** — the always-present trust floor: works on a fresh install, offline, no
+  background run needed. Refreshed each wallet release (~one new epoch hash every ~2 weeks).
+- **Background-validated local extension** — a small persisted store the wallet *extends forward*
+  itself: a background task validates headers from the highest trusted checkpoint to the tip
+  (linkage + network PoW/difficulty) and appends new epoch checkpoints. It stores **only
+  `(height, hash)` per epoch** — a handful of hashes, not the header chain. This keeps the nearest
+  checkpoint ≤ 2016 below *any* height, including witnesses mined since the last release.
+
+**Invariant:** the local extension never overrides baked; it only extends it. Local checkpoints
+are **disposable** — correctness never depends on them, so "drop on any doubt" is always safe.
+The background task only *shortens* runs; verification works (with a longer run from the last
+baked checkpoint) even if it never ran. Local checkpoints are derived **by validation** from a
+baked anchor — a hash merely received from a server is never recorded.
+
+### 9.2 Merge / binary-upgrade reconciliation
+
+On every startup (which transparently handles a new binary shipping an extended baked table),
+reconcile baked vs local — both sit on 2016-aligned heights:
+
+1. **Conflict:** at any shared height, hashes must match. The lowest disagreement → **discard all
+   local from that height up** (a reorg, a poisoned store, or stale local — *baked always wins*).
+2. **Prune:** drop local at/below the highest baked height (baked now covers them).
+3. **Keep the consistent tail:** retain local strictly above the highest baked, re-checking
+   linkage on the next forward-validate; drop on any mismatch.
+4. Effective set = `baked ∪ kept-local`; extend forward from the highest effective checkpoint.
+
+A new binary therefore *shrinks* the local store and shortens runs; baked silently overrides
+anything local got wrong; worst case is re-validating a couple of epochs forward (cheap,
+fail-safe). The store is keyed **by network** and carries a **schema version** (bump → drop +
+re-derive, since it's disposable).
+
+### 9.3 Open gaps (required follow-ups, see also §11)
+
+- **Fail-open downgrade (security):** the wallet pre-sign gate currently runs only if the dApp
+  forwarded a consignment. A buy-swap sign must *require* one — refusing to sign a buy without a
+  validated consignment — else the gate is bypassable by omission.
+- **Mined-ancestry ≠ full validation (security):** the SPV gate proves witnesses are mined; the
+  consignment's RGB graph (commitments / seal-closing / transfer-to-our-invoice) must *also* be
+  validated pre-sign (a `validate`-without-`absorb` path in the wallet), mirroring the node's
+  two-pass gate. Today the wallet's graph validation runs at accept (post-sign).
+- **dApp delivery (cross-repo):** the dApp must forward the maker's consignment in the sign intent
+  (it currently enqueues it post-broadcast); until then the gate never fires in production.
+- **Esplora batch fetch / MV3 background lifetime / reorg-safe verified-witness cache** — see §11.
 
 ## 10. Code map & tests
 
