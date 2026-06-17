@@ -20,6 +20,7 @@ use crate::verify::{HeaderInfo, HeaderSource};
 /// (not mined / not found) and are therefore absent from `pack.anchors`.
 #[derive(Debug, Clone)]
 pub struct ProofPackResult {
+    /// The assembled proof-pack (covers only the txids that could be proven).
     pub pack: SpvProofPack,
     /// Witness txids with no inclusion proof — a verifier will reject these as MissingAnchor.
     pub unproven: Vec<String>,
@@ -148,6 +149,7 @@ pub struct ElectrsHeaderSource {
 }
 
 impl ElectrsHeaderSource {
+    /// Connect to the electrum endpoint `url` (`tcp://host:port`).
     pub fn new(url: &str) -> Result<Self, String> {
         let client = Client::new(url).map_err(|e| format!("connect {url}: {e}"))?;
         Ok(Self { client })

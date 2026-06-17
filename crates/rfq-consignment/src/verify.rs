@@ -51,11 +51,19 @@ pub enum RejectReason {
     /// The merkle proof did not reproduce the block's merkle root.
     BadMerkle,
     /// Included, but shallower than K confirmations.
-    Unmined { confirmations: u32 },
+    Unmined {
+        /// How deep the witness actually is (below the required K).
+        confirmations: u32,
+    },
     /// A hash field in the pack was malformed (bad hex / wrong length).
     Malformed,
     /// The whole ancestry exceeded the size cap; rejected before any per-witness work.
-    AncestryTooLarge { count: usize, cap: usize },
+    AncestryTooLarge {
+        /// Number of (non-exempt) witnesses presented.
+        count: usize,
+        /// The configured maximum ([`DEFAULT_MAX_WITNESSES`]).
+        cap: usize,
+    },
 }
 
 /// Outcome of verifying a full witness set against a pack.

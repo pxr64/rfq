@@ -28,10 +28,15 @@ use crate::verify::{HeaderInfo, HeaderSource};
 /// Bitcoin networks, distinguished by how header validity is established.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
+    /// Bitcoin mainnet — proof-of-work secured; full difficulty validation applies.
     Mainnet,
+    /// Testnet3 — PoW with the 20-minute min-difficulty rule (not yet fully validated here).
     Testnet3,
+    /// Testnet4.
     Testnet4,
+    /// Signet — blocks secured by a signer signature, not header PoW.
     Signet,
+    /// Regtest — local testing; no real proof-of-work.
     Regtest,
 }
 
@@ -73,6 +78,7 @@ impl Network {
 /// A `(height, block-hash)` pair the client trusts a priori — shipped in the binary.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Checkpoint {
+    /// Block height of the checkpoint (must be a retarget-epoch boundary on PoW networks).
     pub height: u32,
     /// Display-order block-hash hex.
     pub block_hash: String,
@@ -133,93 +139,139 @@ impl CheckpointHeaderSource {
         checkpoint: &Checkpoint,
         headers: &[Vec<u8>],
     ) -> Result<Self, String> {
-        if headers.is_empty() {
-            return Err("CheckpointHeaderSource: no headers supplied".to_owned());
-        }
-        if headers.iter().any(|h| h.len() != 80) {
-            return Err("CheckpointHeaderSource: every header must be exactly 80 bytes".to_owned());
-        }
-
-        // 1. Checkpoint anchor.
-        let first_hash = header_hash_display(&headers[0]);
-        if !first_hash.eq_ignore_ascii_case(&checkpoint.block_hash) {
-            return Err(format!(
-                "checkpoint mismatch: headers[0] hashes to {first_hash}, expected {}",
-                checkpoint.block_hash
-            ));
-        }
-
-        // On PoW networks, difficulty validation requires the checkpoint to sit on a retarget
-        // (difficulty-epoch) boundary, so the first epoch in the run is complete from the
-        // checkpoint and every later retarget's 2016-block lookback is in-run.
-        let check_difficulty = network.checks_pow();
-        if check_difficulty && !checkpoint.height.is_multiple_of(RETARGET_INTERVAL) {
-            return Err(format!(
-                "checkpoint height {} is not on a retarget boundary (multiple of {RETARGET_INTERVAL})",
-                checkpoint.height
-            ));
-        }
-
         let mut by_hash = HashMap::with_capacity(headers.len());
-        let mut prev_hash = first_hash.clone();
-        for (i, header) in headers.iter().enumerate() {
-            // 2. Linkage (skip for the anchor itself).
-            if i > 0 {
-                let want_prev = header_prev_display(header);
-                if !want_prev.eq_ignore_ascii_case(&prev_hash) {
-                    return Err(format!(
-                        "broken linkage at index {i}: prev_block {want_prev} != {prev_hash}"
-                    ));
-                }
-                prev_hash = header_hash_display(header);
-            }
-            let height = checkpoint.height + i as u32;
-
-            // 3. Proof-of-work + difficulty correctness (network-gated). PoW alone is
-            //    forgeable (the attacker writes `bits`); we ALSO recompute the required
-            //    difficulty so `bits` can't be faked low.
-            if check_difficulty {
-                if !meets_pow(header) {
-                    return Err(format!(
-                        "header at index {i} (height {height}) fails its proof-of-work target"
-                    ));
-                }
-                if i > 0 {
-                    let bits = header_bits(header);
-                    let expected = if height.is_multiple_of(RETARGET_INTERVAL) {
-                        // Retarget boundary: recompute from the previous epoch's first + last
-                        // block (in-run, since the checkpoint is epoch-aligned).
-                        let last = &headers[i - 1];
-                        let first = &headers[i - RETARGET_INTERVAL as usize];
-                        expected_retarget_bits(header_bits(last), header_time(last), header_time(first))
-                    } else {
-                        // Mid-epoch: difficulty is constant, so `bits` must match the prior block.
-                        header_bits(&headers[i - 1])
-                    };
-                    if bits != expected {
-                        return Err(format!(
-                            "header at index {i} (height {height}): difficulty bits {bits:#010x} \
-                             != expected {expected:#010x}"
-                        ));
-                    }
-                }
-            }
-
-            let root = header_merkle_root(header).ok_or("bad header length")?;
-            by_hash.insert(header_hash_display(header), (root, height));
-        }
-
+        validate_run(network, checkpoint, headers, &mut by_hash)?;
+        // Single full run → the run's last block is the tip.
         let tip_height = checkpoint.height + (headers.len() as u32 - 1);
-        Ok(Self {
-            by_hash,
-            tip_height,
-        })
+        Ok(Self { by_hash, tip_height })
     }
 
-    /// Highest height in the validated run.
+    /// Build a source from **multiple** validated segments — the dense-checkpoint path
+    /// (RFQIP-1). Each segment is an epoch-aligned checkpoint plus a contiguous run starting
+    /// at it; a thin client fetches only the short run around each witness (≤ one epoch from
+    /// the nearest baked checkpoint, via [`nearest_checkpoint`]) instead of syncing the whole
+    /// chain. Every segment is validated (linkage + PoW + difficulty) and merged into one
+    /// lookup. `tip_height` is the real chain tip (segments needn't reach it), used for
+    /// confirmation depth.
+    pub fn from_segments(
+        network: Network,
+        segments: &[(Checkpoint, Vec<Vec<u8>>)],
+        tip_height: u32,
+    ) -> Result<Self, String> {
+        if segments.is_empty() {
+            return Err("CheckpointHeaderSource: no segments supplied".to_owned());
+        }
+        let mut by_hash = HashMap::new();
+        for (checkpoint, headers) in segments {
+            validate_run(network, checkpoint, headers, &mut by_hash)?;
+            if checkpoint.height + (headers.len() as u32 - 1) > tip_height {
+                return Err(format!(
+                    "segment at checkpoint {} extends past the declared tip {tip_height}",
+                    checkpoint.height
+                ));
+            }
+        }
+        Ok(Self { by_hash, tip_height })
+    }
+
+    /// Highest height vouched for (the chain tip the source was built against).
     pub fn tip_height(&self) -> u32 {
         self.tip_height
     }
+}
+
+/// Pick the highest checkpoint at or below `height` — the anchor a thin client fetches its
+/// bounded per-witness header run from. `checkpoints` need not be sorted.
+pub fn nearest_checkpoint(checkpoints: &[Checkpoint], height: u32) -> Option<&Checkpoint> {
+    checkpoints
+        .iter()
+        .filter(|c| c.height <= height)
+        .max_by_key(|c| c.height)
+}
+
+/// Validate one contiguous header run anchored at `checkpoint` (checkpoint match + linkage +
+/// network-gated PoW & difficulty) and insert every block into `by_hash`.
+fn validate_run(
+    network: Network,
+    checkpoint: &Checkpoint,
+    headers: &[Vec<u8>],
+    by_hash: &mut HashMap<String, ([u8; 32], u32)>,
+) -> Result<(), String> {
+    if headers.is_empty() {
+        return Err("CheckpointHeaderSource: no headers supplied".to_owned());
+    }
+    if headers.iter().any(|h| h.len() != 80) {
+        return Err("CheckpointHeaderSource: every header must be exactly 80 bytes".to_owned());
+    }
+
+    // 1. Checkpoint anchor.
+    let first_hash = header_hash_display(&headers[0]);
+    if !first_hash.eq_ignore_ascii_case(&checkpoint.block_hash) {
+        return Err(format!(
+            "checkpoint mismatch: headers[0] hashes to {first_hash}, expected {}",
+            checkpoint.block_hash
+        ));
+    }
+
+    // On PoW networks, difficulty validation requires the checkpoint to sit on a retarget
+    // (difficulty-epoch) boundary, so the first epoch in the run is complete from the
+    // checkpoint and every later retarget's 2016-block lookback is in-run.
+    let check_difficulty = network.checks_pow();
+    if check_difficulty && !checkpoint.height.is_multiple_of(RETARGET_INTERVAL) {
+        return Err(format!(
+            "checkpoint height {} is not on a retarget boundary (multiple of {RETARGET_INTERVAL})",
+            checkpoint.height
+        ));
+    }
+
+    let mut prev_hash = first_hash.clone();
+    for (i, header) in headers.iter().enumerate() {
+        // 2. Linkage (skip for the anchor itself).
+        if i > 0 {
+            let want_prev = header_prev_display(header);
+            if !want_prev.eq_ignore_ascii_case(&prev_hash) {
+                return Err(format!(
+                    "broken linkage at index {i}: prev_block {want_prev} != {prev_hash}"
+                ));
+            }
+            prev_hash = header_hash_display(header);
+        }
+        let height = checkpoint.height + i as u32;
+
+        // 3. Proof-of-work + difficulty correctness (network-gated). PoW alone is forgeable
+        //    (the attacker writes `bits`); we ALSO recompute the required difficulty so `bits`
+        //    can't be faked low.
+        if check_difficulty {
+            if !meets_pow(header) {
+                return Err(format!(
+                    "header at index {i} (height {height}) fails its proof-of-work target"
+                ));
+            }
+            if i > 0 {
+                let bits = header_bits(header);
+                let expected = if height.is_multiple_of(RETARGET_INTERVAL) {
+                    // Retarget boundary: recompute from the previous epoch's first + last block
+                    // (in-run, since the checkpoint is epoch-aligned).
+                    let last = &headers[i - 1];
+                    let first = &headers[i - RETARGET_INTERVAL as usize];
+                    expected_retarget_bits(header_bits(last), header_time(last), header_time(first))
+                } else {
+                    // Mid-epoch: difficulty is constant, so `bits` must match the prior block.
+                    header_bits(&headers[i - 1])
+                };
+                if bits != expected {
+                    return Err(format!(
+                        "header at index {i} (height {height}): difficulty bits {bits:#010x} \
+                         != expected {expected:#010x}"
+                    ));
+                }
+            }
+        }
+
+        let root = header_merkle_root(header).ok_or("bad header length")?;
+        by_hash.insert(header_hash_display(header), (root, height));
+    }
+    Ok(())
 }
 
 impl HeaderSource for CheckpointHeaderSource {
@@ -387,6 +439,50 @@ mod tests {
         assert_eq!(Network::from_label("signet"), Some(Network::Signet));
         assert_eq!(Network::from_label("regtest"), Some(Network::Regtest));
         assert_eq!(Network::from_label("nope"), None);
+    }
+
+    #[test]
+    fn from_segments_uses_declared_tip_for_confirmations() {
+        // A bounded run stops well before the chain tip, so confirmations must come from the
+        // declared tip — not the end of the run (which `new` uses for a full run).
+        let headers = vec![raw(GENESIS), raw(BLOCK1), raw(BLOCK2)];
+        let src = CheckpointHeaderSource::from_segments(
+            Network::Mainnet,
+            &[(checkpoint(), headers)],
+            100, // real tip far above the 3-header run
+        )
+        .unwrap();
+        assert_eq!(src.tip_height(), 100);
+        // genesis at height 0 → 101 confirmations against the declared tip.
+        assert_eq!(src.header_at(GENESIS_HASH, 0).unwrap().confirmations, 101);
+    }
+
+    #[test]
+    fn from_segments_rejects_run_past_tip() {
+        let headers = vec![raw(GENESIS), raw(BLOCK1), raw(BLOCK2)]; // reaches height 2
+        let err = CheckpointHeaderSource::from_segments(
+            Network::Mainnet,
+            &[(checkpoint(), headers)],
+            1, // declared tip below the run's end
+        )
+        .unwrap_err();
+        assert!(err.contains("past the declared tip"), "{err}");
+    }
+
+    #[test]
+    fn nearest_checkpoint_picks_highest_at_or_below() {
+        let cps = vec![
+            Checkpoint { height: 0, block_hash: "a".into() },
+            Checkpoint { height: 4032, block_hash: "c".into() },
+            Checkpoint { height: 2016, block_hash: "b".into() },
+        ];
+        assert_eq!(nearest_checkpoint(&cps, 3000).unwrap().height, 2016);
+        assert_eq!(nearest_checkpoint(&cps, 5000).unwrap().height, 4032);
+        assert_eq!(nearest_checkpoint(&cps, 2016).unwrap().height, 2016);
+        assert_eq!(nearest_checkpoint(&cps, 0).unwrap().height, 0);
+        // Nothing at or below → None.
+        let high_only = [Checkpoint { height: 2016, block_hash: "b".into() }];
+        assert!(nearest_checkpoint(&high_only, 100).is_none());
     }
 
     #[test]

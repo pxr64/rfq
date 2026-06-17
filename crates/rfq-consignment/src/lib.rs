@@ -19,6 +19,10 @@
 //! Because a pack is self-verifying, a lying or faulty producer can only cause a
 //! verification *failure*, never a false *accept* — which is what lets the prover be a
 //! standalone, replaceable service.
+//!
+//! This crate is trust-critical and audited; every public item is documented
+//! (`#![warn(missing_docs)]`). See `docs/consignment-spv-verification.md`.
+#![warn(missing_docs)]
 
 pub mod difficulty;
 pub mod headers;
@@ -31,7 +35,7 @@ pub mod mined;
 #[cfg(feature = "electrs")]
 pub mod prove;
 
-pub use headers::{Checkpoint, CheckpointHeaderSource, Network};
+pub use headers::{nearest_checkpoint, Checkpoint, CheckpointHeaderSource, Network};
 pub use proofpack::{SpvProofPack, WitnessInclusion};
 pub use verify::{verify_pack, HeaderInfo, HeaderSource, RejectReason, SpvVerdict};
 

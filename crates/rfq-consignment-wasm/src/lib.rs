@@ -11,6 +11,7 @@
 //!
 //! The host supplies the witness-txid set (it already decodes the consignment with its
 //! existing RGB wasm), so this module needs neither the RGB stack nor a chain connection.
+#![warn(missing_docs)]
 
 use std::collections::HashSet;
 
