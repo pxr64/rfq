@@ -17,6 +17,7 @@
 //! against its own headers, so a stale anchor still cannot cause a false accept.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
@@ -30,11 +31,12 @@ use rfq_consignment::proofpack::WitnessInclusion;
 use rfq_consignment::{build_proof_pack, SpvProofPack};
 
 /// Soft cap on cached anchors — crude bound so a long-lived prover can't grow without limit.
-/// When exceeded the cache is cleared (a real LRU + disk tier is a follow-up).
+/// When exceeded the cache is cleared (a real LRU is a follow-up).
 const MAX_CACHE_ENTRIES: usize = 100_000;
 
-/// One cached, immutable inclusion proof plus the raw header it anchors to.
-#[derive(Clone)]
+/// One cached, immutable inclusion proof plus the raw header it anchors to. Serializable so
+/// the optional disk tier can persist it (a buried proof never changes).
+#[derive(Clone, Serialize, Deserialize)]
 struct CachedAnchor {
     inclusion: WitnessInclusion,
     /// Raw 80-byte block header, hex — included in the response `headers` map.
@@ -47,7 +49,12 @@ pub struct AppState {
     pub electrum_url: String,
     /// Network label stamped into every pack (`regtest` | `signet` | `testnet` | `mainnet`).
     pub network: String,
+    /// In-memory hot tier: txid → anchor.
     cache: Arc<Mutex<HashMap<String, CachedAnchor>>>,
+    /// Optional persistent tier: one `<txid>.json` per anchor under this dir. Survives
+    /// restarts so a buried proof is fetched from electrs at most once, ever. `None` →
+    /// memory-only.
+    cache_dir: Option<PathBuf>,
 }
 
 impl AppState {
@@ -56,6 +63,43 @@ impl AppState {
             electrum_url,
             network,
             cache: Arc::new(Mutex::new(HashMap::new())),
+            cache_dir: None,
+        }
+    }
+
+    /// Enable the persistent disk tier under `dir` (created if missing).
+    pub fn with_cache_dir(mut self, dir: PathBuf) -> Self {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("spv-prover: cache dir {} unusable, disk tier off: {e}", dir.display());
+        } else {
+            self.cache_dir = Some(dir);
+        }
+        self
+    }
+
+    /// Path for a txid's persisted anchor (`<dir>/<txid>.json`). `None` if no disk tier or
+    /// the txid isn't clean hex (defensive — txids are always hex in practice).
+    fn disk_path(&self, txid: &str) -> Option<PathBuf> {
+        let dir = self.cache_dir.as_ref()?;
+        if txid.is_empty() || !txid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(dir.join(format!("{txid}.json")))
+    }
+
+    /// Try to load a persisted anchor for `txid` from disk.
+    fn load_disk(&self, txid: &str) -> Option<CachedAnchor> {
+        let path = self.disk_path(txid)?;
+        let bytes = std::fs::read(path).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Persist an anchor for `txid` to disk (best-effort; failures are non-fatal).
+    fn store_disk(&self, txid: &str, anchor: &CachedAnchor) {
+        if let Some(path) = self.disk_path(txid) {
+            if let Ok(bytes) = serde_json::to_vec(anchor) {
+                let _ = std::fs::write(path, bytes);
+            }
         }
     }
 }
@@ -121,7 +165,25 @@ async fn build(state: AppState, txids: Vec<String>) -> Result<ProofPackResponse,
         (hits, misses)
     };
 
-    // 2. Fetch the misses from electrs (blocking) off the async runtime.
+    // 2. Disk tier: for in-memory misses, try the persistent cache before electrs. A hit
+    //    here is promoted back into the hot in-memory tier.
+    let mut misses = misses;
+    if state.cache_dir.is_some() {
+        let mut still_missing = Vec::new();
+        let mut cache = state.cache.lock().unwrap();
+        for txid in misses {
+            match state.load_disk(&txid) {
+                Some(anchor) => {
+                    cache.insert(txid.clone(), anchor.clone());
+                    hits.insert(txid, anchor);
+                }
+                None => still_missing.push(txid),
+            }
+        }
+        misses = still_missing;
+    }
+
+    // 3. Fetch the remaining misses from electrs (blocking) off the async runtime.
     let mut unproven = Vec::new();
     if !misses.is_empty() {
         let url = state.electrum_url.clone();
@@ -131,7 +193,7 @@ async fn build(state: AppState, txids: Vec<String>) -> Result<ProofPackResponse,
             .map_err(|e| format!("prover task join: {e}"))??;
 
         unproven = fetched.unproven;
-        // 3. Insert freshly-proven anchors into the cache + the working set.
+        // 4. Insert freshly-proven anchors into both tiers + the working set.
         let mut cache = state.cache.lock().unwrap();
         if cache.len() + fetched.pack.anchors.len() > MAX_CACHE_ENTRIES {
             cache.clear();
@@ -147,12 +209,13 @@ async fn build(state: AppState, txids: Vec<String>) -> Result<ProofPackResponse,
                 inclusion,
                 header_hex,
             };
+            state.store_disk(&txid, &cached);
             cache.insert(txid.clone(), cached.clone());
             hits.insert(txid, cached);
         }
     }
 
-    // 4. Assemble the response pack from the working set, in the requested order.
+    // 5. Assemble the response pack from the working set, in the requested order.
     let mut anchors = std::collections::BTreeMap::new();
     let mut headers = std::collections::BTreeMap::new();
     for txid in &txids {

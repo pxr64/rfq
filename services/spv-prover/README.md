@@ -28,6 +28,7 @@ cargo run -p spv-prover
 | `SPV_PROVER_LISTEN` | `127.0.0.1:3010` | bind address |
 | `SPV_ELECTRUM_URL` | `tcp://127.0.0.1:60001` | electrum/electrs endpoint |
 | `SPV_NETWORK` | `regtest` | network label stamped into packs |
+| `SPV_CACHE_DIR` | *(unset)* | persistent anchor cache dir; absent → memory-only |
 
 ## API
 

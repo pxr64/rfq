@@ -8,6 +8,8 @@ use spv_prover::{app, AppState};
 /// - `SPV_PROVER_LISTEN` — bind address (default `127.0.0.1:3010`).
 /// - `SPV_ELECTRUM_URL` — electrum/electrs URL (default `tcp://127.0.0.1:60001`).
 /// - `SPV_NETWORK` — network label stamped into packs (default `regtest`).
+/// - `SPV_CACHE_DIR` — optional dir for the persistent anchor cache (one `<txid>.json` per
+///   proof). Absent → memory-only (cache lost on restart).
 #[tokio::main]
 async fn main() {
     let listen: SocketAddr = std::env::var("SPV_PROVER_LISTEN")
@@ -21,7 +23,12 @@ async fn main() {
 
     println!("spv-prover: electrs → {electrum_url} (network {network})");
 
-    let app = app(AppState::new(electrum_url, network));
+    let mut state = AppState::new(electrum_url, network);
+    if let Ok(dir) = std::env::var("SPV_CACHE_DIR") {
+        println!("spv-prover: persistent cache → {dir}");
+        state = state.with_cache_dir(dir.into());
+    }
+    let app = app(state);
 
     let listener = tokio::net::TcpListener::bind(listen)
         .await
