@@ -4,6 +4,12 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 
+[features]
+default = ["electrs"]
+electrs = ["dep:bp-electrum"]
+
 [dependencies]
-bp-electrum = "=0.11.1-alpha.2"
+serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = "0.10"
+bp-electrum = { version = "=0.11.1-alpha.2", optional = true }

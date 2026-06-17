@@ -2449,7 +2449,9 @@ name = "rfq-consignment"
 version = "0.1.0"
 dependencies = [
  "bp-electrum",
+ "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
