@@ -290,6 +290,52 @@ impl HeaderSource for CheckpointHeaderSource {
     }
 }
 
+/// A [`HeaderSource`] that **trusts the headers it is given** — RFQIP-1 ladder rung 3. It does
+/// NO proof-of-work, linkage, or checkpoint validation; it simply records each supplied
+/// header's merkle root + height. A lying source therefore *can* fool it.
+///
+/// **Use only where the client already accepts the indexer's headers** — i.e. **signet**
+/// (blocks are signer-signed, not PoW-secured, so header-only PoW validation is meaningless)
+/// or local test setups. Mainnet MUST use [`CheckpointHeaderSource`], which validates PoW +
+/// difficulty + linkage. This type exists so the wallet can do real per-witness
+/// merkle-inclusion + depth checks on signet (a large step up from trusting a `confirmed`
+/// flag) without syncing a full header chain.
+#[derive(Debug, Clone)]
+pub struct TrustedHeaderSource {
+    by_hash: HashMap<String, ([u8; 32], u32)>,
+    tip_height: u32,
+}
+
+impl TrustedHeaderSource {
+    /// Build from `(block_hash_display, raw 80-byte header, height)` triples + the chain tip.
+    /// The merkle root is read from each header; the headers are otherwise unvalidated.
+    pub fn new(headers: &[(String, Vec<u8>, u32)], tip_height: u32) -> Result<Self, String> {
+        let mut by_hash = HashMap::with_capacity(headers.len());
+        for (block_hash, header, height) in headers {
+            let root = header_merkle_root(header)
+                .ok_or_else(|| format!("header for {block_hash} is not 80 bytes"))?;
+            by_hash.insert(block_hash.to_ascii_lowercase(), (root, *height));
+        }
+        Ok(Self {
+            by_hash,
+            tip_height,
+        })
+    }
+}
+
+impl HeaderSource for TrustedHeaderSource {
+    fn header_at(&self, block_hash: &str, claimed_height: u32) -> Option<HeaderInfo> {
+        let (merkle_root, height) = self.by_hash.get(&block_hash.to_ascii_lowercase())?;
+        if *height != claimed_height {
+            return None;
+        }
+        Some(HeaderInfo {
+            merkle_root: *merkle_root,
+            confirmations: (self.tip_height + 1).saturating_sub(*height),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +529,28 @@ mod tests {
         // Nothing at or below → None.
         let high_only = [Checkpoint { height: 2016, block_hash: "b".into() }];
         assert!(nearest_checkpoint(&high_only, 100).is_none());
+    }
+
+    #[test]
+    fn trusted_header_source_vouches_for_supplied_headers() {
+        // Tier-1 (signet): trust the given header, vouch for its block at its claimed height.
+        let src = TrustedHeaderSource::new(
+            &[(GENESIS_HASH.to_owned(), raw(GENESIS), 0)],
+            100,
+        )
+        .unwrap();
+        let info = src.header_at(GENESIS_HASH, 0).unwrap();
+        assert_eq!(info.confirmations, 101);
+        assert_eq!(
+            info.merkle_root,
+            hash32_display_to_internal(
+                "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+            )
+            .unwrap()
+        );
+        // Wrong claimed height / unknown block → None.
+        assert!(src.header_at(GENESIS_HASH, 1).is_none());
+        assert!(src.header_at(&"ab".repeat(32), 0).is_none());
     }
 
     #[test]
