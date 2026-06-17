@@ -20,6 +20,7 @@
 //! verification *failure*, never a false *accept* — which is what lets the prover be a
 //! standalone, replaceable service.
 
+pub mod headers;
 pub mod merkle;
 pub mod proofpack;
 pub mod verify;
@@ -29,6 +30,7 @@ pub mod mined;
 #[cfg(feature = "electrs")]
 pub mod prove;
 
+pub use headers::{Checkpoint, CheckpointHeaderSource, Network};
 pub use proofpack::{SpvProofPack, WitnessInclusion};
 pub use verify::{verify_pack, HeaderInfo, HeaderSource, RejectReason, SpvVerdict};
 
