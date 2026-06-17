@@ -35,9 +35,7 @@ pub mod mined;
 #[cfg(feature = "electrs")]
 pub mod prove;
 
-pub use headers::{
-    nearest_checkpoint, Checkpoint, CheckpointHeaderSource, Network, TrustedHeaderSource,
-};
+pub use headers::{nearest_checkpoint, Checkpoint, CheckpointHeaderSource, Network};
 pub use proofpack::{SpvProofPack, WitnessInclusion};
 pub use verify::{verify_pack, HeaderInfo, HeaderSource, RejectReason, SpvVerdict};
 
