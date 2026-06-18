@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::difficulty::{expected_retarget_bits, target_from_compact, RETARGET_INTERVAL};
 use crate::merkle::{bytes_to_hex, dsha256, header_merkle_root};
@@ -76,7 +76,7 @@ impl Network {
 }
 
 /// A `(height, block-hash)` pair the client trusts a priori — shipped in the binary.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Checkpoint {
     /// Block height of the checkpoint (must be a retarget-epoch boundary on PoW networks).
     pub height: u32,
@@ -177,6 +177,25 @@ impl CheckpointHeaderSource {
     /// Highest height vouched for (the chain tip the source was built against).
     pub fn tip_height(&self) -> u32 {
         self.tip_height
+    }
+
+    /// The epoch-boundary (`height % RETARGET_INTERVAL == 0`) checkpoints inside the validated
+    /// run, ascending. A thin client uses this to **extend** its local checkpoint store forward:
+    /// validate a run from its current frontier, then persist these as new trusted anchors. They
+    /// are trustworthy because they come from a validated `CheckpointHeaderSource` (linkage [+ PoW
+    /// + difficulty on mainnet]) anchored at an already-trusted checkpoint.
+    pub fn epoch_checkpoints(&self) -> Vec<Checkpoint> {
+        let mut out: Vec<Checkpoint> = self
+            .by_hash
+            .iter()
+            .filter(|(_, (_, height))| height.is_multiple_of(RETARGET_INTERVAL))
+            .map(|(block_hash, (_, height))| Checkpoint {
+                height: *height,
+                block_hash: block_hash.clone(),
+            })
+            .collect();
+        out.sort_by_key(|c| c.height);
+        out
     }
 }
 
@@ -483,6 +502,17 @@ mod tests {
         // Nothing at or below → None.
         let high_only = [Checkpoint { height: 2016, block_hash: "b".into() }];
         assert!(nearest_checkpoint(&high_only, 100).is_none());
+    }
+
+    #[test]
+    fn epoch_checkpoints_lists_only_boundary_blocks() {
+        // genesis(0) + block1(1) + block2(2): only height 0 is on a 2016 boundary.
+        let headers = [raw(GENESIS), raw(BLOCK1), raw(BLOCK2)];
+        let src = CheckpointHeaderSource::new(Network::Mainnet, &checkpoint(), &headers).unwrap();
+        let cps = src.epoch_checkpoints();
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].height, 0);
+        assert!(cps[0].block_hash.eq_ignore_ascii_case(GENESIS_HASH));
     }
 
     #[test]
