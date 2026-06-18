@@ -88,9 +88,12 @@ pub struct Checkpoint {
 /// block hash inside the run with its real merkle root + confirmation depth.
 #[derive(Debug, Clone)]
 pub struct CheckpointHeaderSource {
-    /// block_hash (display hex) → (merkle_root internal, height).
-    by_hash: HashMap<String, ([u8; 32], u32)>,
-    tip_height: u32,
+    /// block_hash (display hex) → (merkle_root internal, height, run_top_height), where
+    /// `run_top_height` is the top of the *validated run* this block belongs to. Confirmation
+    /// depth is measured against that validated height — never an externally-supplied tip, which
+    /// an untrusted indexer could inflate to forge depth (see `header_at`). For a single full run
+    /// (`new`) every block's `run_top_height` is the run's last block.
+    by_hash: HashMap<String, ([u8; 32], u32, u32)>,
 }
 
 /// Display-order (big-endian) hash hex of an 80-byte header.
@@ -141,9 +144,7 @@ impl CheckpointHeaderSource {
     ) -> Result<Self, String> {
         let mut by_hash = HashMap::with_capacity(headers.len());
         validate_run(network, checkpoint, headers, &mut by_hash)?;
-        // Single full run → the run's last block is the tip.
-        let tip_height = checkpoint.height + (headers.len() as u32 - 1);
-        Ok(Self { by_hash, tip_height })
+        Ok(Self { by_hash })
     }
 
     /// Build a source from **multiple** validated segments — the dense-checkpoint path
@@ -151,12 +152,13 @@ impl CheckpointHeaderSource {
     /// at it; a thin client fetches only the short run around each witness (≤ one epoch from
     /// the nearest baked checkpoint, via [`nearest_checkpoint`]) instead of syncing the whole
     /// chain. Every segment is validated (linkage + PoW + difficulty) and merged into one
-    /// lookup. `tip_height` is the real chain tip (segments needn't reach it), used for
-    /// confirmation depth.
+    /// lookup. Confirmation depth for each block is measured against **its own** validated run's
+    /// top — there is no externally-supplied tip (a thin client proves a witness is K-deep by
+    /// fetching K headers above it, so each run carries its own depth, and disjoint runs never
+    /// lend each other confirmations).
     pub fn from_segments(
         network: Network,
         segments: &[(Checkpoint, Vec<Vec<u8>>)],
-        tip_height: u32,
     ) -> Result<Self, String> {
         if segments.is_empty() {
             return Err("CheckpointHeaderSource: no segments supplied".to_owned());
@@ -164,19 +166,18 @@ impl CheckpointHeaderSource {
         let mut by_hash = HashMap::new();
         for (checkpoint, headers) in segments {
             validate_run(network, checkpoint, headers, &mut by_hash)?;
-            if checkpoint.height + (headers.len() as u32 - 1) > tip_height {
-                return Err(format!(
-                    "segment at checkpoint {} extends past the declared tip {tip_height}",
-                    checkpoint.height
-                ));
-            }
         }
-        Ok(Self { by_hash, tip_height })
+        Ok(Self { by_hash })
     }
 
-    /// Highest height vouched for (the chain tip the source was built against).
+    /// Highest validated height this source vouches for — the top of the tallest validated run.
+    /// Derived from validated headers; there is no externally-supplied tip.
     pub fn tip_height(&self) -> u32 {
-        self.tip_height
+        self.by_hash
+            .values()
+            .map(|(_, _, run_top)| *run_top)
+            .max()
+            .unwrap_or(0)
     }
 
     /// The epoch-boundary (`height % RETARGET_INTERVAL == 0`) checkpoints inside the validated
@@ -188,8 +189,8 @@ impl CheckpointHeaderSource {
         let mut out: Vec<Checkpoint> = self
             .by_hash
             .iter()
-            .filter(|(_, (_, height))| height.is_multiple_of(RETARGET_INTERVAL))
-            .map(|(block_hash, (_, height))| Checkpoint {
+            .filter(|(_, (_, height, _))| height.is_multiple_of(RETARGET_INTERVAL))
+            .map(|(block_hash, (_, height, _))| Checkpoint {
                 height: *height,
                 block_hash: block_hash.clone(),
             })
@@ -214,8 +215,8 @@ fn validate_run(
     network: Network,
     checkpoint: &Checkpoint,
     headers: &[Vec<u8>],
-    by_hash: &mut HashMap<String, ([u8; 32], u32)>,
-) -> Result<(), String> {
+    by_hash: &mut HashMap<String, ([u8; 32], u32, u32)>,
+) -> Result<u32, String> {
     if headers.is_empty() {
         return Err("CheckpointHeaderSource: no headers supplied".to_owned());
     }
@@ -242,6 +243,11 @@ fn validate_run(
             checkpoint.height
         ));
     }
+
+    // Top of THIS validated run — the confirmation-depth anchor for every block in it (a
+    // validated height, never an external tip). Known up front: the run is contiguous from the
+    // checkpoint, so its last block is at `checkpoint.height + len - 1`.
+    let run_top = checkpoint.height + (headers.len() as u32 - 1);
 
     let mut prev_hash = first_hash.clone();
     for (i, header) in headers.iter().enumerate() {
@@ -288,20 +294,23 @@ fn validate_run(
         }
 
         let root = header_merkle_root(header).ok_or("bad header length")?;
-        by_hash.insert(header_hash_display(header), (root, height));
+        by_hash.insert(header_hash_display(header), (root, height, run_top));
     }
-    Ok(())
+    Ok(run_top)
 }
 
 impl HeaderSource for CheckpointHeaderSource {
     fn header_at(&self, block_hash: &str, claimed_height: u32) -> Option<HeaderInfo> {
         let key = block_hash.to_ascii_lowercase();
-        let (merkle_root, height) = self.by_hash.get(&key)?;
+        let (merkle_root, height, run_top) = self.by_hash.get(&key)?;
         // The pack must not lie about which height the block sits at.
         if *height != claimed_height {
             return None;
         }
-        let confirmations = (self.tip_height + 1).saturating_sub(*height);
+        // Depth is measured against this block's own validated run top — NOT an external tip an
+        // untrusted indexer could inflate. A thin client proves K confirmations by validating K
+        // headers above the witness; disjoint runs never lend each other depth.
+        let confirmations = (run_top + 1).saturating_sub(*height);
         Some(HeaderInfo {
             merkle_root: *merkle_root,
             confirmations,
@@ -330,6 +339,24 @@ mod tests {
             height: 0,
             block_hash: GENESIS_HASH.to_owned(),
         }
+    }
+
+    /// Build `n` linked synthetic 80-byte headers (regtest — no PoW), each chaining to the
+    /// previous by real double-SHA256. `prev0` is headers[0]'s `prev_block` (internal order);
+    /// the caller anchors a checkpoint at `header_hash_display(&headers[0])`.
+    fn synth_chain(prev0: [u8; 32], merkle_tag: u8, n: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(n);
+        let mut prev = prev0;
+        for i in 0..n {
+            let mut h = vec![0u8; 80];
+            h[0] = 1; // version
+            h[4..36].copy_from_slice(&prev);
+            h[36..68].copy_from_slice(&[merkle_tag.wrapping_add(i as u8); 32]); // arbitrary root
+            h[72..76].copy_from_slice(&0x1d00_ffffu32.to_le_bytes()); // bits (ignored on regtest)
+            prev = crate::merkle::dsha256(&h);
+            out.push(h);
+        }
+        out
     }
 
     #[test]
@@ -461,31 +488,43 @@ mod tests {
     }
 
     #[test]
-    fn from_segments_uses_declared_tip_for_confirmations() {
-        // A bounded run stops well before the chain tip, so confirmations must come from the
-        // declared tip — not the end of the run (which `new` uses for a full run).
+    fn from_segments_uses_run_top_for_confirmations() {
+        // No external tip: confirmations come from the validated run's OWN top. A 3-header run
+        // from genesis puts genesis 3 deep (run top = height 2 ⇒ 2+1-0) — a thin client that
+        // wants more depth must validate more headers, it can't borrow depth from a claimed tip.
         let headers = vec![raw(GENESIS), raw(BLOCK1), raw(BLOCK2)];
-        let src = CheckpointHeaderSource::from_segments(
-            Network::Mainnet,
-            &[(checkpoint(), headers)],
-            100, // real tip far above the 3-header run
-        )
-        .unwrap();
-        assert_eq!(src.tip_height(), 100);
-        // genesis at height 0 → 101 confirmations against the declared tip.
-        assert_eq!(src.header_at(GENESIS_HASH, 0).unwrap().confirmations, 101);
+        let src = CheckpointHeaderSource::from_segments(Network::Mainnet, &[(checkpoint(), headers)])
+            .unwrap();
+        assert_eq!(src.tip_height(), 2);
+        assert_eq!(src.header_at(GENESIS_HASH, 0).unwrap().confirmations, 3);
+        assert_eq!(src.header_at(BLOCK1_HASH, 1).unwrap().confirmations, 2);
     }
 
     #[test]
-    fn from_segments_rejects_run_past_tip() {
-        let headers = vec![raw(GENESIS), raw(BLOCK1), raw(BLOCK2)]; // reaches height 2
-        let err = CheckpointHeaderSource::from_segments(
-            Network::Mainnet,
-            &[(checkpoint(), headers)],
-            1, // declared tip below the run's end
+    fn from_segments_disjoint_runs_use_own_tops() {
+        // Two disjoint validated runs at different epochs. A block's depth must derive from ITS
+        // run's top — a taller run must NOT lend depth to a shorter one (else an attacker pads an
+        // unrelated tall run to forge confirmations on a shallow witness). Regtest skips PoW, so
+        // we synthesize linked headers and anchor each run at its own (synthetic) checkpoint.
+        let run_a = synth_chain([0x00; 32], 0x10, 2); // heights 0,1 → run_top 1
+        let cp_a = Checkpoint { height: 0, block_hash: header_hash_display(&run_a[0]) };
+        let run_b = synth_chain([0xAB; 32], 0x40, 3); // heights 2016..=2018 → run_top 2018
+        let cp_b = Checkpoint { height: 2016, block_hash: header_hash_display(&run_b[0]) };
+
+        let src = CheckpointHeaderSource::from_segments(
+            Network::Regtest,
+            &[(cp_a, run_a.clone()), (cp_b, run_b.clone())],
         )
-        .unwrap_err();
-        assert!(err.contains("past the declared tip"), "{err}");
+        .unwrap();
+
+        // Run A's first block: 2 deep against run A's top (1) — NOT 2019 against run B's top.
+        let a0 = header_hash_display(&run_a[0]);
+        assert_eq!(src.header_at(&a0, 0).unwrap().confirmations, 2);
+        // Run B's first block: 3 deep against run B's own top (2018).
+        let b0 = header_hash_display(&run_b[0]);
+        assert_eq!(src.header_at(&b0, 2016).unwrap().confirmations, 3);
+        // tip_height() reports the tallest run's top.
+        assert_eq!(src.tip_height(), 2018);
     }
 
     #[test]

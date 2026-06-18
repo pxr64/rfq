@@ -113,8 +113,12 @@ For each witness txid (except the buy-side exempt swap tx):
    claimed `(block_hash, height)` (else `UnknownHeader`).
 3. **Inclusion** — fold txid up `merkle_proof` (display→internal byte order, `tx_index` directs
    left/right, double-SHA256); recomputed root must equal the header's (else `BadMerkle`).
-4. **Depth** — ≥ K confirmations (else `Unmined`).
-5. **Size cap** — the whole set is bounded by `DEFAULT_MAX_WITNESSES` first.
+4. **Depth** — ≥ K confirmations, measured **against headers the verifier itself validated** (each
+   bounded run is fetched K blocks past its witness), **never an indexer-reported tip** — so an
+   inflated tip cannot forge depth (N2). Else `Unmined`.
+5. **Size cap** — the witness set is bounded by `DEFAULT_MAX_WITNESSES` (10k) and each merkle branch
+   by `MAX_MERKLE_DEPTH` (32), so a forged pack can't force unbounded hashing (N3); the claimed block
+   height is also clamped to the tip before any header fetch.
 
 ## 6. Header trust ladder (`HeaderSource`)
 
@@ -166,11 +170,16 @@ re-derives it instead of trusting it. Forging now requires real Bitcoin-scale wo
   block 840,672.
 - **Invariants** — faster→harder, slower→easier, the 4× clamps, pow-limit cap.
 
-**Network gating:** difficulty/PoW validation is currently **mainnet-only** (`Network::checks_pow`).
-Signet blocks are secured by a signer signature (not header-only PoW) and regtest has none, so
-those rely on checkpoint + linkage. *On signet the SPV path is therefore not fully trustless —
-this is acceptable for a test network and is the reason the live deployment is signet.* (testnet's
-20-minute rule and signet-signature validation are noted follow-ups.)
+**Network gating:** difficulty/PoW validation is **mainnet-only** (`Network::checks_pow`). Signet
+blocks are secured by a signer signature (not header-only PoW) and regtest has none, so those rely
+on checkpoint + linkage alone. **Consequence (N1, accepted):** on signet a malicious or compromised
+indexer can fabricate a header chain *above the last baked checkpoint* for free (no PoW to do) and
+thereby forge a witness's inclusion — so the thin-client SPV gate is **not trustless on signet**.
+This is **deliberately accepted**: signet carries no value, and the live deployment is signet
+precisely because it exercises the *exact* mainnet verification path while the protocol is
+pre-release. **Real value is mainnet-only**, where PoW + difficulty validation (below) make header
+forgery cost real Bitcoin work. (Signet signer-signature validation and testnet's 20-minute rule are
+noted follow-ups — not required for a no-value test network.)
 
 ## 9. Dense multi-checkpoint + bounded runs (scaling)
 
@@ -227,18 +236,28 @@ anything local got wrong; worst case is re-validating a couple of epochs forward
 fail-safe). The store is keyed **by network** and carries a **schema version** (bump → drop +
 re-derive, since it's disposable).
 
-### 9.3 Open gaps (required follow-ups, see also §11)
+### 9.3 Status of the prior open gaps
 
-- **Fail-open downgrade (security):** the wallet pre-sign gate currently runs only if the dApp
-  forwarded a consignment. A buy-swap sign must *require* one — refusing to sign a buy without a
-  validated consignment — else the gate is bypassable by omission.
-- **Mined-ancestry ≠ full validation (security):** the SPV gate proves witnesses are mined; the
-  consignment's RGB graph (commitments / seal-closing / transfer-to-our-invoice) must *also* be
-  validated pre-sign (a `validate`-without-`absorb` path in the wallet), mirroring the node's
-  two-pass gate. Today the wallet's graph validation runs at accept (post-sign).
-- **dApp delivery (cross-repo):** the dApp must forward the maker's consignment in the sign intent
-  (it currently enqueues it post-broadcast); until then the gate never fires in production.
-- **Esplora batch fetch / MV3 background lifetime / reorg-safe verified-witness cache** — see §11.
+- **Fail-open downgrade (A1) — ADDRESSED.** A visible buy — paying BTC while RGB lands on our own
+  k10 receive seals — with no good consignment delivery is now a **hard `block`** finding
+  (`rgb-delta.ts`), re-enforced in the trusted worker's `finalize` so a bypassed popup can't sign it.
+  (A *blinded* receive is invisible in the PSBT and so can't be positively classified as a buy —
+  accepted; the symmetric k10-*spend* case stays an advisory `warn`, the user being the final approver.)
+- **Mined-ancestry ≠ full validation (A2) — ADDRESSED.** The wallet runs full RGB graph validation
+  pre-sign against a **non-persisting scratch stock** (`consignment_delivery_to_me`,
+  `clone_no_persistence`); a graph-invalid consignment is a hard `block`, mirroring the node's
+  two-pass gate.
+- **dApp delivery (A3) — ADDRESSED.** The dApp now forwards the maker's consignment (+ swap txid) in
+  the sign intent **pre-broadcast** (`transport.ts`), so the gate fires in production.
+- **Confirmation depth (N2) — CLOSED.** Depth is computed from headers the verifier validated (each
+  run extended K past its witness) and the bury-cache keys off the wallet's **validated checkpoint
+  frontier**, not the indexer's reported tip — an inflated tip can no longer forge depth or poison
+  the skip-cache.
+- **DoS bounds (N3) — CLOSED.** Per-witness merkle branches are capped (`MAX_MERKLE_DEPTH`), the
+  header-run length is capped, and the claimed block height is clamped to the tip before any fetch.
+- **Remaining (perf/reliability, not security):** Esplora batch fetch (B1) and MV3 background
+  lifetime (B2). The checkpoint forward-extension that keeps runs bounded is live (hourly alarm +
+  per-verify harvest).
 
 ## 10. Code map & tests
 
@@ -261,8 +280,17 @@ real mainnet retarget vector; a live regtest prover→verifier round-trip with t
   most-work chain and that no reorg deeper than K occurs.
 - **Checkpoint freshness** — the baked checkpoint table must be refreshed as new epochs occur; a
   stale table simply can't vouch for blocks past its last checkpoint (fails closed).
-- **Signet is not fully trustless** (§8) — PoW gating is mainnet-only today.
+- **Signet is not fully trustless** (§8, N1) — PoW gating is mainnet-only; a malicious indexer can
+  forge the signet chain above the last checkpoint. Accepted (no-value test net); real value → mainnet.
+- **Node-path indexer trust (N4)** — the maker/broker `MinedChecker` trusts its **own** electrs's
+  confirmation count (no merkle proof on that path). Keep electrs on loopback / the maker's trust
+  boundary; a *remote* electrs over plaintext `tcp://` would be a MITM point that could forge
+  confirmations. (Not reachable in the current deployment — electrs is `127.0.0.1`.)
+- **Maker stash bookmark (N5)** — `<stock>/mined_bookmark` is a plaintext skip-list of buried
+  witnesses sharing the stock dir's trust domain (write access there is already full compromise). It
+  only ever *skips re-checking already-buried* txids — it can never admit an unmined one.
 - **RGB is pre-release** — the underlying `rgb-api` / `bp-*` are rc/alpha; that protocol risk is
   outside this verifier and is the primary reason real-value mainnet deployment awaits review.
-- **Vendoring drift** — the wallet copy of the verifier must be kept in sync with this crate
-  (enforced by review; see `colorex-wallet/rgb-wasm/src/spv/mod.rs`).
+- **Vendoring drift** — the wallet's vendored verifier is held **identical** to this crate by a CI
+  tripwire (`pnpm check:vendor-sync` vs `scripts/vendor-manifest.json`, plus an authoritative
+  cross-repo diff via `RFQ_CONSIGNMENT_DIR`); see `colorex-wallet/rgb-wasm/src/spv/mod.rs`.

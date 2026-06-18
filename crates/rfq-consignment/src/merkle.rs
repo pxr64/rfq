@@ -60,9 +60,16 @@ pub fn hash32_display_to_internal(display_hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// Maximum merkle-branch length accepted. A 32-node branch admits a block of up to 2^32
+/// transactions — far beyond any real block (largest ever ~a few thousand txs ⇒ depth ≤ ~13).
+/// A longer branch is a forged or DoS proof: an untrusted pack could otherwise force unbounded
+/// double-SHA256. Shared with [`crate::verify::verify_pack`] (surfaces there as `Malformed`).
+pub const MAX_MERKLE_DEPTH: usize = 32;
+
 /// Fold `txid_display` up `merkle_proof` (each node display-order hex), directed by
 /// `tx_index`, and return the recomputed merkle root in **internal** byte order — ready to
-/// compare against a block header's stored merkle-root field. `None` if any hash is malformed.
+/// compare against a block header's stored merkle-root field. `None` if any hash is malformed
+/// or the branch exceeds [`MAX_MERKLE_DEPTH`].
 ///
 /// At level `i`, bit `i` of `tx_index` selects the current node's side: 0 = current is the
 /// left child (sibling on the right), 1 = current is the right child (sibling on the left).
@@ -71,6 +78,11 @@ pub fn compute_merkle_root(
     merkle_proof: &[String],
     tx_index: u32,
 ) -> Option<[u8; 32]> {
+    // DoS guard: an over-long branch (attacker-controlled in a proof pack) would force unbounded
+    // hashing. Real branches are ≤ ~13 nodes; refuse anything past the cap.
+    if merkle_proof.len() > MAX_MERKLE_DEPTH {
+        return None;
+    }
     let mut cur = hash32_display_to_internal(txid_display)?;
     let mut idx = tx_index;
     for node in merkle_proof {
@@ -170,5 +182,14 @@ mod tests {
         let r_good = compute_merkle_root(txid, std::slice::from_ref(&good), 0).unwrap();
         let r_bad = compute_merkle_root(txid, std::slice::from_ref(&bad), 0).unwrap();
         assert_ne!(r_good, r_bad);
+    }
+
+    #[test]
+    fn rejects_overlong_merkle_proof() {
+        // DoS-guard boundary: MAX_MERKLE_DEPTH nodes fold fine; one more is refused (None).
+        let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
+        let node = "ff".repeat(32);
+        assert!(compute_merkle_root(txid, &vec![node.clone(); MAX_MERKLE_DEPTH], 0).is_some());
+        assert!(compute_merkle_root(txid, &vec![node; MAX_MERKLE_DEPTH + 1], 0).is_none());
     }
 }

@@ -293,4 +293,36 @@ mod tests {
         assert!(v.all_mined, "rejected: {:?}", v.rejected);
         assert_eq!(v.checked, 1, "exempt hop must not be counted");
     }
+
+    #[test]
+    fn rejects_oversized_merkle_proof() {
+        // A witness carrying an over-long merkle branch (a DoS vector in an untrusted pack) is
+        // refused as `Malformed` — the header source vouches for the block, so verification
+        // reaches the merkle fold, which caps the branch length.
+        use crate::merkle::MAX_MERKLE_DEPTH;
+        let mut anchors = BTreeMap::new();
+        anchors.insert(
+            TXID.to_owned(),
+            WitnessInclusion {
+                block_hash: BLOCK.to_owned(),
+                block_height: 100,
+                tx_index: 0,
+                merkle_proof: vec!["ff".repeat(32); MAX_MERKLE_DEPTH + 1],
+            },
+        );
+        let pack = SpvProofPack {
+            version: 1,
+            network: "regtest".to_owned(),
+            anchors,
+            headers: BTreeMap::new(),
+        };
+        let mut hmap = BTreeMap::new();
+        hmap.insert(
+            BLOCK.to_owned(),
+            HeaderInfo { merkle_root: [0u8; 32], confirmations: 6 },
+        );
+        let v = verify_pack(&[TXID.to_owned()], &HashSet::new(), &pack, &MockHeaders(hmap), 1);
+        assert!(!v.all_mined);
+        assert_eq!(v.rejected, vec![(TXID.to_owned(), RejectReason::Malformed)]);
+    }
 }
