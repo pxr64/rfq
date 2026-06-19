@@ -10,8 +10,8 @@ the broker, the indexer, or the consignment's own claims**. It is the design beh
 vendored verifier in the colorex-wallet (public) repo.
 
 > Companion: the public client trust model is documented in
-> `colorex-wallet/docs/spv-consignment-verification.md`. Internal rationale/history lives in
-> `docs/consignment-validation-hardening-plan.md` and `docs/rfqip-1-spv-consignment-anchoring.md`.
+> `colorex-wallet/docs/spv-consignment-verification.md`. This is the single internal source of
+> record — it absorbed the earlier hardening-plan and RFQIP-1 SPV-anchoring drafts.
 
 ## 1. What is being protected
 
@@ -88,6 +88,17 @@ must be mined); the buy gate exempts exactly one txid — the not-yet-broadcast 
 - **Stash bookmark**: witnesses confirmed ≥ `BURY_DEPTH` (100) deep are recorded
   (`<stock>/mined_bookmark`) and skipped on later gates — settled ancestry isn't re-walked.
 
+**Performance basis (measured, signet electrs).** Resolving witnesses tops out at **~1,500 tx/s**,
+which is **electrs-server-bound**: pipelined `batch_call` (chunk ~200, one connection) is ≈2× serial
+and a concurrency pool adds essentially nothing on top — so the resolver is single-connection
+pipelined with **no pool**, and the only scaling lever is *more electrs endpoints* (the resolver is
+multi-endpoint), not more threads. The gate is **two-tier**: a cheap confirmations-only pass rejects
+forgeries fast, while full `WitnessOrd::Mined(pos)` (which adds a `get_merkle` round-trip, ~2–3×
+slower) is paid only when accepting a legit consignment into the stash. At ~1,500 tx/s a cold
+10k-witness ancestry is a few seconds / ~30 MB — which is where the `DEFAULT_MAX_WITNESSES` = 10k cap
+comes from (beyond it: reject + require the asset pre-synced); stash bookmarks keep the steady-state
+walk down to just the new tip.
+
 ## 5. SPV proof-packs (thin-client path)
 
 A wallet/canister can't run a node. It verifies a **self-certifying** sidecar bundle:
@@ -122,7 +133,7 @@ For each witness txid (except the buy-side exempt swap tx):
 
 ## 6. Header trust ladder (`HeaderSource`)
 
-The verifier trusts **only** its header source. Three rungs (RFQIP-1 §3):
+The verifier trusts **only** its header source. Three rungs:
 
 1. **Own validated chain** — ICP-native headers (subnet consensus already validated PoW). No
    checkpoint or difficulty logic needed; `header_at` just reads `bitcoin_get_block_headers`.

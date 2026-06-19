@@ -154,14 +154,14 @@ async fn validate_incoming_consignment_accepts_a_real_consignment() {
 }
 
 // SECURITY regression for the sell-side mined-ancestry gate
-// (docs/consignment-validation-hardening-plan.md): a consignment whose witness tx was
+// (docs/consignment-spv-verification.md §1): a consignment whose witness tx was
 // never mined MUST be rejected before the maker commits BTC. Verified manually red→green
 // (original code returns `Ok(..)` for an unmined `taker_consignment_for` consignment; the
 // fix returns `Err`). NOT kept as an e2e test here: `taker_consignment_for`'s destructive
 // "fake-broadcast" stash mutation can't coexist with the provenance `sell_round_trip` in
 // the shared single-bootstrap suite (whichever runs first starves the other of taker RGB).
-// The permanent regression lives as an isolated unit test in the Phase 1 `rfq-consignment`
-// crate (docs/consignment-validation-hardening-plan.md Phase 1).
+// The permanent regression lives as an isolated unit test in the `rfq-consignment`
+// crate (docs/consignment-spv-verification.md §10).
 
 #[tokio::test]
 #[ignore = "needs the regtest stack up + tools installed; see file header"]

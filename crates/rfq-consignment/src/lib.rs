@@ -1,7 +1,7 @@
 //! `rfq-consignment` — shared consignment-validation primitives for the Colorex
 //! sell/buy gates, the broker pre-check, the SPV prover, and the thin-client
-//! (wallet / ICP) verifiers. Phase 1+ of
-//! `docs/consignment-validation-hardening-plan.md` and `docs/rfqip-1-spv-consignment-anchoring.md`.
+//! (wallet / ICP) verifiers. Design, threat model, and SPV-anchoring spec:
+//! `docs/consignment-spv-verification.md`.
 //!
 //! ## Two backends, one verdict
 //! Confirming "is every witness mined?" needs a Bitcoin chain source. There are two ways
