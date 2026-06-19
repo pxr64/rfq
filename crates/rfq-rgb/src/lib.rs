@@ -13,7 +13,7 @@ mod taker;
 pub use lib_backend::{witness_txids_of_consignment, LibRgbBackend, WalletUtxo};
 pub use swap::enrich_psbt_input;
 pub use swap::SEAL_ANCHOR_SATS;
-pub use taker::Taker;
+pub use taker::{SignGuard, Taker};
 
 /// Self-bootstrapping regtest harness shared across rfq-rgb's own e2e
 /// tests and dependent crates' tests (e.g. maker-node's HTTP-layer

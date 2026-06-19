@@ -68,7 +68,7 @@ sequenceDiagram
     T->>M: DELIVER_CONSIGNMENT { consignment, named outpoints }
     M->>M: validate provenance consignment against own Stock,<br/>confirm the named outpoints carry the RGB,<br/>fetch prevouts via BitcoinClient::get_outpoint,<br/>build PSBT (taker RGB inputs + maker BTC inputs +<br/>outputs: maker RGB seal, taker BTC payout,<br/>maker BTC change, taker RGB change?),<br/>sign maker BTC inputs
     M->>T: PSBT (maker-signed half)
-    T->>T: verify PSBT (matches consignment,<br/>payout addr, amounts),<br/>sign RGB-bearing inputs
+    T->>T: PRE-SIGN GATE (#38): sign ONLY the named RGB outpoints<br/>(reject spliced inputs), payout reaches the taker,<br/>txid == published swap tx — then sign RGB-bearing inputs
     T->>M: SIGN_PSBT { signed_psbt }
     M->>M: finalize PSBT, broadcast witness tx
     M->>T: FINAL_STATE { witness_txid,<br/>witness_extended_consignment }
@@ -81,6 +81,7 @@ sequenceDiagram
 - **Prevout fetch is required.** The consignment names outpoints but doesn't carry `scriptPubKey` or BTC value, which are needed to construct the PSBT inputs. The maker calls `BitcoinClient::get_outpoint` for each.
 - **Maker validates consignment in step 6.** Against the maker's Stock, then runs the **mined-ancestry gate** (`validate_incoming_consignment`) before committing any BTC — see [Consignment validation](#consignment-validation-mined-ancestry-gate). This is the symmetric operation to what the taker does in buy-side step 5.
 - **Taker pays the fee, by netting from payout.** The taker's BTC payout output value = `quote.price − actual_fee_sats`. Maker's BTC change = `sum(maker_btc_inputs) − quote.price`. Maker reserves `quote.price` gross from BTC inventory.
+- **Pre-sign safety gate (#38) — the taker's signature *is* the authorization.** A consignment is unsigned history; the taker's Bitcoin signature is what moves value, so before signing (step 7) the taker verifies the maker-built PSBT against what it agreed: **(a)** it signs *only* the RGB outpoints it named for sale — any other taker-owned input is a sweep and is rejected (`Taker::sign_and_finalize` + `SignGuard` on the node; the colorex-wallet derives the named set from its own provenance consignment via the `consignment_sale_outpoints` wasm binding — the maker cannot forge a provenance consignment over the taker's *other* UTXOs); **(d)** the BTC payout reaches the taker's own script at ≥ `price − quoted_fee`; **(e)** the txid equals the maker's published `expected_witness_txid`. All three are **hard blocks** on both the taker-cli (unit-tested) and the wallet sign screen. The symmetric **buy-side** gate rejects signing any of the taker's RGB anchors on a BTC-only leg. *Remaining (#38 follow-up):* the delivered-amount / change-routing half — the RGB change must come back to the taker's own seal — needs the maker to return a change consignment pre-sign.
 
 ### Inventory transitions (maker side)
 

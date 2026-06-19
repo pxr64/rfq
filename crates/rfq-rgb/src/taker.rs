@@ -18,7 +18,7 @@ use std::str::FromStr;
 
 use bpstd::psbt::{Psbt, PsbtConstructor};
 use bpstd::signers::TestnetRefSigner;
-use bpstd::{Derive, Sats, Terminal, XprivAccount, XpubDerivable};
+use bpstd::{Address, Derive, Sats, Terminal, XprivAccount, XpubDerivable};
 use bpwallet::fs::FsTextStore;
 use bpwallet::hot::SecureIo;
 use bpwallet::Wallet as BpWallet;
@@ -26,6 +26,28 @@ use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo};
 use rgb::{ContractId, RgbDescr};
 
 use crate::{enrich_psbt_input, LibRgbBackend, RgbBackend, RgbError, TxOut};
+
+/// Pre-sign safety gate for [`Taker::sign_and_finalize`] (GitHub issue #38). A consignment is
+/// unsigned history; the taker's Bitcoin signature is what authorizes the swap — so before signing
+/// the maker-built PSBT the taker asserts *which inputs it signs* and *what it receives*. Each
+/// `None` field skips its check; a production caller populates the ones relevant to its leg
+/// (passing `None` overall = no gate — legacy/test paths only).
+#[derive(Debug, Default, Clone)]
+pub struct SignGuard {
+    /// Whitelist of taker-owned inputs allowed to be signed. If `Some`, any taker-owned PSBT input
+    /// outside it is rejected — the **sell-side anti-sweep** (the maker can't splice the taker's
+    /// *other* RGB UTXOs into the tx). Sell passes the named sale outpoints.
+    pub allowed_outpoints: Option<Vec<Outpoint>>,
+    /// Blacklist of taker-owned inputs that must NOT be signed. The **buy side** passes the taker's
+    /// RGB anchors: a buy pays BTC, so signing any RGB-bearing input the maker spliced in leaks it.
+    pub forbidden_outpoints: Option<Vec<Outpoint>>,
+    /// The swap tx the maker published; after decode `psbt.txid()` must equal it (anti-substitution).
+    pub expected_witness_txid: Option<String>,
+    /// `(taker BTC payout scriptPubkey bytes, minimum sats)` — outputs paying that script must total
+    /// at least the minimum, so the maker can't redirect or short-change the taker's BTC payout.
+    /// Build the script from the payout address with [`Taker::payout_spk`]. Sell side.
+    pub expected_payout: Option<(Vec<u8>, u64)>,
+}
 
 /// A swap counterparty's RGB/BTC wallet. Constructed from the same on-disk
 /// stash + signer inputs as [`LibRgbBackend`]; the wallet cache lives at
@@ -232,13 +254,31 @@ impl Taker {
         ))
     }
 
-    /// Enrich every PSBT input owned by the taker wallet, then sign + finalize
-    /// against the taker descriptor. Inputs the taker doesn't own (the maker's,
-    /// already carrying `partial_sigs`) are left untouched for the maker's own
-    /// finalize step. Enrichment is mandatory: the maker leaves taker inputs
-    /// with only `witness_utxo` + `sighash_type`, but `TestnetRefSigner` keys
-    /// off `bip32_derivation`.
-    pub fn sign_and_finalize(&self, partial_psbt_b64: &str) -> Result<String, RgbError> {
+    /// Convert a BTC payout address into its scriptPubkey bytes — build
+    /// [`SignGuard::expected_payout`] from the taker's own payout address with this.
+    pub fn payout_spk(&self, address: &str) -> Result<Vec<u8>, RgbError> {
+        Ok(Address::from_str(address)
+            .map_err(|e| RgbError::TransferBuild(format!("bad payout address {address}: {e}")))?
+            .script_pubkey()
+            .as_slice()
+            .to_vec())
+    }
+
+    /// Enrich every authorized PSBT input owned by the taker wallet, then sign + finalize against
+    /// the taker descriptor. Inputs the taker doesn't own (the maker's, already carrying
+    /// `partial_sigs`) are left untouched for the maker's own finalize step. Enrichment is mandatory:
+    /// the maker leaves taker inputs with only `witness_utxo` + `sighash_type`, but `TestnetRefSigner`
+    /// keys off `bip32_derivation`.
+    ///
+    /// **Pre-sign gate (GitHub #38):** when `guard` is `Some`, the taker verifies — *before producing
+    /// any signature* — that the maker-built PSBT (a) signs only inputs the taker authorized (no
+    /// spliced-in RGB UTXOs — the sweep), (d) pays the taker's BTC payout, and (e) is the swap tx the
+    /// maker published. `None` skips the gate (legacy/test callers).
+    pub fn sign_and_finalize(
+        &self,
+        partial_psbt_b64: &str,
+        guard: Option<&SignGuard>,
+    ) -> Result<String, RgbError> {
         let wallet = self.load_wallet()?;
         let descriptor = wallet.descriptor().clone();
         let owned: HashMap<(String, u32), (Terminal, Sats)> = wallet
@@ -256,6 +296,27 @@ impl Taker {
         let mut psbt = Psbt::from_base64(partial_psbt_b64)
             .map_err(|e| RgbError::TransferBuild(format!("decode partial PSBT: {e}")))?;
 
+        // #38 pre-sign gate — assert what we sign + what we receive BEFORE any signature exists.
+        // The checks are factored into `enforce_sign_guard` (pure, unit-tested) over a projection of
+        // the PSBT, so the trust-critical logic is verifiable without a wallet.
+        if let Some(g) = guard {
+            let spent: Vec<(String, u32)> = psbt
+                .inputs()
+                .map(|inp| {
+                    (
+                        inp.previous_outpoint.txid.to_string(),
+                        inp.previous_outpoint.vout.into_u32(),
+                    )
+                })
+                .collect();
+            let outputs: Vec<(Vec<u8>, u64)> = psbt
+                .outputs()
+                .map(|o| (o.script.as_slice().to_vec(), o.value().sats()))
+                .collect();
+            let owned_keys: HashSet<(String, u32)> = owned.keys().cloned().collect();
+            enforce_sign_guard(&psbt.txid().to_string(), &spent, &outputs, &owned_keys, g)?;
+        }
+
         let prev_outs: Vec<(usize, String, u32)> = psbt
             .inputs()
             .enumerate()
@@ -269,6 +330,8 @@ impl Taker {
             .collect();
         let mut enriched = 0usize;
         for (i, txid, vout) in prev_outs {
+            // The guard (above) already rejected any taker-owned input it didn't authorize, so every
+            // owned input here is safe to enrich + sign.
             if let Some((terminal, value)) = owned.get(&(txid, vout)).cloned() {
                 // Taker inputs are its own untweaked receives/funding (only the
                 // maker hosts tapret commitments), so the base derived script is
@@ -294,5 +357,137 @@ impl Taker {
         }
         psbt.finalize(&descriptor);
         Ok(psbt.to_base64())
+    }
+}
+
+/// The pure #38 pre-sign checks over a *projected* PSBT — its txid, spent outpoints, and outputs as
+/// `(scriptPubkey bytes, sats)` — plus the taker's owned-outpoint set. Extracted from
+/// [`Taker::sign_and_finalize`] so the trust-critical logic is unit-testable without a wallet or
+/// signing. Rejects: (e) a substituted txid, (d) a BTC payout that misses the taker's script or
+/// falls short, or (a) any taker-owned input the guard did not authorize (the sweep).
+fn enforce_sign_guard(
+    psbt_txid: &str,
+    spent_outpoints: &[(String, u32)],
+    outputs: &[(Vec<u8>, u64)],
+    owned: &HashSet<(String, u32)>,
+    guard: &SignGuard,
+) -> Result<(), RgbError> {
+    // (e) anti-substitution: the tx we sign must be the swap the maker published (the unsigned-tx
+    // txid is fixed pre-sign, so a divergence means the maker swapped the tx out from under us).
+    if let Some(expected) = &guard.expected_witness_txid {
+        if psbt_txid != expected {
+            return Err(RgbError::TransferBuild(format!(
+                "swap txid {psbt_txid} != expected {expected} — maker substituted the tx"
+            )));
+        }
+    }
+    // (d) the BTC payout must reach the taker's OWN script at >= the agreed minimum.
+    if let Some((payout_spk, min_sats)) = &guard.expected_payout {
+        let paid: u64 = outputs
+            .iter()
+            .filter(|(spk, _)| spk == payout_spk)
+            .map(|(_, sats)| *sats)
+            .sum();
+        if paid < *min_sats {
+            return Err(RgbError::TransferBuild(format!(
+                "BTC payout to taker is {paid} sats < expected {min_sats} — maker redirected or \
+                 short-changed the payout"
+            )));
+        }
+    }
+    // (a) input-set / anti-sweep: every taker-owned input must be authorized (whitelist for the sell
+    // sale set, blacklist for the buy's RGB anchors). Maker-owned inputs aren't ours to police.
+    let allowed: Option<HashSet<(String, u32)>> = guard
+        .allowed_outpoints
+        .as_ref()
+        .map(|v| v.iter().map(|o| (o.txid.clone(), o.vout)).collect());
+    let forbidden: Option<HashSet<(String, u32)>> = guard
+        .forbidden_outpoints
+        .as_ref()
+        .map(|v| v.iter().map(|o| (o.txid.clone(), o.vout)).collect());
+    for key in spent_outpoints {
+        if !owned.contains(key) {
+            continue;
+        }
+        if allowed.as_ref().is_some_and(|a| !a.contains(key)) {
+            return Err(RgbError::TransferBuild(format!(
+                "PSBT spends taker outpoint {}:{} outside the named sale set — refusing to sign \
+                 (anti-sweep)",
+                key.0, key.1
+            )));
+        }
+        if forbidden.as_ref().is_some_and(|f| f.contains(key)) {
+            return Err(RgbError::TransferBuild(format!(
+                "PSBT spends taker RGB anchor {}:{} on a BTC-only leg — refusing to sign (anti-sweep)",
+                key.0, key.1
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(txid: &str, vout: u32) -> Outpoint {
+        Outpoint { txid: txid.to_owned(), vout }
+    }
+    fn owned(set: &[(&str, u32)]) -> HashSet<(String, u32)> {
+        set.iter().map(|(t, v)| ((*t).to_owned(), *v)).collect()
+    }
+    fn spent(set: &[(&str, u32)]) -> Vec<(String, u32)> {
+        set.iter().map(|(t, v)| ((*t).to_owned(), *v)).collect()
+    }
+
+    #[test]
+    fn sell_signs_exactly_the_named_sale_set() {
+        // Taker owns A + B (savings); the PSBT spends A (named) + a maker BTC input. Allowed.
+        let g = SignGuard { allowed_outpoints: Some(vec![op("a", 0)]), ..Default::default() };
+        enforce_sign_guard("tx", &spent(&[("a", 0), ("m", 0)]), &[], &owned(&[("a", 0), ("b", 1)]), &g)
+            .expect("named sale set + maker input must sign");
+    }
+
+    #[test]
+    fn sell_rejects_spliced_savings_utxo() {
+        // The maker splices the taker's savings UTXO B into the tx → sweep → reject.
+        let g = SignGuard { allowed_outpoints: Some(vec![op("a", 0)]), ..Default::default() };
+        let err = enforce_sign_guard("tx", &spent(&[("a", 0), ("b", 1)]), &[], &owned(&[("a", 0), ("b", 1)]), &g)
+            .unwrap_err();
+        assert!(err.to_string().contains("anti-sweep"), "{err}");
+    }
+
+    #[test]
+    fn buy_rejects_spliced_rgb_anchor() {
+        // A buy pays BTC; the maker splices the taker's RGB anchor as an "input" → reject.
+        let g = SignGuard { forbidden_outpoints: Some(vec![op("rgb", 0)]), ..Default::default() };
+        let err = enforce_sign_guard("tx", &spent(&[("btc", 0), ("rgb", 0)]), &[], &owned(&[("btc", 0), ("rgb", 0)]), &g)
+            .unwrap_err();
+        assert!(err.to_string().contains("anti-sweep"), "{err}");
+    }
+
+    #[test]
+    fn rejects_substituted_txid() {
+        let g = SignGuard { expected_witness_txid: Some("expected".to_owned()), ..Default::default() };
+        let err = enforce_sign_guard("different", &[], &[], &HashSet::new(), &g).unwrap_err();
+        assert!(err.to_string().contains("substituted"), "{err}");
+    }
+
+    #[test]
+    fn payout_must_reach_taker_at_minimum() {
+        let spk = vec![0x00u8, 0x14, 0xde, 0xad, 0xbe, 0xef];
+        let g = SignGuard { expected_payout: Some((spk.clone(), 1000)), ..Default::default() };
+        // redirected: no output pays our script → 0 < 1000 → reject.
+        assert!(enforce_sign_guard("tx", &[], &[(vec![0x99], 5000)], &HashSet::new(), &g).is_err());
+        // shortfall: pays our script but below the minimum → reject.
+        assert!(enforce_sign_guard("tx", &[], &[(spk.clone(), 999)], &HashSet::new(), &g).is_err());
+        // exact (or over): accepted.
+        enforce_sign_guard("tx", &[], &[(spk, 1000)], &HashSet::new(), &g).expect("sufficient payout signs");
+    }
+
+    #[test]
+    fn empty_guard_is_permissive() {
+        enforce_sign_guard("tx", &spent(&[("a", 0)]), &[], &owned(&[("a", 0)]), &SignGuard::default())
+            .expect("a guard with no checks set permits");
     }
 }

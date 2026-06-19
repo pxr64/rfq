@@ -652,7 +652,7 @@ impl<'a> TakerGuard<'a> {
     /// finalize step.
     pub fn sign_and_finalize(&self, partial_psbt_b64: &str) -> Result<String, String> {
         self.taker()
-            .sign_and_finalize(partial_psbt_b64)
+            .sign_and_finalize(partial_psbt_b64, None)
             .map_err(|e| e.to_string())
     }
 }

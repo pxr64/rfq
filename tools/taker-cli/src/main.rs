@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 use rfq_wallet::{resolve_wallet, WalletInput};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input};
 use rfq_client::{RfqClient, Url};
-use rfq_rgb::Taker;
+use rfq_rgb::{SignGuard, Taker};
 use rfq_types::{
     AcceptQuoteRequest, AssetId, AssetKind, BitcoinNetwork, CreateRfqRequest, Outpoint, Side,
     SwapLeg,
@@ -325,7 +325,20 @@ async fn buy(
         .validate_buy_consignment(asset, consignment, expected_wt)
         .await?;
 
-    let signed = taker.sign_and_finalize(&transfer.partial_psbt)?;
+    // #38 buy gate: we pay BTC, so refuse to sign any of our own RGB anchors the maker may have
+    // spliced in, and confirm the tx is the swap the maker published (anti-substitution).
+    let rgb_anchors: Vec<Outpoint> = taker
+        .inventory(asset)
+        .await?
+        .into_iter()
+        .map(|u| u.outpoint)
+        .collect();
+    let guard = SignGuard {
+        forbidden_outpoints: Some(rgb_anchors),
+        expected_witness_txid: Some(expected_wt.to_owned()),
+        ..Default::default()
+    };
+    let signed = taker.sign_and_finalize(&transfer.partial_psbt, Some(&guard))?;
     let settled = client.submit_signed_psbt(quote.quote_id, signed).await?;
     let txid = settled
         .witness_txid
@@ -408,13 +421,25 @@ async fn sell(
     let consignment = taker.export_provenance(&asset.id, &outpoint_strs)?;
 
     let delivered = client
-        .submit_consignment(quote.quote_id.clone(), consignment, chosen)
+        .submit_consignment(quote.quote_id.clone(), consignment, chosen.clone())
         .await?;
     let transfer = delivered
         .transfer
         .ok_or("consignment delivery did not return a partial PSBT")?;
 
-    let signed = taker.sign_and_finalize(&transfer.partial_psbt)?;
+    // #38 sell gate: sign ONLY the named sale outpoints (anti-sweep — the maker can't splice in our
+    // other RGB UTXOs), confirm the BTC payout reaches OUR address at >= price minus the quoted fee,
+    // and that the tx is the swap the maker published.
+    let guard = SignGuard {
+        allowed_outpoints: Some(chosen.clone()),
+        expected_witness_txid: transfer.expected_witness_txid.clone(),
+        expected_payout: Some((
+            taker.payout_spk(btc_address)?,
+            quote.price.saturating_sub(quote.estimated_fee_sats),
+        )),
+        ..Default::default()
+    };
+    let signed = taker.sign_and_finalize(&transfer.partial_psbt, Some(&guard))?;
     let settled = client.submit_signed_psbt(quote.quote_id, signed).await?;
     let txid = settled
         .witness_txid
