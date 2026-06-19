@@ -23,6 +23,7 @@ use bpwallet::fs::FsTextStore;
 use bpwallet::hot::SecureIo;
 use bpwallet::Wallet as BpWallet;
 use rfq_types::{AssetId, Outpoint, RgbInventoryUtxo};
+use rgb::invoice::{Beneficiary, RgbInvoice};
 use rgb::{ContractId, RgbDescr};
 
 use crate::{enrich_psbt_input, LibRgbBackend, RgbBackend, RgbError, TxOut};
@@ -157,6 +158,64 @@ impl Taker {
         self.lib_backend()
             .validate_buy_consignment(consignment_base64, contract_id, expected_witness_txid)
             .await
+    }
+
+    /// Total RGB a maker-delivered consignment lands on the taker's OWN wallet UTXOs (#38
+    /// delivered-value): the change that came back on a sell, or the bought amount on a buy. A
+    /// misrouted delivery returns 0. See [`LibRgbBackend::consignment_delivery_to_wallet`].
+    pub async fn consignment_delivery_to_wallet(
+        &self,
+        asset: &AssetId,
+        consignment_base64: &str,
+    ) -> Result<u64, RgbError> {
+        let contract_id = ContractId::from_str(&asset.id)
+            .map_err(|e| RgbError::ContractNotFound(format!("invalid contract id: {e}")))?;
+        self.lib_backend()
+            .consignment_delivery_to_wallet(consignment_base64, contract_id)
+            .await
+    }
+
+    /// #38 delivered-value gate: verify a maker-delivered consignment credits the expected RGB to
+    /// the taker's OWN seal — the one it minted in `invoice`. For a **blinded** beneficiary (the
+    /// default) the delivery lands on one of the taker's existing anchors, so it's read directly
+    /// via [`Self::consignment_delivery_to_wallet`]: `exact` requires the credited amount to equal
+    /// `expected` (a sell's change = `gross − sold`), else it must be `>= expected` (a buy = at
+    /// least the requested amount). A **witness-vout** beneficiary rides a not-yet-broadcast swap
+    /// output (no UTXO to read pre-broadcast), so it's skipped here and verified at accept time —
+    /// a documented residual for the rare witness-vout fallback (`create_invoice` prefers blinded).
+    pub async fn verify_delivery(
+        &self,
+        asset: &AssetId,
+        consignment_base64: &str,
+        invoice: &str,
+        expected: u64,
+        exact: bool,
+    ) -> Result<(), RgbError> {
+        let parsed = RgbInvoice::from_str(invoice).map_err(|_| RgbError::InvalidInvoice)?;
+        match parsed.beneficiary.into_inner() {
+            Beneficiary::BlindedSeal(_) => {
+                let delivered = self
+                    .consignment_delivery_to_wallet(asset, consignment_base64)
+                    .await?;
+                let ok = if exact {
+                    delivered == expected
+                } else {
+                    delivered >= expected
+                };
+                if !ok {
+                    return Err(RgbError::TransferBuild(format!(
+                        "delivered-value check failed: consignment credits {delivered} RGB to our \
+                         seals, expected {}{expected} — refusing to sign",
+                        if exact { "exactly " } else { "at least " }
+                    )));
+                }
+            }
+            Beneficiary::WitnessVout(..) => {
+                // The delivery rides a not-yet-broadcast swap output — no UTXO to read yet. The
+                // standard post-broadcast accept validates it; nothing to assert here.
+            }
+        }
+        Ok(())
     }
 
     /// Build the taker's sell consignment: a unilateral RGB transfer to the

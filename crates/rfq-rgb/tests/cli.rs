@@ -792,7 +792,7 @@ async fn sell_round_trip_two_backends_broadcasts() {
         prevouts
     };
 
-    let (partial_psbt, expected_wt) = {
+    let (partial_psbt, expected_wt, change_consignment) = {
         let maker = stack.maker_backend().await;
         let transfer = maker
             .create_swap_psbt_sell(
@@ -809,16 +809,30 @@ async fn sell_round_trip_two_backends_broadcasts() {
             )
             .await
             .expect("create_swap_psbt_sell");
-        assert!(
-            transfer.consignment.is_some(),
-            "sell with surplus: maker emits a change consignment for the taker's surplus RGB"
+        let change_consignment = transfer.consignment.clone().expect(
+            "sell with surplus: maker emits a change consignment for the taker's surplus RGB",
         );
         let expected_wt = transfer
             .expected_witness_txid
             .clone()
             .expect("declared-funding sell commits a stable witness txid");
-        (transfer.partial_psbt, expected_wt)
+        (transfer.partial_psbt, expected_wt, change_consignment)
     };
+
+    // --- #38 sell change-back: the maker's change consignment must deliver the surplus
+    //     (gross 500 − sold 200 = 300) back to one of the TAKER's OWN anchors. A short or
+    //     misrouted change would read < 300 (it lands on no taker UTXO).
+    {
+        let taker = stack.taker_backend().await;
+        let delivered_change = taker
+            .consignment_delivery_to_wallet(&asset, &change_consignment)
+            .await
+            .expect("read change delivery");
+        assert_eq!(
+            delivered_change, 300,
+            "the taker's RGB change must come back to its own seal"
+        );
+    }
 
     // --- Taker signs + finalizes its RGB inputs ---------------------------
     let signed_psbt = {

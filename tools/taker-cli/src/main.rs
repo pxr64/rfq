@@ -295,7 +295,7 @@ async fn buy(
         .accept_quote(AcceptQuoteRequest {
             quote_id: quote.quote_id.clone(),
             leg: SwapLeg::Buy {
-                rgb_invoice,
+                rgb_invoice: rgb_invoice.clone(),
                 btc_funding_addr,
             },
         })
@@ -323,6 +323,11 @@ async fn buy(
         .ok_or("buy accept did not return an expected witness txid to validate against")?;
     taker
         .validate_buy_consignment(asset, consignment, expected_wt)
+        .await?;
+    // #38 buy delivered-value: the maker's consignment must deliver at least the amount we're
+    // paying for, to OUR own seal (blinded; witness-vout deferred to accept).
+    taker
+        .verify_delivery(asset, consignment, &rgb_invoice, amount, false)
         .await?;
 
     // #38 buy gate: we pay BTC, so refuse to sign any of our own RGB anchors the maker may have
@@ -404,7 +409,7 @@ async fn sell(
             quote_id: quote.quote_id.clone(),
             leg: SwapLeg::Sell {
                 btc_payout_addr,
-                rgb_change_invoice: Some(rgb_change_invoice),
+                rgb_change_invoice: Some(rgb_change_invoice.clone()),
             },
         })
         .await?;
@@ -426,6 +431,14 @@ async fn sell(
     let transfer = delivered
         .transfer
         .ok_or("consignment delivery did not return a partial PSBT")?;
+
+    // #38 sell change-back: the RGB change (gross − sold) must come back to OUR own seal — a short
+    // or misrouted change is rejected before we sign (blinded; witness-vout deferred to accept).
+    if let Some(change_consignment) = transfer.consignment.as_deref() {
+        taker
+            .verify_delivery(asset, change_consignment, &rgb_change_invoice, have - amount, true)
+            .await?;
+    }
 
     // #38 sell gate: sign ONLY the named sale outpoints (anti-sweep — the maker can't splice in our
     // other RGB UTXOs), confirm the BTC payout reaches OUR address at >= price minus the quoted fee,

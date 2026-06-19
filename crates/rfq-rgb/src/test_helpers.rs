@@ -533,6 +533,20 @@ impl<'a> TakerGuard<'a> {
             .map_err(|e| e.to_string())
     }
 
+    /// Total RGB a maker-delivered consignment lands on the taker's own wallet UTXOs (#38
+    /// delivered-value) — the sell change that came back, or the bought amount. Delegates to
+    /// [`Taker::consignment_delivery_to_wallet`].
+    pub async fn consignment_delivery_to_wallet(
+        &self,
+        asset: &rfq_types::AssetId,
+        consignment_base64: &str,
+    ) -> Result<u64, String> {
+        self.taker()
+            .consignment_delivery_to_wallet(asset, consignment_base64)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// Refresh the taker's bp-wallet UTXO cache against electrum so
     /// post-broadcast BTC change outputs (e.g. from a prior buy swap)
     /// become visible to `spare_btc_input` / `lookup_prevout`. Mirrors

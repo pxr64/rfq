@@ -542,6 +542,111 @@ impl LibRgbBackend {
         Ok(())
     }
 
+    /// RGB this consignment newly delivers to the taker's OWN wallet UTXOs (#38 delivered-value) —
+    /// the **delta** in the taker's holdings across a validate+accept into a **non-persisting**
+    /// stock (autosave off; the live stash is never touched). The delta (not the absolute total) is
+    /// the right signal: the swap witness is not yet broadcast (Tentative), so the inputs the
+    /// transition spends aren't retired in the stash and the taker's pre-existing RGB still shows —
+    /// only the newly-credited allocation moves the needle. For a sell this is the change that came
+    /// back (`gross − sold`); for a buy, the bought amount. A **misrouted** delivery (to the
+    /// counterparty's seal) credits no taker UTXO → returns 0.
+    ///
+    /// NB: blinded beneficiary seals (the default) resolve here because they're bound to the
+    /// taker's existing anchors; a **witness-vout** delivery rides a not-yet-broadcast swap output
+    /// (not yet a UTXO) and reads 0 — the caller verifies that path against the PSBT instead.
+    pub async fn consignment_delivery_to_wallet(
+        &self,
+        consignment_base64: &str,
+        expected_contract_id: ContractId,
+    ) -> Result<u64, RgbError> {
+        let _guard = self.guard();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(consignment_base64.trim())
+            .map_err(|e| {
+                RgbError::TransferBuild(format!("consignment is not valid base64: {e}"))
+            })?;
+        let consignment = Transfer::load(bytes.as_slice())
+            .map_err(|e| RgbError::TransferBuild(format!("consignment decode: {e}")))?;
+        if consignment.contract_id() != expected_contract_id {
+            return Err(RgbError::TransferBuild(format!(
+                "consignment contract {} does not match expected {}",
+                consignment.contract_id(),
+                expected_contract_id
+            )));
+        }
+
+        // Non-persisting stock (autosave = false): accept_transfer's mutations never reach disk.
+        let provider = FsBinStore::new(self.stock_path())
+            .map_err(|e| RgbError::StashLoad(e.to_string()))?;
+        let mut stock: Stock =
+            Stock::load(provider, false).map_err(|e| RgbError::StashLoad(e.to_string()))?;
+
+        let kit = Kit::load(&mut &NIA_SCHEMA_KIT[..])
+            .map_err(|e| RgbError::StashLoad(format!("load NIA kit: {e}")))?
+            .validate()
+            .map_err(|e| RgbError::StashLoad(format!("validate NIA kit: {e:?}")))?;
+        stock
+            .import_kit(kit)
+            .map_err(|e| RgbError::StashLoad(format!("import NIA kit: {e}")))?;
+
+        let mut resolver = self.resolver()?;
+        resolver.add_consignment_txes(&consignment);
+        let validation_config = ValidationConfig {
+            chain_net: chain_net_for(self.parse_network()?),
+            trusted_typesystem: stock
+                .as_stash_provider()
+                .type_system()
+                .map_err(|e| RgbError::StashLoad(format!("type system: {e}")))?
+                .clone(),
+            ..Default::default()
+        };
+        let validated = consignment
+            .validate(&resolver, &validation_config)
+            .map_err(|e| RgbError::TransferBuild(format!("consignment validation: {e:?}")))?;
+        if validated.validation_status().validity() != Validity::Valid {
+            return Err(RgbError::TransferBuild(format!(
+                "consignment invalid: {}",
+                validated.validation_status()
+            )));
+        }
+        // The taker's own UTXOs — blinded delivery seals are bound to these anchors.
+        let wallet = self.load_wallet()?;
+        let mine: std::collections::HashSet<(String, u32)> = wallet
+            .wallet()
+            .utxos()
+            .map(|u| (u.outpoint.txid.to_string(), u.outpoint.vout.into_u32()))
+            .collect();
+        let sum_mine = |stock: &Stock| -> u64 {
+            let Ok(contract) = stock.contract_data(expected_contract_id) else {
+                return 0; // contract not in the stock yet (e.g. a first-time buy) → 0 held
+            };
+            let mut total = 0u64;
+            let filter = FilterIncludeAll;
+            for details in contract.schema.owned_types.values() {
+                if let Ok(allocs) = contract.fungible(details.name.clone(), &filter) {
+                    for alloc in allocs {
+                        let op = alloc.seal.to_outpoint();
+                        if mine.contains(&(op.txid.to_string(), op.vout.into_u32())) {
+                            total = total.saturating_add(alloc.state.value());
+                        }
+                    }
+                }
+            }
+            total
+        };
+
+        // DELTA, not absolute total: the swap witness isn't broadcast yet (Tentative), so the inputs
+        // the transition spends aren't retired in the stash — the taker's pre-existing RGB still
+        // shows. The change in holdings across accept isolates exactly what this consignment
+        // delivered (the change on a sell; the bought amount on a buy).
+        let before = sum_mine(&stock);
+        stock
+            .accept_transfer(validated, &resolver)
+            .map_err(|e| RgbError::StashLoad(format!("accept_transfer: {e}")))?;
+        let after = sum_mine(&stock);
+        Ok(after.saturating_sub(before))
+    }
+
     /// Load the full RGB wallet: a `bp-wallet` `Wallet<XpubDerivable, RgbDescr>`
     /// wrapped with the maker's `Stock`. The wallet descriptor must already
     /// exist on disk (e.g. via `make rgb-wallets-init` + `rgb create --tapret-key-only`).
